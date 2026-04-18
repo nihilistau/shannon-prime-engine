@@ -63,6 +63,21 @@ If you already cloned without `--recursive`:
 git submodule update --init --recursive
 ```
 
+### Runtime note (Windows + MinGW builds)
+
+The produced `sp-engine.exe` dynamically links the MinGW C/C++ runtime.
+If your shell doesn't expose the MinGW bin directory on PATH you'll see
+exit code 127 ("not recognized"). Fix by copying three DLLs next to the
+binary (one-time):
+
+```bash
+cp /c/ProgramData/mingw64/mingw64/bin/libgcc_s_seh-1.dll   build/bin/
+cp /c/ProgramData/mingw64/mingw64/bin/libstdc++-6.dll      build/bin/
+cp /c/ProgramData/mingw64/mingw64/bin/libwinpthread-1.dll  build/bin/
+```
+
+MSVC-based release builds (planned) will ship the runtime statically.
+
 ## License
 
 AGPLv3 for open-source / academic / non-proprietary use. Commercial

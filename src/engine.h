@@ -30,6 +30,19 @@ struct Config {
     enum class Backend { CPU, CUDA, Vulkan };
     Backend     backend = Backend::CPU;
     int         n_gpu_layers = 0;  // 0 = CPU-only, otherwise offload count
+
+    // Positional-encoding mode. Default is Standard (geometric RoPE, no
+    // ALiBi, byte-for-byte compatible with llama.cpp). Non-standard modes
+    // implement the paper's "PrimePE-RoPE-ALiBi" family — lattice-drawn
+    // frequencies + distance-based attention bias:
+    //   PrimePe        geometric freqs replaced by lattice-drawn integer
+    //                  freqs, blended with geometric at pe_alpha
+    //   PrimePeAlibi   PrimePe + per-head ALiBi slopes added to attn scores
+    //   AlibiOnly      standard RoPE + ALiBi (ablation)
+    enum class PeMode { Standard, PrimePe, PrimePeAlibi, AlibiOnly };
+    PeMode      pe_mode  = PeMode::Standard;
+    float       pe_alpha = 0.17f;   // blend factor 0..1; paper's sweet spot 0.15–0.22
+    int         pe_tier  = 0;       // 0 = composite lattice, 1 = prime generators
 };
 
 class Engine {

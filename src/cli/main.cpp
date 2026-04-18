@@ -5,12 +5,14 @@
 // Commercial license available — contact raydaniels@gmail.com
 
 #include "engine.h"
+#include "forward.h"
 #include "gguf_loader.h"
 #include "llama_weights.h"
 #include "tokenizer.h"
 #include "vocab.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -29,6 +31,7 @@ static void usage(const char* prog) {
         "  info --model <gguf>  Load a GGUF and print hparams + tensor summary.\n"
         "  encode --model <gguf> <text>  Tokenise text to IDs.\n"
         "  decode --model <gguf> <id1> [id2 ...]  Decode IDs to text.\n"
+        "  embed  --model <gguf> <text>  Encode + run token-embedding lookup.\n"
         "  perplexity <args>    (not yet implemented)\n"
         "  run <args>           (not yet implemented)\n"
         "\n"
@@ -164,6 +167,57 @@ int main(int argc, char** argv) {
         for (const auto& s : rest) ids.push_back(std::atoi(s.c_str()));
         std::string out = tk->decode(ids);
         std::printf("%s\n", out.c_str());
+        return 0;
+    }
+
+    if (cmd == "embed") {
+        if (cfg.model_path.empty()) {
+            std::fprintf(stderr, "embed requires --model <path.gguf>\n"); return 1;
+        }
+        auto m = sp::engine::Model::load(cfg.model_path);
+        if (!m) return 2;
+        auto v = sp::engine::Vocab::load(*m);
+        auto tk = v ? sp::engine::Tokenizer::create(*v) : nullptr;
+        auto W = sp::engine::LlamaWeights::load(*m);
+        if (!tk || !W) return 3;
+
+        std::string text;
+        for (size_t i = 0; i < rest.size(); ++i) {
+            if (i) text.push_back(' ');
+            text += rest[i];
+        }
+        std::vector<int32_t> ids;
+        tk->encode(text, /*add_bos=*/true, ids);
+
+        auto fc = sp::engine::ForwardContext::create(*W);
+        if (!fc) return 4;
+
+        std::vector<float> emb;
+        int n_embd = 0;
+        if (!fc->embed(ids, emb, n_embd)) {
+            std::fprintf(stderr, "embed failed\n"); return 5;
+        }
+
+        // Print a summary: shape, a few values at the start / middle / end,
+        // and the mean + std of the whole block for sanity.
+        const int n = (int)ids.size();
+        double sum = 0, sumsq = 0;
+        for (float f : emb) { sum += f; sumsq += (double)f * f; }
+        double mean = sum / emb.size();
+        double var  = (sumsq / emb.size()) - mean * mean;
+        double stdv = var > 0 ? std::sqrt(var) : 0.0;
+
+        std::printf("n_tokens=%d  n_embd=%d  n_elems=%zu\n", n, n_embd, emb.size());
+        std::printf("mean=%.6f  std=%.6f  min=%.6f  max=%.6f\n",
+                    mean, stdv,
+                    *std::min_element(emb.begin(), emb.end()),
+                    *std::max_element(emb.begin(), emb.end()));
+        std::printf("emb[0][:4]   = %+.6f %+.6f %+.6f %+.6f\n",
+                    emb[0], emb[1], emb[2], emb[3]);
+        if (n >= 2) {
+            std::printf("emb[1][:4]   = %+.6f %+.6f %+.6f %+.6f\n",
+                        emb[n_embd], emb[n_embd+1], emb[n_embd+2], emb[n_embd+3]);
+        }
         return 0;
     }
 

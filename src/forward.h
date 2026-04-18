@@ -1,0 +1,59 @@
+// Shannon-Prime Engine — forward-pass graph builder
+// Copyright (C) 2026 Ray Daniels. All Rights Reserved.
+//
+// Licensed under the GNU Affero General Public License v3.0 (AGPLv3).
+// Commercial license available — contact raydaniels@gmail.com
+//
+// Builds a ggml compute graph for a llama-family forward pass. This
+// file gets extended stage by stage:
+//   3a (current)  : token-embedding lookup only
+//   3b (next)     : single transformer block (norm + attn + FFN + res)
+//   3c           : full n_layer loop + output norm + logits
+//   4            : swap standard fp16 KV cache for Shannon-Prime compressed
+//
+// The ctx-size and mem estimation live in the ForwardContext so the
+// engine can allocate scratch once and re-run the graph per-decode.
+
+#pragma once
+
+#include <cstdint>
+#include <memory>
+#include <vector>
+
+struct ggml_backend;
+struct ggml_backend_buffer;
+struct ggml_cgraph;
+struct ggml_context;
+struct ggml_tensor;
+
+namespace sp::engine {
+
+class LlamaWeights;
+
+class ForwardContext {
+public:
+    // Construct a reusable compute context for a given model. ctx_size is
+    // the compute-graph memory cap (bytes); 64 MB is plenty for 3a and
+    // small for later stages — the stage-3c commit bumps it.
+    static std::unique_ptr<ForwardContext> create(const LlamaWeights& weights,
+                                                   int ctx_size_bytes = 64 * 1024 * 1024);
+
+    ~ForwardContext();
+    ForwardContext(const ForwardContext&) = delete;
+    ForwardContext& operator=(const ForwardContext&) = delete;
+
+    // Run the 3a-stage graph: for `token_ids` of length n, produce an
+    // (n, n_embd) fp32 tensor of token embeddings. Returns the flat
+    // embedding values in row-major order (n * n_embd floats). Resets
+    // the graph context each call — cheap enough for scaffolding.
+    bool embed(const std::vector<int32_t>& token_ids,
+               std::vector<float>& out_flat,
+               int& out_n_embd);
+
+private:
+    ForwardContext();
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
+};
+
+} // namespace sp::engine

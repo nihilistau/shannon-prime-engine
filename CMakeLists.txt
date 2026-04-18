@@ -90,7 +90,8 @@ add_library(sp_engine STATIC
     src/gguf_loader.cpp
     src/vocab.cpp
     src/tokenizer.cpp
-    src/llama_weights.cpp)
+    src/llama_weights.cpp
+    src/forward.cpp)
 target_include_directories(sp_engine PUBLIC src)
 target_link_libraries(sp_engine PUBLIC
     shannon_prime_core
