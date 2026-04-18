@@ -313,12 +313,24 @@ int main(int argc, char** argv) {
         sp::engine::Config pc;
         int  n_ctx    = 512;
         int  n_chunks = 0;     // 0 = all
+        bool use_cache = false;
         std::string textfile;
         for (int i = 2; i < argc; ++i) {
             std::string a = argv[i];
-            if      (a == "--model"   && i + 1 < argc) pc.model_path = argv[++i];
-            else if (a == "--ctx"     && i + 1 < argc) n_ctx         = std::atoi(argv[++i]);
-            else if (a == "--chunks"  && i + 1 < argc) n_chunks      = std::atoi(argv[++i]);
+            if      (a == "--model"    && i + 1 < argc) pc.model_path    = argv[++i];
+            else if (a == "--ctx"      && i + 1 < argc) n_ctx            = std::atoi(argv[++i]);
+            else if (a == "--chunks"   && i + 1 < argc) n_chunks         = std::atoi(argv[++i]);
+            else if (a == "--cache")        use_cache       = true;
+            else if (a == "--sqfree")       pc.sqfree       = true;
+            else if (a == "--spinor")       { pc.spinor = true; pc.sqfree = true; }
+            else if (a == "--hierarchical") pc.hierarchical = true;
+            else if (a == "--no-mobius")    pc.mobius       = false;
+            else if (a == "--k-bits"        && i + 1 < argc) pc.k_bits_csv    = argv[++i];
+            else if (a == "--v-bits"        && i + 1 < argc) pc.v_bits_csv    = argv[++i];
+            else if (a == "--residual-bits" && i + 1 < argc) pc.residual_bits = std::atoi(argv[++i]);
+            else if (a == "--hier-level"    && i + 1 < argc) pc.hier_level    = std::atoi(argv[++i]);
+            else if (a == "--hier-res-bits" && i + 1 < argc) pc.hier_res_bits = std::atoi(argv[++i]);
+            else if (a == "--hier-skel-bits"&& i + 1 < argc) pc.hier_skel_bits= argv[++i];
             else if (a.size() >= 2 && a[0] == '-' && a[1] == '-') {
                 std::fprintf(stderr, "perplexity: unknown flag %s\n", a.c_str()); return 2;
             }
@@ -373,8 +385,23 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "text too short for ctx=%d (have %zu tokens)\n",
                          n_ctx, all_ids.size()); return 6;
         }
+
+        // Cache-mode: allocate one KvCache re-used across chunks
+        // (calibration state persists; bind_cache zeroes kv_pos but
+        // keeps the cache's calibrated masks intact).
+        std::unique_ptr<sp::engine::KvCache> kv;
+        if (use_cache) {
+            kv = sp::engine::KvCache::create(fc->n_layer(),
+                                              (int)m->n_head_kv(),
+                                              (int)m->head_dim(),
+                                              n_ctx + 8, pc);
+            if (!kv) { std::fprintf(stderr, "KvCache::create failed\n"); return 5; }
+            std::fprintf(stderr, "[sp-engine] %s\n", kv->describe().c_str());
+        }
+
         std::fprintf(stderr,
-            "[sp-engine] perplexity: n_ctx=%d  total_chunks=%d  eval=%d  n_vocab=%d\n",
+            "[sp-engine] perplexity: mode=%s n_ctx=%d  total_chunks=%d  eval=%d  n_vocab=%d\n",
+            use_cache ? "cache" : "baseline",
             n_ctx, total_chunks, eval_chunks, n_vocab_local);
 
         double total_nll        = 0.0;
@@ -383,26 +410,54 @@ int main(int argc, char** argv) {
         std::vector<float> logits;
         std::vector<int32_t> chunk((size_t)n_ctx);
         const int32_t bos = v->bos_id();
+        const int first_eval = n_ctx / 2;
 
         for (int c = 0; c < eval_chunks; ++c) {
             for (int t = 0; t < n_ctx; ++t) {
                 chunk[(size_t)t] = all_ids[(size_t)(c * n_ctx + t)];
             }
-            // Match llama-perplexity: every chunk's first token is BOS for
-            // the forward pass (resets the "context"), even mid-document.
-            // Targets at chunk positions [first+1, n_ctx) come from the
-            // unchanged all_ids array, so position 0 being BOS only
-            // affects what the model sees, not what we're scoring.
             if (bos >= 0) chunk[0] = bos;
             int n_vocab_out = 0;
+
+            // Cache-mode path: prefill [0..first_eval], then decode each
+            // input token, reading compressed past K/V each step.
+            if (use_cache) {
+                fc->bind_cache(kv.get());    // resets kv_pos, keeps calibration
+                std::vector<int32_t> warmup(chunk.begin(),
+                                            chunk.begin() + first_eval + 1);
+                std::vector<float> last_logits;
+                if (!fc->prefill(warmup, last_logits, n_vocab_out)) {
+                    std::fprintf(stderr, "cache-prefill failed at chunk %d\n", c);
+                    return 7;
+                }
+                auto score = [&](const float* row, int32_t target) {
+                    float mx = row[0];
+                    for (int k = 1; k < n_vocab_out; ++k) if (row[k] > mx) mx = row[k];
+                    double s = 0.0;
+                    for (int k = 0; k < n_vocab_out; ++k) s += std::exp((double)(row[k] - mx));
+                    const double lse = (double)mx + std::log(s);
+                    total_nll += lse - (double)row[target];
+                    total_evalled += 1;
+                };
+                score(last_logits.data(), chunk[(size_t)(first_eval + 1)]);
+                for (int i = first_eval + 1; i < n_ctx - 1; ++i) {
+                    std::vector<float> dlogits;
+                    if (!fc->decode(chunk[(size_t)i], dlogits, n_vocab_out)) {
+                        std::fprintf(stderr, "cache-decode failed chunk %d pos %d\n", c, i);
+                        return 7;
+                    }
+                    score(dlogits.data(), chunk[(size_t)(i + 1)]);
+                }
+                const double running_ppl = std::exp(total_nll / (double)total_evalled);
+                std::fprintf(stderr, "  chunk %3d/%d  PPL_running=%.4f  (cache)\n",
+                             c + 1, eval_chunks, running_ppl);
+                continue;
+            }
+
+            // Baseline path (original behaviour): forward_full, score all eval positions.
             if (!fc->forward_full(chunk, logits, n_vocab_out)) {
                 std::fprintf(stderr, "forward_full failed at chunk %d\n", c); return 7;
             }
-            // Cross-entropy at every position predicting the next token in
-            // the chunk. We use the half-context warmup convention so the
-            // first half of the chunk is "context only" — matches
-            // llama-perplexity's default behaviour.
-            const int first_eval = n_ctx / 2;
             for (int i = first_eval; i < n_ctx - 1; ++i) {
                 const float* row = logits.data() + (size_t)i * n_vocab_out;
                 const int32_t target = chunk[(size_t)(i + 1)];
