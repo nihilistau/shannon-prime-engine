@@ -1,0 +1,3 @@
+add_executable(test_engine_smoke test_engine_smoke.cpp)
+target_link_libraries(test_engine_smoke PRIVATE sp_engine)
+add_test(NAME engine_smoke COMMAND test_engine_smoke)

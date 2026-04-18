@@ -1,0 +1,6 @@
+[submodule "lib/shannon-prime"]
+	path = lib/shannon-prime
+	url = https://github.com/nihilistau/shannon-prime.git
+[submodule "vendor/ggml"]
+	path = vendor/ggml
+	url = https://github.com/ggml-org/ggml.git

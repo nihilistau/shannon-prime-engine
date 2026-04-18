@@ -1,0 +1,44 @@
+# Build artefacts
+build/
+build-*/
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.dll
+*.dylib
+*.exe
+*.spv
+*.cubin
+*.ptx
+*.fatbin
+
+# CMake
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+compile_commands.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local bench artefacts (logs/ keeps only JSON summaries)
+logs/*.gguf
+logs/*.log
+logs/*.bin
+logs/*.sp_freq_factors.bin
+!logs/.gitkeep
