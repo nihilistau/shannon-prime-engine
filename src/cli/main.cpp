@@ -45,6 +45,9 @@ static void usage(const char* prog) {
         "  chat --model <gguf> [--n-predict N] [--sqfree] <prompt>\n"
         "                       Greedy generation: prefill prompt, decode N tokens\n"
         "                       reading past K/V from the compressed cache.\n"
+        "  perplexity --model <gguf> [--ctx N] [--chunks N] <textfile>\n"
+        "                       Compute baseline PPL over a UTF-8 text file in\n"
+        "                       contiguous N-token chunks. Hook-free reference.\n"
         "  perplexity <args>    (not yet implemented)\n"
         "  run <args>           (not yet implemented)\n"
         "\n"
@@ -71,6 +74,126 @@ int main(int argc, char** argv) {
 
     if (cmd == "version") {
         std::printf("sp-engine 0.1.0 (scaffolding)\n");
+        return 0;
+    }
+
+    // perplexity handles its own argv (positional textfile + --ctx/--chunks)
+    // so the strict --flag pass doesn't reject the textfile path.
+    if (cmd == "perplexity") {
+        sp::engine::Config pc;
+        int  n_ctx    = 512;
+        int  n_chunks = 0;     // 0 = all
+        std::string textfile;
+        for (int i = 2; i < argc; ++i) {
+            std::string a = argv[i];
+            if      (a == "--model"   && i + 1 < argc) pc.model_path = argv[++i];
+            else if (a == "--ctx"     && i + 1 < argc) n_ctx         = std::atoi(argv[++i]);
+            else if (a == "--chunks"  && i + 1 < argc) n_chunks      = std::atoi(argv[++i]);
+            else if (a.size() >= 2 && a[0] == '-' && a[1] == '-') {
+                std::fprintf(stderr, "perplexity: unknown flag %s\n", a.c_str()); return 2;
+            }
+            else { textfile = a; }
+        }
+        if (pc.model_path.empty()) {
+            std::fprintf(stderr, "perplexity requires --model <path.gguf>\n"); return 1;
+        }
+        if (textfile.empty()) {
+            std::fprintf(stderr, "perplexity requires a UTF-8 text file path\n"); return 1;
+        }
+
+        auto m  = sp::engine::Model::load(pc.model_path);
+        if (!m) return 2;
+        auto v  = sp::engine::Vocab::load(*m);
+        auto tk = v ? sp::engine::Tokenizer::create(*v) : nullptr;
+        auto W  = sp::engine::LlamaWeights::load(*m);
+        if (!tk || !W) return 3;
+
+        // Read whole file. Binary mode so byte-perfect with what llama.cpp's
+        // perplexity sees from wiki.test.raw.
+        std::FILE* fp = std::fopen(textfile.c_str(), "rb");
+        if (!fp) {
+            std::fprintf(stderr, "cannot open %s\n", textfile.c_str()); return 4;
+        }
+        std::fseek(fp, 0, SEEK_END);
+        const size_t fsize = (size_t)std::ftell(fp);
+        std::fseek(fp, 0, SEEK_SET);
+        std::string text((size_t)fsize, '\0');
+        if (std::fread(text.data(), 1, fsize, fp) != fsize) {
+            std::fclose(fp);
+            std::fprintf(stderr, "short read on %s\n", textfile.c_str()); return 4;
+        }
+        std::fclose(fp);
+
+        std::vector<int32_t> all_ids;
+        tk->encode(text, /*add_bos=*/true, all_ids);
+        std::fprintf(stderr, "[sp-engine] tokenised %zu bytes -> %zu tokens\n",
+                     fsize, all_ids.size());
+
+        // Estimate scratch: full forward at n=ctx for an n_layer=36 / 8B model
+        // wants ~1 GB. The 1 GB ctx_size we pass to ForwardContext::create
+        // covers up to ctx ~ 1024 on Qwen3-8B comfortably.
+        auto fc = sp::engine::ForwardContext::create(*m, *W, 1024 * 1024 * 1024);
+        if (!fc) return 5;
+
+        const int n_vocab_local = fc->n_vocab();
+        const int total_chunks  = (int)(all_ids.size() / (size_t)n_ctx);
+        const int eval_chunks   = (n_chunks > 0 && n_chunks < total_chunks)
+                                    ? n_chunks : total_chunks;
+        if (eval_chunks <= 0) {
+            std::fprintf(stderr, "text too short for ctx=%d (have %zu tokens)\n",
+                         n_ctx, all_ids.size()); return 6;
+        }
+        std::fprintf(stderr,
+            "[sp-engine] perplexity: n_ctx=%d  total_chunks=%d  eval=%d  n_vocab=%d\n",
+            n_ctx, total_chunks, eval_chunks, n_vocab_local);
+
+        double total_nll        = 0.0;
+        long long total_evalled = 0;
+
+        std::vector<float> logits;
+        std::vector<int32_t> chunk((size_t)n_ctx);
+        const int32_t bos = v->bos_id();
+
+        for (int c = 0; c < eval_chunks; ++c) {
+            for (int t = 0; t < n_ctx; ++t) {
+                chunk[(size_t)t] = all_ids[(size_t)(c * n_ctx + t)];
+            }
+            // Match llama-perplexity: every chunk's first token is BOS for
+            // the forward pass (resets the "context"), even mid-document.
+            // Targets at chunk positions [first+1, n_ctx) come from the
+            // unchanged all_ids array, so position 0 being BOS only
+            // affects what the model sees, not what we're scoring.
+            if (bos >= 0) chunk[0] = bos;
+            int n_vocab_out = 0;
+            if (!fc->forward_full(chunk, logits, n_vocab_out)) {
+                std::fprintf(stderr, "forward_full failed at chunk %d\n", c); return 7;
+            }
+            // Cross-entropy at every position predicting the next token in
+            // the chunk. We use the half-context warmup convention so the
+            // first half of the chunk is "context only" — matches
+            // llama-perplexity's default behaviour.
+            const int first_eval = n_ctx / 2;
+            for (int i = first_eval; i < n_ctx - 1; ++i) {
+                const float* row = logits.data() + (size_t)i * n_vocab_out;
+                const int32_t target = chunk[(size_t)(i + 1)];
+                // log-softmax via logsumexp for numerical stability.
+                float mx = row[0];
+                for (int k = 1; k < n_vocab_out; ++k) if (row[k] > mx) mx = row[k];
+                double s = 0.0;
+                for (int k = 0; k < n_vocab_out; ++k) s += std::exp((double)(row[k] - mx));
+                const double lse = (double)mx + std::log(s);
+                const double nll = lse - (double)row[target];
+                total_nll += nll;
+                total_evalled += 1;
+            }
+            const double running_ppl = std::exp(total_nll / (double)total_evalled);
+            std::fprintf(stderr, "  chunk %3d/%d  PPL_running=%.4f\n",
+                         c + 1, eval_chunks, running_ppl);
+        }
+        const double mean_nll = total_nll / (double)total_evalled;
+        const double ppl      = std::exp(mean_nll);
+        std::printf("PPL = %.4f  (over %lld tokens, %d chunks at ctx=%d)\n",
+                    ppl, total_evalled, eval_chunks, n_ctx);
         return 0;
     }
 

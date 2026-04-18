@@ -38,6 +38,12 @@ struct ForwardContext::Impl {
     PeSettings         pe;
     std::vector<float> freq_factors_vec;
     float              alibi_max_bias = 0.0f;
+    // Model-provided RoPE scaling factors (rope_freqs.weight in GGUF).
+    // Llama-3.2 ships these to extend the 8K base context to 128K via
+    // YaRN-style per-frequency scaling — without them, attention
+    // degrades at long positions. When PrimePE is inactive we hand
+    // this tensor straight to ggml_rope_ext as freq_factors.
+    ggml_tensor*       model_rope_freqs = nullptr;
 
     ggml_backend_t        backend = nullptr;   // CPU only at this stage
     ggml_backend_buffer_t compute_buf = nullptr;
@@ -108,6 +114,11 @@ std::unique_ptr<ForwardContext> ForwardContext::create(const Model& model,
                                                         pe.pe_tier, fc->impl_->n_rot,
                                                         fc->impl_->rope_freq_base);
     fc->impl_->alibi_max_bias   = prime_pe_alibi_max_bias(pe.pe_mode, pe.pe_alpha);
+
+    // Capture the GGUF-provided RoPE scaling factors (Llama-3.2's 32-fp32
+    // long-context scaling, etc.). Used as fallback freq_factors for
+    // ggml_rope_ext when PrimePE is inactive.
+    fc->impl_->model_rope_freqs = weights.rope_freqs;
 
     fc->impl_->backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
     if (!fc->impl_->backend) {
@@ -361,6 +372,10 @@ bool ForwardContext::forward_one_block(const std::vector<int32_t>& token_ids,
         freq_factors = ggml_new_tensor_1d(gctx, GGML_TYPE_F32,
                                           (int64_t)impl_->freq_factors_vec.size());
         ggml_set_input(freq_factors);
+    } else if (impl_->model_rope_freqs) {
+        // Fall back to the GGUF-provided RoPE scaling (Llama-3.2 ships
+        // 32 fp32 factors that extend its context from 8K to 128K).
+        freq_factors = impl_->model_rope_freqs;
     }
 
     // Causal mask [n_kv=n, n_q=n] fp32. Fixes self-attention's
@@ -462,6 +477,8 @@ bool ForwardContext::forward_full(const std::vector<int32_t>& token_ids,
         freq_factors = ggml_new_tensor_1d(gctx, GGML_TYPE_F32,
                                           (int64_t)impl_->freq_factors_vec.size());
         ggml_set_input(freq_factors);
+    } else if (impl_->model_rope_freqs) {
+        freq_factors = impl_->model_rope_freqs;
     }
     ggml_tensor* kq_mask = ggml_new_tensor_2d(gctx, GGML_TYPE_F32, n, n);
     ggml_set_input(kq_mask);
@@ -780,6 +797,8 @@ bool ForwardContext::decode(int32_t token_id,
         freq_factors = ggml_new_tensor_1d(gctx, GGML_TYPE_F32,
                                           (int64_t)impl_->freq_factors_vec.size());
         ggml_set_input(freq_factors);
+    } else if (impl_->model_rope_freqs) {
+        freq_factors = impl_->model_rope_freqs;
     }
 
     // Per-layer past K/V inputs (only when past_n > 0).
