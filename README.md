@@ -90,14 +90,23 @@ samples per slot).
 
 ### Cache-mode PPL (`perplexity --cache`, ctx=512 chunks=2, wiki.test.raw)
 
-| Model | Mode | PPL | ΔPPL | Compression |
-|---|---|---|---|---|
-| Qwen3-8B-Q8 | baseline (no cache) | 18.05 | — | — |
-| Qwen3-8B-Q8 | **ship** | **18.14** | **+0.5%** | **4.06×** |
+| Model | Mode | PPL | ΔPPL | Compression | Skeleton |
+|---|---|---|---|---|---|
+| Qwen3-8B-Q8 | baseline (no cache) | 18.05 | — | — | — |
+| Qwen3-8B-Q8 | **ship** | **18.14** | **+0.5%** | **4.06×** | full |
+| Qwen3-8B-Q8 | hierarchical (chunk 1 only) | 17.43 | — | 4.06× | 9% (14/154) |
 
-(Dolphin-1B cache-mode numbers omitted — the 1B regime is not
-representative of target deployments and the scaling law
-predicts its behaviour from the K_corr alone.)
+**Hierarchical caveat:** the Qwen3 hier decode chain exceeded the
+CPU bench window mid-chunk-2 and was terminated. Chunk 1 running
+PPL landed at 17.43 (vs ship chunk 1's 11.72 on the same text,
++48%). Extrapolating ship's chunk-1→final growth (11.72 → 18.14,
+~1.55×) suggests hier's full 2-chunk PPL would land near 27, i.e.
++50% vs baseline. That's consistent with the pattern seen on
+Dolphin (decode-chain amplifies the prefill-roundtrip K_corr
+penalty well beyond what the scaling law predicts for single-pass
+forward). Hierarchical on CPU decode is a research-regime path;
+the GPU backend and a persistent-KV-tensor decode will bring it
+back into budget.
 
 ### cache_ppl roundtrip (baseline PPL + K/V correlation)
 
