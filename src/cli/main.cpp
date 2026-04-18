@@ -807,6 +807,25 @@ int main(int argc, char** argv) {
         if (!kv) { std::fprintf(stderr, "KvCache::create failed\n"); return 7; }
         std::fprintf(stderr, "[sp-engine] %s\n", kv->describe().c_str());
 
+        // Optional: calibrate the cache using this prefill's K vectors
+        // before compressed writes. SP_CALIBRATE=1 enables it — matches
+        // what ForwardContext::prefill does automatically under chat.
+        if (std::getenv("SP_CALIBRATE")) {
+            if (kv->calibrate_begin()) {
+                for (int L = 0; L < n_layer; ++L) {
+                    const float* Kd = Ks[(size_t)L].data();
+                    for (int q = 0; q < n; ++q) {
+                        for (int h = 0; h < n_head_kv; ++h) {
+                            kv->calibrate_feed(Kd + (size_t)(q * n_head_kv + h) * head_dim);
+                        }
+                    }
+                }
+                kv->calibrate_end();
+                std::fprintf(stderr, "[sp-engine] calibrated=%s\n",
+                             kv->is_calibrated() ? "yes" : "no");
+            }
+        }
+
         // Push every layer's captured K/V through the compressed cache.
         for (int L = 0; L < n_layer; ++L) {
             if (!kv->write(L, /*pos_offset=*/0, n, Ks[(size_t)L].data(), Vs[(size_t)L].data())) {

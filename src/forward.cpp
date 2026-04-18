@@ -758,6 +758,30 @@ bool ForwardContext::prefill(const std::vector<int32_t>& token_ids,
         return false;
     }
 
+    // ── Adaptive calibration: if cache hasn't been calibrated yet,
+    // use this prefill's K vectors as calibration data. Feed every
+    // per-head K vector from every layer into the calibration
+    // accumulator, then finalize. This rebuilds the Knight mask
+    // (sqfree) or variance-ranked permutation (ship) before any
+    // compressed writes happen.
+    if (!impl_->cache->is_calibrated()) {
+        if (impl_->cache->calibrate_begin()) {
+            const int H  = impl_->n_head_kv;
+            const int hd = impl_->head_dim;
+            for (int L = 0; L < impl_->n_layer; ++L) {
+                const float* K_data = Ks[(size_t)L].data();
+                // Layout: K_data[(q * H + h) * hd + d]
+                for (int q = 0; q < n; ++q) {
+                    for (int h = 0; h < H; ++h) {
+                        impl_->cache->calibrate_feed(
+                            K_data + (size_t)(q * H + h) * hd);
+                    }
+                }
+            }
+            impl_->cache->calibrate_end();
+        }
+    }
+
     // Push every layer to the bound cache at offset = current kv_pos.
     for (int L = 0; L < impl_->n_layer; ++L) {
         if (!impl_->cache->write(L, impl_->kv_pos, n,

@@ -55,6 +55,21 @@ public:
               std::vector<float>& K_out,
               std::vector<float>& V_out) const;
 
+    // --- adaptive calibration ---
+    //
+    // Calibration feeds raw KV vectors through the spectral transform
+    // and accumulates per-coefficient variance. calibrate_end() rebuilds
+    // the internal masks so write/read use variance-ranked ordering
+    // (sqfree: Knight mask with L/2 skeleton; ship: variance-ranked
+    // reorder into banded quantizer).
+    //
+    // Feed ALL calibration vectors between begin/end. Typical use: feed
+    // K vectors from the first forward pass (warmup), then end.
+    bool calibrate_begin();
+    void calibrate_feed(const float* vec);
+    bool calibrate_end();
+    bool is_calibrated() const;
+
     // --- diagnostics / introspection ---
     int  n_layer()           const;
     int  n_head_kv()         const;

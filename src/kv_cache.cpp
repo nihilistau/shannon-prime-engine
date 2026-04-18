@@ -53,6 +53,7 @@ struct KvCache::Impl {
     bool                 sq_inited     = false;
 
     sp_config_t          cfg{};
+    bool                 calibrated = false;
 
     // For shadow path: bytes per K/V vector (used for slot sizing).
     size_t               k_bytes = 0;
@@ -226,6 +227,42 @@ bool KvCache::read(int layer, int kv_len,
         }
     }
     return true;
+}
+
+// ── Adaptive calibration ────────────────────────────────────────────
+
+bool KvCache::calibrate_begin() {
+    if (impl_->sqfree) {
+        return sp_sqfree_calibrate_begin(&impl_->sq) == 0;
+    } else {
+        return sp_shadow_calibrate_begin(&impl_->shadow) == 0;
+    }
+}
+
+void KvCache::calibrate_feed(const float* vec) {
+    if (impl_->sqfree) {
+        sp_sqfree_calibrate_feed(&impl_->sq, vec);
+    } else {
+        sp_shadow_calibrate_feed(&impl_->shadow, vec);
+    }
+}
+
+bool KvCache::calibrate_end() {
+    int rc;
+    if (impl_->sqfree) {
+        rc = sp_sqfree_calibrate_end(&impl_->sq);
+    } else {
+        rc = sp_shadow_calibrate_end(&impl_->shadow);
+    }
+    if (rc == 0) {
+        impl_->calibrated = true;
+        return true;
+    }
+    return false;
+}
+
+bool KvCache::is_calibrated() const {
+    return impl_->calibrated;
 }
 
 } // namespace sp::engine
