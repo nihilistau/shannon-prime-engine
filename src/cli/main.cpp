@@ -33,6 +33,7 @@ static void usage(const char* prog) {
         "  decode --model <gguf> <id1> [id2 ...]  Decode IDs to text.\n"
         "  embed  --model <gguf> <text>  Encode + run token-embedding lookup.\n"
         "  block1 --model <gguf> <text>  Run layer-0 transformer block forward.\n"
+        "  logits --model <gguf> <text>  Run full forward pass, print logit stats.\n"
         "  perplexity <args>    (not yet implemented)\n"
         "  run <args>           (not yet implemented)\n"
         "\n"
@@ -190,7 +191,7 @@ int main(int argc, char** argv) {
         std::vector<int32_t> ids;
         tk->encode(text, /*add_bos=*/true, ids);
 
-        auto fc = sp::engine::ForwardContext::create(*W);
+        auto fc = sp::engine::ForwardContext::create(*m, *W);
         if (!fc) return 4;
 
         std::vector<float> emb;
@@ -241,7 +242,7 @@ int main(int argc, char** argv) {
         std::vector<int32_t> ids;
         tk->encode(text, /*add_bos=*/true, ids);
 
-        auto fc = sp::engine::ForwardContext::create(*W, /*ctx_size_bytes=*/256 * 1024 * 1024);
+        auto fc = sp::engine::ForwardContext::create(*m, *W, /*ctx_size_bytes=*/256 * 1024 * 1024);
         if (!fc) return 4;
 
         std::vector<float> out;
@@ -271,6 +272,81 @@ int main(int argc, char** argv) {
                         out[(size_t)(n-1) * n_embd + 0], out[(size_t)(n-1) * n_embd + 1],
                         out[(size_t)(n-1) * n_embd + 2], out[(size_t)(n-1) * n_embd + 3]);
         }
+        return 0;
+    }
+
+    if (cmd == "logits") {
+        if (cfg.model_path.empty()) {
+            std::fprintf(stderr, "logits requires --model <path.gguf>\n"); return 1;
+        }
+        auto m = sp::engine::Model::load(cfg.model_path);
+        if (!m) return 2;
+        auto v = sp::engine::Vocab::load(*m);
+        auto tk = v ? sp::engine::Tokenizer::create(*v) : nullptr;
+        auto W = sp::engine::LlamaWeights::load(*m);
+        if (!tk || !W) return 3;
+
+        std::string text;
+        for (size_t i = 0; i < rest.size(); ++i) {
+            if (i) text.push_back(' ');
+            text += rest[i];
+        }
+        std::vector<int32_t> ids;
+        tk->encode(text, /*add_bos=*/true, ids);
+
+        auto fc = sp::engine::ForwardContext::create(*m, *W, /*ctx_size_bytes=*/1024 * 1024 * 1024);
+        if (!fc) return 4;
+
+        std::vector<float> logits;
+        int n_vocab = 0;
+        if (!fc->forward_full(ids, logits, n_vocab)) {
+            std::fprintf(stderr, "forward_full failed\n"); return 5;
+        }
+
+        const int n = (int)ids.size();
+        double sum = 0, sumsq = 0;
+        int n_nan = 0;
+        for (float f : logits) {
+            if (std::isnan(f) || std::isinf(f)) { n_nan++; continue; }
+            sum += f; sumsq += (double)f * f;
+        }
+        double mean = sum / logits.size();
+        double var  = (sumsq / logits.size()) - mean * mean;
+        double stdv = var > 0 ? std::sqrt(var) : 0.0;
+
+        std::printf("n_tokens=%d  n_vocab=%d  n_elems=%zu  n_nan=%d\n",
+                    n, n_vocab, logits.size(), n_nan);
+        std::printf("mean=%.6f  std=%.6f  min=%.6f  max=%.6f\n",
+                    mean, stdv,
+                    *std::min_element(logits.begin(), logits.end()),
+                    *std::max_element(logits.begin(), logits.end()));
+
+        // Last-row argmax: the next-token prediction for the prompt.
+        const float* last = logits.data() + (size_t)(n - 1) * n_vocab;
+        int arg = 0;
+        float best = last[0];
+        for (int i = 1; i < n_vocab; ++i) {
+            if (last[i] > best) { best = last[i]; arg = i; }
+        }
+        std::printf("argmax(last) = %d  logit=%+.4f  token=\"%s\"\n",
+                    arg, best,
+                    (v && arg >= 0 && (size_t)arg < v->size()) ? v->token(arg).c_str() : "?");
+
+        // Top-5 of the last row for a sanity sample.
+        std::vector<std::pair<float,int>> topv;
+        topv.reserve(n_vocab);
+        for (int i = 0; i < n_vocab; ++i) topv.emplace_back(last[i], i);
+        std::partial_sort(topv.begin(), topv.begin() + 5, topv.end(),
+                          [](const auto& a, const auto& b){ return a.first > b.first; });
+        std::printf("top5:");
+        for (int i = 0; i < 5; ++i) {
+            int id = topv[i].second;
+            std::printf("  [%d %s %+.3f]",
+                        id,
+                        (v && (size_t)id < v->size()) ? v->token(id).c_str() : "?",
+                        topv[i].first);
+        }
+        std::printf("\n");
         return 0;
     }
 

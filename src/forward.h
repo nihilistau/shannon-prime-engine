@@ -29,14 +29,16 @@ struct ggml_tensor;
 namespace sp::engine {
 
 class LlamaWeights;
+class Model;
 
 class ForwardContext {
 public:
-    // Construct a reusable compute context for a given model. ctx_size is
-    // the compute-graph memory cap (bytes); 64 MB is plenty for 3a and
-    // small for later stages — the stage-3c commit bumps it.
-    static std::unique_ptr<ForwardContext> create(const LlamaWeights& weights,
-                                                   int ctx_size_bytes = 64 * 1024 * 1024);
+    // Construct a reusable compute context for a given model. ctx_size
+    // defaults large enough for typical 1B–8B prefill up to ~512 tokens;
+    // caller can override.
+    static std::unique_ptr<ForwardContext> create(const Model&         model,
+                                                   const LlamaWeights& weights,
+                                                   int ctx_size_bytes = 512 * 1024 * 1024);
 
     ~ForwardContext();
     ForwardContext(const ForwardContext&) = delete;
@@ -55,11 +57,23 @@ public:
     // (n, n_embd) fp32 flat array. No KV cache — self-attention is
     // computed among the prefill tokens in a single pass.
     //
-    // This is a diagnostic entry point; stage 3c replaces it with a
-    // full n_layer forward pass that feeds into the output head.
+    // This is a diagnostic entry point; stage 3c adds forward_full()
+    // which loops over all layers and emits logits.
     bool forward_one_block(const std::vector<int32_t>& token_ids,
                            std::vector<float>& out_flat,
                            int& out_n_embd);
+
+    // Run the 3c-stage graph: prefill through all n_layer transformer
+    // blocks, then output_norm + output head → logits. Returns the
+    // (n, n_vocab) fp32 logits flat.
+    bool forward_full(const std::vector<int32_t>& token_ids,
+                      std::vector<float>& logits_flat,
+                      int& out_n_vocab);
+
+    // Hparams the caller set at create(); exposed for diagnostics.
+    int n_embd()  const;
+    int n_vocab() const;
+    int n_layer() const;
 
 private:
     ForwardContext();
