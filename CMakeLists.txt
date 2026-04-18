@@ -86,7 +86,8 @@ add_subdirectory(vendor/ggml EXCLUDE_FROM_ALL)
 add_library(sp_engine STATIC
     src/engine.cpp
     src/kv_cache.cpp
-    src/model_loader.cpp)
+    src/model_loader.cpp
+    src/gguf_loader.cpp)
 target_include_directories(sp_engine PUBLIC src)
 target_link_libraries(sp_engine PUBLIC
     shannon_prime_core

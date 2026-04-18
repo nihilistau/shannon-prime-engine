@@ -5,7 +5,9 @@
 // Commercial license available — contact raydaniels@gmail.com
 
 #include "engine.h"
+#include "gguf_loader.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -19,6 +21,7 @@ static void usage(const char* prog) {
         "Commands:\n"
         "  version              Print version.\n"
         "  banner               Print banner + loaded submodule SHAs (sanity).\n"
+        "  info --model <gguf>  Load a GGUF and print hparams + tensor summary.\n"
         "  perplexity <args>    (not yet implemented)\n"
         "  run <args>           (not yet implemented)\n"
         "\n"
@@ -72,6 +75,31 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "unknown arg: %s\n", a.c_str());
             return 2;
         }
+    }
+
+    if (cmd == "info") {
+        if (cfg.model_path.empty()) {
+            std::fprintf(stderr, "info requires --model <path.gguf>\n");
+            return 1;
+        }
+        auto m = sp::engine::Model::load(cfg.model_path);
+        if (!m) return 2;
+        m->print_summary(stdout);
+
+        // Also show the first few tensors so the user can spot-check the
+        // layout without loading a full inspection tool.
+        std::printf("\n  first %d tensors:\n",
+                    (int)std::min<size_t>(m->tensor_count(), 8));
+        for (size_t i = 0; i < m->tensor_count() && i < 8; ++i) {
+            auto ti = m->tensor_info(i);
+            std::printf("    [%3zu] %-48s type=%d size=%llu B\n",
+                        i, ti.name.c_str(), ti.type,
+                        (unsigned long long)ti.n_bytes);
+        }
+        if (m->tensor_count() > 8) {
+            std::printf("    ... (%zu total)\n", m->tensor_count());
+        }
+        return 0;
     }
 
     if (cmd == "perplexity" || cmd == "run") {
