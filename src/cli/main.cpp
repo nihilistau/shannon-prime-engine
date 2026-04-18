@@ -6,12 +6,15 @@
 
 #include "engine.h"
 #include "gguf_loader.h"
+#include "tokenizer.h"
 #include "vocab.h"
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
+#include <vector>
 
 static void usage(const char* prog) {
     std::fprintf(stderr,
@@ -23,6 +26,8 @@ static void usage(const char* prog) {
         "  version              Print version.\n"
         "  banner               Print banner + loaded submodule SHAs (sanity).\n"
         "  info --model <gguf>  Load a GGUF and print hparams + tensor summary.\n"
+        "  encode --model <gguf> <text>  Tokenise text to IDs.\n"
+        "  decode --model <gguf> <id1> [id2 ...]  Decode IDs to text.\n"
         "  perplexity <args>    (not yet implemented)\n"
         "  run <args>           (not yet implemented)\n"
         "\n"
@@ -55,16 +60,17 @@ int main(int argc, char** argv) {
         return 0;
     }
 
-    // Stub argparse for the other commands. Real one lands with the
-    // first functional command.
+    // Flag parser — extracts known flags and stashes positional args in `rest`.
+    // Per-command handlers below can consume those positionals however they like.
     sp::engine::Config cfg;
+    std::vector<std::string> rest;
     for (int i = 2; i < argc; ++i) {
         std::string a = argv[i];
         auto next = [&](const char* key, std::string& dst) {
             if (a == key && i + 1 < argc) { dst = argv[++i]; return true; }
             return false;
         };
-        if (a == "--sqfree")         cfg.sqfree = true;
+        if      (a == "--sqfree")    cfg.sqfree = true;
         else if (a == "--spinor")    cfg.spinor = true;
         else if (a == "--no-mobius") cfg.mobius = false;
         else if (next("--model",   cfg.model_path)) {}
@@ -72,10 +78,11 @@ int main(int argc, char** argv) {
         else if (next("--v-bits",  cfg.v_bits_csv)) {}
         else if (a == "--ctx" && i + 1 < argc)           cfg.n_ctx = std::atoi(argv[++i]);
         else if (a == "--residual-bits" && i + 1 < argc) cfg.residual_bits = std::atoi(argv[++i]);
-        else {
-            std::fprintf(stderr, "unknown arg: %s\n", a.c_str());
+        else if (a.size() >= 2 && a[0] == '-' && a[1] == '-') {
+            std::fprintf(stderr, "unknown flag: %s\n", a.c_str());
             return 2;
         }
+        else rest.push_back(std::move(a));
     }
 
     if (cmd == "info") {
@@ -112,6 +119,42 @@ int main(int argc, char** argv) {
         } else {
             std::printf("Tokenizer: (no vocab section in this GGUF)\n");
         }
+        return 0;
+    }
+
+    if (cmd == "encode" || cmd == "decode") {
+        if (cfg.model_path.empty()) {
+            std::fprintf(stderr, "%s requires --model <path.gguf>\n", cmd.c_str());
+            return 1;
+        }
+        auto m = sp::engine::Model::load(cfg.model_path);
+        if (!m) return 2;
+        auto v = sp::engine::Vocab::load(*m);
+        if (!v) { std::fprintf(stderr, "no vocab\n"); return 3; }
+        auto tk = sp::engine::Tokenizer::create(*v);
+        if (!tk) return 4;
+
+        if (cmd == "encode") {
+            std::string text;
+            for (size_t i = 0; i < rest.size(); ++i) {
+                if (i) text.push_back(' ');
+                text += rest[i];
+            }
+            std::vector<int32_t> ids;
+            tk->encode(text, /*add_bos=*/true, ids);
+            for (size_t i = 0; i < ids.size(); ++i) {
+                std::printf("%s%d", i ? " " : "", ids[i]);
+            }
+            std::printf("\n");
+            std::fprintf(stderr, "(%zu tokens)\n", ids.size());
+            return 0;
+        }
+
+        // decode
+        std::vector<int32_t> ids;
+        for (const auto& s : rest) ids.push_back(std::atoi(s.c_str()));
+        std::string out = tk->decode(ids);
+        std::printf("%s\n", out.c_str());
         return 0;
     }
 
