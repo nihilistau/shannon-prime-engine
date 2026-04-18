@@ -32,6 +32,7 @@ static void usage(const char* prog) {
         "  encode --model <gguf> <text>  Tokenise text to IDs.\n"
         "  decode --model <gguf> <id1> [id2 ...]  Decode IDs to text.\n"
         "  embed  --model <gguf> <text>  Encode + run token-embedding lookup.\n"
+        "  block1 --model <gguf> <text>  Run layer-0 transformer block forward.\n"
         "  perplexity <args>    (not yet implemented)\n"
         "  run <args>           (not yet implemented)\n"
         "\n"
@@ -217,6 +218,58 @@ int main(int argc, char** argv) {
         if (n >= 2) {
             std::printf("emb[1][:4]   = %+.6f %+.6f %+.6f %+.6f\n",
                         emb[n_embd], emb[n_embd+1], emb[n_embd+2], emb[n_embd+3]);
+        }
+        return 0;
+    }
+
+    if (cmd == "block1") {
+        if (cfg.model_path.empty()) {
+            std::fprintf(stderr, "block1 requires --model <path.gguf>\n"); return 1;
+        }
+        auto m = sp::engine::Model::load(cfg.model_path);
+        if (!m) return 2;
+        auto v = sp::engine::Vocab::load(*m);
+        auto tk = v ? sp::engine::Tokenizer::create(*v) : nullptr;
+        auto W = sp::engine::LlamaWeights::load(*m);
+        if (!tk || !W) return 3;
+
+        std::string text;
+        for (size_t i = 0; i < rest.size(); ++i) {
+            if (i) text.push_back(' ');
+            text += rest[i];
+        }
+        std::vector<int32_t> ids;
+        tk->encode(text, /*add_bos=*/true, ids);
+
+        auto fc = sp::engine::ForwardContext::create(*W, /*ctx_size_bytes=*/256 * 1024 * 1024);
+        if (!fc) return 4;
+
+        std::vector<float> out;
+        int n_embd = 0;
+        if (!fc->forward_one_block(ids, out, n_embd)) {
+            std::fprintf(stderr, "forward_one_block failed\n"); return 5;
+        }
+
+        const int n = (int)ids.size();
+        double sum = 0, sumsq = 0;
+        int n_nan = 0;
+        for (float f : out) {
+            if (std::isnan(f) || std::isinf(f)) { n_nan++; continue; }
+            sum += f; sumsq += (double)f * f;
+        }
+        double mean = sum / out.size();
+        double var  = (sumsq / out.size()) - mean * mean;
+        double stdv = var > 0 ? std::sqrt(var) : 0.0;
+
+        std::printf("n_tokens=%d  n_embd=%d  n_elems=%zu  n_nan=%d\n",
+                    n, n_embd, out.size(), n_nan);
+        std::printf("mean=%.6f  std=%.6f\n", mean, stdv);
+        std::printf("out[0][:4]  = %+.6f %+.6f %+.6f %+.6f\n",
+                    out[0], out[1], out[2], out[3]);
+        if (n >= 2) {
+            std::printf("out[-1][:4] = %+.6f %+.6f %+.6f %+.6f\n",
+                        out[(size_t)(n-1) * n_embd + 0], out[(size_t)(n-1) * n_embd + 1],
+                        out[(size_t)(n-1) * n_embd + 2], out[(size_t)(n-1) * n_embd + 3]);
         }
         return 0;
     }

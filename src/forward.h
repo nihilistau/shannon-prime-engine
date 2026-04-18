@@ -50,6 +50,17 @@ public:
                std::vector<float>& out_flat,
                int& out_n_embd);
 
+    // Run the 3b-stage graph: prefill a sequence through ONE transformer
+    // block (layer 0). Returns the post-block hidden states as an
+    // (n, n_embd) fp32 flat array. No KV cache — self-attention is
+    // computed among the prefill tokens in a single pass.
+    //
+    // This is a diagnostic entry point; stage 3c replaces it with a
+    // full n_layer forward pass that feeds into the output head.
+    bool forward_one_block(const std::vector<int32_t>& token_ids,
+                           std::vector<float>& out_flat,
+                           int& out_n_embd);
+
 private:
     ForwardContext();
     struct Impl;
