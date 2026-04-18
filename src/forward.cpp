@@ -4,6 +4,7 @@
 #include "forward.h"
 #include "gguf_loader.h"
 #include "llama_weights.h"
+#include "prime_pe.h"
 
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
@@ -30,6 +31,13 @@ struct ForwardContext::Impl {
     float rope_freq_base  = 10000.0f;
     float rope_freq_scale = 1.0f;
 
+    // PrimePE-RoPE-ALiBi precomputed values. `freq_factors_vec` is
+    // empty when PE is Standard/AlibiOnly (ggml_rope_ext gets nullptr);
+    // `alibi_max_bias` is 0 unless an ALiBi mode is selected.
+    PeSettings         pe;
+    std::vector<float> freq_factors_vec;
+    float              alibi_max_bias = 0.0f;
+
     ggml_backend_t        backend = nullptr;   // CPU only at this stage
     ggml_backend_buffer_t compute_buf = nullptr;
     ggml_gallocr_t        allocr = nullptr;
@@ -53,7 +61,8 @@ int ForwardContext::n_layer() const { return impl_->n_layer; }
 
 std::unique_ptr<ForwardContext> ForwardContext::create(const Model& model,
                                                         const LlamaWeights& weights,
-                                                        int ctx_size_bytes) {
+                                                        int ctx_size_bytes,
+                                                        PeSettings pe) {
     if (!weights.tok_embd) {
         std::fprintf(stderr, "[sp-engine] ForwardContext: weights missing tok_embd\n");
         return nullptr;
@@ -79,6 +88,14 @@ std::unique_ptr<ForwardContext> ForwardContext::create(const Model& model,
     fc->impl_->n_rot = (int)model.rope_dim_count();
     if (fc->impl_->n_rot == 0) fc->impl_->n_rot = fc->impl_->head_dim;
     fc->impl_->rope_freq_base = model.rope_freq_base();
+
+    // PrimePE precompute. One allocation per ForwardContext; re-uploaded
+    // into each graph's freq_factors input tensor.
+    fc->impl_->pe               = pe;
+    fc->impl_->freq_factors_vec = prime_pe_freq_factors(pe.pe_mode, pe.pe_alpha,
+                                                        pe.pe_tier, fc->impl_->n_rot,
+                                                        fc->impl_->rope_freq_base);
+    fc->impl_->alibi_max_bias   = prime_pe_alibi_max_bias(pe.pe_mode, pe.pe_alpha);
 
     fc->impl_->backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
     if (!fc->impl_->backend) {
@@ -200,6 +217,9 @@ bool ForwardContext::embed(const std::vector<int32_t>& token_ids,
 static ggml_tensor* build_block(ggml_context* gctx,
                                  ggml_tensor* x,
                                  ggml_tensor* pos,
+                                 ggml_tensor* kq_mask,       // [n_kv, n_q] fp32
+                                 ggml_tensor* freq_factors,  // may be nullptr
+                                 float        alibi_max_bias,
                                  const LlamaLayer& L,
                                  int n,
                                  int head_dim,
@@ -234,9 +254,9 @@ static ggml_tensor* build_block(ggml_context* gctx,
         K = ggml_mul(gctx, K, L.attn_k_norm);
     }
 
-    Q = ggml_rope_ext(gctx, Q, pos, /*freq_factors=*/nullptr,
+    Q = ggml_rope_ext(gctx, Q, pos, freq_factors,
                       n_rot, 0, 0, freq_base, freq_scale, 0, 1, 32, 1);
-    K = ggml_rope_ext(gctx, K, pos, /*freq_factors=*/nullptr,
+    K = ggml_rope_ext(gctx, K, pos, freq_factors,
                       n_rot, 0, 0, freq_base, freq_scale, 0, 1, 32, 1);
 
     // GQA broadcast.
@@ -256,8 +276,8 @@ static ggml_tensor* build_block(ggml_context* gctx,
     ggml_tensor* Qp = ggml_cont(gctx, ggml_permute(gctx, Q, 0, 2, 1, 3));
     ggml_tensor* Kp = ggml_cont(gctx, ggml_permute(gctx, K, 0, 2, 1, 3));
     ggml_tensor* KQ = ggml_mul_mat(gctx, Kp, Qp);
-    KQ = ggml_soft_max_ext(gctx, KQ, nullptr,
-                           1.0f / sqrtf((float)head_dim), 0.0f);
+    KQ = ggml_soft_max_ext(gctx, KQ, kq_mask,
+                           1.0f / sqrtf((float)head_dim), alibi_max_bias);
 
     ggml_tensor* Vp = ggml_cont(gctx, ggml_permute(gctx, V, 1, 2, 0, 3));
     ggml_tensor* attn = ggml_mul_mat(gctx, Vp, KQ);
@@ -305,8 +325,22 @@ bool ForwardContext::forward_one_block(const std::vector<int32_t>& token_ids,
     ggml_tensor* pos = ggml_new_tensor_1d(gctx, GGML_TYPE_I32, n);
     ggml_set_input(pos);
 
+    ggml_tensor* freq_factors = nullptr;
+    if (!impl_->freq_factors_vec.empty()) {
+        freq_factors = ggml_new_tensor_1d(gctx, GGML_TYPE_F32,
+                                          (int64_t)impl_->freq_factors_vec.size());
+        ggml_set_input(freq_factors);
+    }
+
+    // Causal mask [n_kv=n, n_q=n] fp32. Fixes self-attention's
+    // bidirectional bug from stage 3b/3c AND carries ALiBi position
+    // offsets when max_bias > 0 (slope * mask added to scores).
+    ggml_tensor* kq_mask = ggml_new_tensor_2d(gctx, GGML_TYPE_F32, n, n);
+    ggml_set_input(kq_mask);
+
     ggml_tensor* x = ggml_get_rows(gctx, W->tok_embd, ids);
-    x = build_block(gctx, x, pos, W->layers()[0], n,
+    x = build_block(gctx, x, pos, kq_mask, freq_factors, impl_->alibi_max_bias,
+                     W->layers()[0], n,
                      impl_->head_dim, impl_->n_head, impl_->n_head_kv,
                      impl_->n_rot, impl_->rope_freq_base, impl_->rope_freq_scale);
     ggml_set_output(x);
@@ -321,6 +355,28 @@ bool ForwardContext::forward_one_block(const std::vector<int32_t>& token_ids,
     std::vector<int32_t> positions(n);
     for (int i = 0; i < n; ++i) positions[i] = i;
     ggml_backend_tensor_set(pos, positions.data(), 0, (size_t)n * sizeof(int32_t));
+    if (freq_factors) {
+        ggml_backend_tensor_set(freq_factors, impl_->freq_factors_vec.data(), 0,
+                                impl_->freq_factors_vec.size() * sizeof(float));
+    }
+    // Causal mask: element [kv, q] (row-major, column = fastest) is
+    // -INF if kv > q, else the ALiBi distance (-(q-kv)) when ALiBi is
+    // on, else 0. With max_bias=0 ggml uses slope=1 on the mask, so
+    // the 0/−INF convention degenerates to the usual causal mask.
+    {
+        std::vector<float> mask((size_t)n * (size_t)n);
+        const bool alibi = (impl_->alibi_max_bias > 0.0f);
+        for (int q = 0; q < n; ++q) {
+            for (int kv = 0; kv < n; ++kv) {
+                float v;
+                if (kv > q)      v = -INFINITY;
+                else if (alibi)  v = -(float)(q - kv);
+                else             v = 0.0f;
+                mask[(size_t)q * n + kv] = v;
+            }
+        }
+        ggml_backend_tensor_set(kq_mask, mask.data(), 0, mask.size() * sizeof(float));
+    }
 
     if (ggml_backend_graph_compute(impl_->backend, graph) != GGML_STATUS_SUCCESS) {
         ggml_free(gctx); return false;
@@ -357,10 +413,20 @@ bool ForwardContext::forward_full(const std::vector<int32_t>& token_ids,
     ggml_tensor* pos = ggml_new_tensor_1d(gctx, GGML_TYPE_I32, n);
     ggml_set_input(pos);
 
+    ggml_tensor* freq_factors = nullptr;
+    if (!impl_->freq_factors_vec.empty()) {
+        freq_factors = ggml_new_tensor_1d(gctx, GGML_TYPE_F32,
+                                          (int64_t)impl_->freq_factors_vec.size());
+        ggml_set_input(freq_factors);
+    }
+    ggml_tensor* kq_mask = ggml_new_tensor_2d(gctx, GGML_TYPE_F32, n, n);
+    ggml_set_input(kq_mask);
+
     ggml_tensor* x = ggml_get_rows(gctx, W->tok_embd, ids);
 
     for (int i = 0; i < impl_->n_layer; ++i) {
-        x = build_block(gctx, x, pos, W->layers()[(size_t)i], n,
+        x = build_block(gctx, x, pos, kq_mask, freq_factors, impl_->alibi_max_bias,
+                         W->layers()[(size_t)i], n,
                          impl_->head_dim, impl_->n_head, impl_->n_head_kv,
                          impl_->n_rot, impl_->rope_freq_base, impl_->rope_freq_scale);
     }
@@ -382,6 +448,24 @@ bool ForwardContext::forward_full(const std::vector<int32_t>& token_ids,
     std::vector<int32_t> positions(n);
     for (int i = 0; i < n; ++i) positions[i] = i;
     ggml_backend_tensor_set(pos, positions.data(), 0, (size_t)n * sizeof(int32_t));
+    if (freq_factors) {
+        ggml_backend_tensor_set(freq_factors, impl_->freq_factors_vec.data(), 0,
+                                impl_->freq_factors_vec.size() * sizeof(float));
+    }
+    {
+        std::vector<float> mask((size_t)n * (size_t)n);
+        const bool alibi = (impl_->alibi_max_bias > 0.0f);
+        for (int q = 0; q < n; ++q) {
+            for (int kv = 0; kv < n; ++kv) {
+                float v;
+                if (kv > q)      v = -INFINITY;
+                else if (alibi)  v = -(float)(q - kv);
+                else             v = 0.0f;
+                mask[(size_t)q * n + kv] = v;
+            }
+        }
+        ggml_backend_tensor_set(kq_mask, mask.data(), 0, mask.size() * sizeof(float));
+    }
 
     if (ggml_backend_graph_compute(impl_->backend, graph) != GGML_STATUS_SUCCESS) {
         std::fprintf(stderr, "[sp-engine] forward_full: compute failed\n");

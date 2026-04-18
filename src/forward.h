@@ -16,6 +16,8 @@
 
 #pragma once
 
+#include "engine.h"   // PeMode lives on Config
+
 #include <cstdint>
 #include <memory>
 #include <vector>
@@ -31,14 +33,26 @@ namespace sp::engine {
 class LlamaWeights;
 class Model;
 
+// Narrow view of the positional-encoding knobs. Kept as a tiny struct
+// so ForwardContext::create stays call-site-light (most callers pass
+// the default = Standard RoPE, no ALiBi).
+struct PeSettings {
+    Config::PeMode pe_mode  = Config::PeMode::Standard;
+    float          pe_alpha = 0.0f;
+    int            pe_tier  = 0;
+};
+
 class ForwardContext {
 public:
     // Construct a reusable compute context for a given model. ctx_size
     // defaults large enough for typical 1B–8B prefill up to ~512 tokens;
-    // caller can override.
+    // caller can override. `pe` selects the positional-encoding variant
+    // (default Standard = geometric RoPE, no ALiBi — byte-for-byte
+    // compatible with llama.cpp).
     static std::unique_ptr<ForwardContext> create(const Model&         model,
                                                    const LlamaWeights& weights,
-                                                   int ctx_size_bytes = 512 * 1024 * 1024);
+                                                   int ctx_size_bytes = 512 * 1024 * 1024,
+                                                   PeSettings pe = {});
 
     ~ForwardContext();
     ForwardContext(const ForwardContext&) = delete;

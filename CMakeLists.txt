@@ -91,7 +91,8 @@ add_library(sp_engine STATIC
     src/vocab.cpp
     src/tokenizer.cpp
     src/llama_weights.cpp
-    src/forward.cpp)
+    src/forward.cpp
+    src/prime_pe.cpp)
 target_include_directories(sp_engine PUBLIC src)
 target_link_libraries(sp_engine PUBLIC
     shannon_prime_core

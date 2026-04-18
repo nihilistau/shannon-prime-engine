@@ -8,6 +8,7 @@
 #include "forward.h"
 #include "gguf_loader.h"
 #include "llama_weights.h"
+#include "prime_pe.h"
 #include "tokenizer.h"
 #include "vocab.h"
 
@@ -46,6 +47,11 @@ static void usage(const char* prog) {
         "  --k-bits <csv>       K band bits, e.g. 5,5,4,3\n"
         "  --v-bits <csv>       V band bits, default 3\n"
         "  --residual-bits <n>  sqfree residual bits, default 3\n"
+        "\n"
+        "PrimePE-RoPE-ALiBi:\n"
+        "  --pe-mode <name>     standard|primepe|primepe_alibi|alibi (default: standard)\n"
+        "  --pe-alpha <f>       blend factor 0..1 (default: 0.0 = identity)\n"
+        "  --pe-tier  <n>       0 = composite lattice, 1 = prime generators\n"
         "\n", prog);
 }
 
@@ -84,6 +90,16 @@ int main(int argc, char** argv) {
         else if (next("--v-bits",  cfg.v_bits_csv)) {}
         else if (a == "--ctx" && i + 1 < argc)           cfg.n_ctx = std::atoi(argv[++i]);
         else if (a == "--residual-bits" && i + 1 < argc) cfg.residual_bits = std::atoi(argv[++i]);
+        else if (a == "--pe-mode" && i + 1 < argc) {
+            std::string m = argv[++i];
+            if      (m == "standard")      cfg.pe_mode = sp::engine::Config::PeMode::Standard;
+            else if (m == "primepe")       cfg.pe_mode = sp::engine::Config::PeMode::PrimePe;
+            else if (m == "primepe_alibi") cfg.pe_mode = sp::engine::Config::PeMode::PrimePeAlibi;
+            else if (m == "alibi")         cfg.pe_mode = sp::engine::Config::PeMode::AlibiOnly;
+            else { std::fprintf(stderr, "bad --pe-mode: %s\n", m.c_str()); return 2; }
+        }
+        else if (a == "--pe-alpha" && i + 1 < argc) cfg.pe_alpha = (float)std::atof(argv[++i]);
+        else if (a == "--pe-tier"  && i + 1 < argc) cfg.pe_tier  = std::atoi(argv[++i]);
         else if (a.size() >= 2 && a[0] == '-' && a[1] == '-') {
             std::fprintf(stderr, "unknown flag: %s\n", a.c_str());
             return 2;
@@ -191,7 +207,8 @@ int main(int argc, char** argv) {
         std::vector<int32_t> ids;
         tk->encode(text, /*add_bos=*/true, ids);
 
-        auto fc = sp::engine::ForwardContext::create(*m, *W);
+        sp::engine::PeSettings pe{cfg.pe_mode, cfg.pe_alpha, cfg.pe_tier};
+        auto fc = sp::engine::ForwardContext::create(*m, *W, 512*1024*1024, pe);
         if (!fc) return 4;
 
         std::vector<float> emb;
@@ -242,7 +259,9 @@ int main(int argc, char** argv) {
         std::vector<int32_t> ids;
         tk->encode(text, /*add_bos=*/true, ids);
 
-        auto fc = sp::engine::ForwardContext::create(*m, *W, /*ctx_size_bytes=*/256 * 1024 * 1024);
+        sp::engine::PeSettings pe{cfg.pe_mode, cfg.pe_alpha, cfg.pe_tier};
+        auto fc = sp::engine::ForwardContext::create(*m, *W,
+                      /*ctx_size_bytes=*/256 * 1024 * 1024, pe);
         if (!fc) return 4;
 
         std::vector<float> out;
@@ -294,7 +313,11 @@ int main(int argc, char** argv) {
         std::vector<int32_t> ids;
         tk->encode(text, /*add_bos=*/true, ids);
 
-        auto fc = sp::engine::ForwardContext::create(*m, *W, /*ctx_size_bytes=*/1024 * 1024 * 1024);
+        sp::engine::PeSettings pe{cfg.pe_mode, cfg.pe_alpha, cfg.pe_tier};
+        std::fprintf(stderr, "[sp-engine] PE: %s\n",
+                     sp::engine::prime_pe_describe(cfg.pe_mode, cfg.pe_alpha, cfg.pe_tier).c_str());
+        auto fc = sp::engine::ForwardContext::create(*m, *W,
+                      /*ctx_size_bytes=*/1024 * 1024 * 1024, pe);
         if (!fc) return 4;
 
         std::vector<float> logits;
