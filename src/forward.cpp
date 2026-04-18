@@ -29,8 +29,10 @@ struct ForwardContext::Impl {
     int   n_head_kv = 0;
     int   head_dim  = 0;
     int   n_rot     = 0;          // RoPE dim count (often = head_dim)
+    int   rope_mode = 0;          // 0 = LLaMA-style, 2 = NEOX (qwen, phi3, …)
     float rope_freq_base  = 10000.0f;
     float rope_freq_scale = 1.0f;
+    float rms_norm_eps    = 1e-5f;  // Llama-3 default; Qwen3 uses 1e-6
 
     // PrimePE-RoPE-ALiBi precomputed values. `freq_factors_vec` is
     // empty when PE is Standard/AlibiOnly (ggml_rope_ext gets nullptr);
@@ -106,6 +108,26 @@ std::unique_ptr<ForwardContext> ForwardContext::create(const Model& model,
     fc->impl_->n_rot = (int)model.rope_dim_count();
     if (fc->impl_->n_rot == 0) fc->impl_->n_rot = fc->impl_->head_dim;
     fc->impl_->rope_freq_base = model.rope_freq_base();
+    // RMS norm epsilon: Llama-3 = 1e-5, Qwen3 = 1e-6, etc. The key is
+    // namespaced by architecture (e.g., "qwen3.attention.layer_norm_rms_epsilon").
+    {
+        const std::string key = model.architecture() + ".attention.layer_norm_rms_epsilon";
+        const double eps = model.get_f64(key, 1e-5);
+        fc->impl_->rms_norm_eps = (float)eps;
+    }
+    // RoPE rotation layout (NORMAL = adjacent pairs / NEOX = offset by n_rot/2).
+    // The two layouts differ in how the half-rotations are interleaved within
+    // each head's vector; the wrong choice scrambles K/Q relative phase and
+    // wrecks long-context attention. Mirrors llama.cpp's per-arch table.
+    {
+        const std::string& a = model.architecture();
+        if (a == "llama" || a == "mistral" || a == "mistral3" ||
+            a == "granite" || a == "minicpm" || a == "command-r") {
+            fc->impl_->rope_mode = 0;          // GGML_ROPE_TYPE_NORMAL
+        } else {
+            fc->impl_->rope_mode = 2;          // GGML_ROPE_TYPE_NEOX (qwen*, phi*, gemma*, ...)
+        }
+    }
 
     // PrimePE precompute. One allocation per ForwardContext; re-uploaded
     // into each graph's freq_factors input tensor.
@@ -251,6 +273,8 @@ static ggml_tensor* build_block(ggml_context* gctx,
                                  int n_rot,
                                  float freq_base,
                                  float freq_scale,
+                                 float rms_eps,
+                                 int   rope_mode,
                                  // Optional captures: if non-null, the
                                  // post-RoPE pre-GQA-broadcast K and V
                                  // tensors are returned through these.
@@ -262,7 +286,7 @@ static ggml_tensor* build_block(ggml_context* gctx,
     const int n_embd_q = n_head * head_dim;
 
     // Attention pre-norm + projections.
-    ggml_tensor* xa = ggml_rms_norm(gctx, x, 1e-5f);
+    ggml_tensor* xa = ggml_rms_norm(gctx, x, rms_eps);
     xa = ggml_mul(gctx, xa, L.attn_norm);
 
     ggml_tensor* Q = ggml_mul_mat(gctx, L.wq, xa);
@@ -277,18 +301,18 @@ static ggml_tensor* build_block(ggml_context* gctx,
     V = ggml_reshape_3d(gctx, V, head_dim, n_head_kv, n);
 
     if (L.attn_q_norm) {
-        Q = ggml_rms_norm(gctx, Q, 1e-5f);
+        Q = ggml_rms_norm(gctx, Q, rms_eps);
         Q = ggml_mul(gctx, Q, L.attn_q_norm);
     }
     if (L.attn_k_norm) {
-        K = ggml_rms_norm(gctx, K, 1e-5f);
+        K = ggml_rms_norm(gctx, K, rms_eps);
         K = ggml_mul(gctx, K, L.attn_k_norm);
     }
 
     Q = ggml_rope_ext(gctx, Q, pos, freq_factors,
-                      n_rot, 0, 0, freq_base, freq_scale, 0, 1, 32, 1);
+                      n_rot, rope_mode, 0, freq_base, freq_scale, 0, 1, 32, 1);
     K = ggml_rope_ext(gctx, K, pos, freq_factors,
-                      n_rot, 0, 0, freq_base, freq_scale, 0, 1, 32, 1);
+                      n_rot, rope_mode, 0, freq_base, freq_scale, 0, 1, 32, 1);
 
     // V is a ggml_reshape_3d view over the projection output. ggml_set_output
     // on a view does not preserve the underlying buffer through subsequent
@@ -332,7 +356,7 @@ static ggml_tensor* build_block(ggml_context* gctx,
     x = ggml_add(gctx, x, y1);
 
     // FFN.
-    ggml_tensor* xb = ggml_rms_norm(gctx, x, 1e-5f);
+    ggml_tensor* xb = ggml_rms_norm(gctx, x, rms_eps);
     xb = ggml_mul(gctx, xb, L.ffn_norm);
 
     ggml_tensor* gate = ggml_mul_mat(gctx, L.ffn_gate, xb);
@@ -388,7 +412,8 @@ bool ForwardContext::forward_one_block(const std::vector<int32_t>& token_ids,
     x = build_block(gctx, x, pos, kq_mask, freq_factors, impl_->alibi_max_bias,
                      W->layers()[0], n,
                      impl_->head_dim, impl_->n_head, impl_->n_head_kv,
-                     impl_->n_rot, impl_->rope_freq_base, impl_->rope_freq_scale);
+                     impl_->n_rot, impl_->rope_freq_base, impl_->rope_freq_scale,
+                     impl_->rms_norm_eps, impl_->rope_mode);
     ggml_set_output(x);
 
     ggml_cgraph* graph = ggml_new_graph(gctx);
@@ -499,6 +524,7 @@ bool ForwardContext::forward_full(const std::vector<int32_t>& token_ids,
                          W->layers()[(size_t)i], n,
                          impl_->head_dim, impl_->n_head, impl_->n_head_kv,
                          impl_->n_rot, impl_->rope_freq_base, impl_->rope_freq_scale,
+                         impl_->rms_norm_eps, impl_->rope_mode,
                          capture ? &k_cap : nullptr,
                          capture ? &v_cap : nullptr);
         if (capture) {
@@ -514,7 +540,7 @@ bool ForwardContext::forward_full(const std::vector<int32_t>& token_ids,
     }
 
     // Output norm + projection.
-    ggml_tensor* h = ggml_rms_norm(gctx, x, 1e-5f);
+    ggml_tensor* h = ggml_rms_norm(gctx, x, impl_->rms_norm_eps);
     h = ggml_mul(gctx, h, W->output_norm);
     ggml_tensor* logits = ggml_mul_mat(gctx, W->output, h);
     ggml_set_output(logits);
@@ -626,12 +652,14 @@ static ggml_tensor* build_block_decode(ggml_context* gctx,
                                         int n_rot,
                                         float freq_base,
                                         float freq_scale,
+                                        float rms_eps,
+                                        int   rope_mode,
                                         ggml_tensor** k_capture,
                                         ggml_tensor** v_capture) {
     const int n_embd_q = n_head * head_dim;
     const int n        = 1;
 
-    ggml_tensor* xa = ggml_rms_norm(gctx, x, 1e-5f);
+    ggml_tensor* xa = ggml_rms_norm(gctx, x, rms_eps);
     xa = ggml_mul(gctx, xa, L.attn_norm);
 
     ggml_tensor* Q = ggml_mul_mat(gctx, L.wq, xa);
@@ -646,18 +674,18 @@ static ggml_tensor* build_block_decode(ggml_context* gctx,
     V = ggml_reshape_3d(gctx, V, head_dim, n_head_kv, n);
 
     if (L.attn_q_norm) {
-        Q = ggml_rms_norm(gctx, Q, 1e-5f);
+        Q = ggml_rms_norm(gctx, Q, rms_eps);
         Q = ggml_mul(gctx, Q, L.attn_q_norm);
     }
     if (L.attn_k_norm) {
-        K = ggml_rms_norm(gctx, K, 1e-5f);
+        K = ggml_rms_norm(gctx, K, rms_eps);
         K = ggml_mul(gctx, K, L.attn_k_norm);
     }
 
     Q = ggml_rope_ext(gctx, Q, pos, freq_factors,
-                      n_rot, 0, 0, freq_base, freq_scale, 0, 1, 32, 1);
+                      n_rot, rope_mode, 0, freq_base, freq_scale, 0, 1, 32, 1);
     K = ggml_rope_ext(gctx, K, pos, freq_factors,
-                      n_rot, 0, 0, freq_base, freq_scale, 0, 1, 32, 1);
+                      n_rot, rope_mode, 0, freq_base, freq_scale, 0, 1, 32, 1);
 
     // V at this point is a ggml_reshape_3d view over the projection
     // output. Materialise it once via ggml_cont and reuse for both the
@@ -708,7 +736,7 @@ static ggml_tensor* build_block_decode(ggml_context* gctx,
 
     x = ggml_add(gctx, x, y1);
 
-    ggml_tensor* xb = ggml_rms_norm(gctx, x, 1e-5f);
+    ggml_tensor* xb = ggml_rms_norm(gctx, x, rms_eps);
     xb = ggml_mul(gctx, xb, L.ffn_norm);
     ggml_tensor* gate = ggml_mul_mat(gctx, L.ffn_gate, xb);
     ggml_tensor* up   = ggml_mul_mat(gctx, L.ffn_up,   xb);
@@ -837,6 +865,7 @@ bool ForwardContext::decode(int32_t token_id,
                                past_n, hd, impl_->n_head, n_kv,
                                impl_->n_rot,
                                impl_->rope_freq_base, impl_->rope_freq_scale,
+                               impl_->rms_norm_eps, impl_->rope_mode,
                                &k_cap, &v_cap);
         ggml_set_output(k_cap);
         ggml_set_output(v_cap);
@@ -848,7 +877,7 @@ bool ForwardContext::decode(int32_t token_id,
         }
     }
 
-    ggml_tensor* h = ggml_rms_norm(gctx, x, 1e-5f);
+    ggml_tensor* h = ggml_rms_norm(gctx, x, impl_->rms_norm_eps);
     h = ggml_mul(gctx, h, W->output_norm);
     ggml_tensor* logits_t = ggml_mul_mat(gctx, W->output, h);
     ggml_set_output(logits_t);
