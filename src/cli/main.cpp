@@ -7,6 +7,7 @@
 #include "engine.h"
 #include "forward.h"
 #include "gguf_loader.h"
+#include "kv_cache.h"
 #include "llama_weights.h"
 #include "prime_pe.h"
 #include "tokenizer.h"
@@ -35,6 +36,9 @@ static void usage(const char* prog) {
         "  embed  --model <gguf> <text>  Encode + run token-embedding lookup.\n"
         "  block1 --model <gguf> <text>  Run layer-0 transformer block forward.\n"
         "  logits --model <gguf> <text>  Run full forward pass, print logit stats.\n"
+        "  kv_smoke [--sqfree] [--head-dim N] [--n-tokens N]\n"
+        "                       Push synthetic K/V through compressed cache, report\n"
+        "                       compression ratio + per-head correlation.\n"
         "  perplexity <args>    (not yet implemented)\n"
         "  run <args>           (not yet implemented)\n"
         "\n"
@@ -61,6 +65,91 @@ int main(int argc, char** argv) {
 
     if (cmd == "version") {
         std::printf("sp-engine 0.1.0 (scaffolding)\n");
+        return 0;
+    }
+
+    // kv_smoke handles its own argv parsing so the strict --flag check below
+    // doesn't reject its tweakable knobs (--head-dim, --n-tokens, etc.).
+    if (cmd == "kv_smoke") {
+        sp::engine::Config kvc;
+        int hd = 128, n_tokens = 32, n_head_kv = 4, n_layer = 2;
+        for (int i = 2; i < argc; ++i) {
+            std::string a = argv[i];
+            if      (a == "--sqfree")    kvc.sqfree = true;
+            else if (a == "--spinor")    { kvc.spinor = true; kvc.sqfree = true; }
+            else if (a == "--no-mobius") kvc.mobius = false;
+            else if (a == "--head-dim"  && i + 1 < argc) hd        = std::atoi(argv[++i]);
+            else if (a == "--n-tokens"  && i + 1 < argc) n_tokens  = std::atoi(argv[++i]);
+            else if (a == "--n-head-kv" && i + 1 < argc) n_head_kv = std::atoi(argv[++i]);
+            else if (a == "--n-layer"   && i + 1 < argc) n_layer   = std::atoi(argv[++i]);
+            else if (a == "--k-bits"    && i + 1 < argc) kvc.k_bits_csv = argv[++i];
+            else if (a == "--v-bits"    && i + 1 < argc) kvc.v_bits_csv = argv[++i];
+            else if (a == "--residual-bits" && i + 1 < argc) kvc.residual_bits = std::atoi(argv[++i]);
+            else { std::fprintf(stderr, "kv_smoke: unknown arg %s\n", a.c_str()); return 2; }
+        }
+
+        auto kv = sp::engine::KvCache::create(n_layer, n_head_kv, hd, n_tokens, kvc);
+        if (!kv) { std::fprintf(stderr, "KvCache::create failed\n"); return 2; }
+        std::fprintf(stderr, "[sp-engine] %s\n", kv->describe().c_str());
+
+        const size_t n_elems = (size_t)n_tokens * n_head_kv * hd;
+        std::vector<float> K(n_elems), V(n_elems);
+        uint64_t s = 0x9E3779B97F4A7C15ULL ^ ((uint64_t)hd << 32) ^ (uint64_t)n_tokens;
+        auto next = [&]() {
+            s ^= s << 13; s ^= s >> 7; s ^= s << 17;
+            uint32_t u1 = (uint32_t)(s & 0xFFFFFFFFULL);
+            s ^= s << 13; s ^= s >> 7; s ^= s << 17;
+            uint32_t u2 = (uint32_t)(s & 0xFFFFFFFFULL);
+            float r1 = (u1 + 1.0f) / 4294967297.0f;
+            float r2 = (u2 + 0.0f) / 4294967296.0f;
+            return std::sqrt(-2.0f * std::log(r1)) * std::cos(6.2831853f * r2);
+        };
+        for (size_t i = 0; i < n_elems; ++i) K[i] = next();
+        for (size_t i = 0; i < n_elems; ++i) V[i] = next();
+
+        for (int L = 0; L < n_layer; ++L) {
+            if (!kv->write(L, 0, n_tokens, K.data(), V.data())) {
+                std::fprintf(stderr, "kv->write layer %d failed\n", L); return 3;
+            }
+        }
+        std::vector<float> Krec, Vrec;
+        if (!kv->read(0, n_tokens, Krec, Vrec)) {
+            std::fprintf(stderr, "kv->read failed\n"); return 4;
+        }
+
+        auto corr = [&](const float* a, const float* b, int n) {
+            double ma = 0, mb = 0;
+            for (int i = 0; i < n; ++i) { ma += a[i]; mb += b[i]; }
+            ma /= n; mb /= n;
+            double sxy = 0, sxx = 0, syy = 0;
+            for (int i = 0; i < n; ++i) {
+                double da = a[i] - ma, db = b[i] - mb;
+                sxy += da * db; sxx += da * da; syy += db * db;
+            }
+            const double denom = std::sqrt(sxx * syy);
+            return (denom > 0) ? (float)(sxy / denom) : 0.0f;
+        };
+
+        double k_sum = 0, v_sum = 0;
+        float  k_min = 1.0f, v_min = 1.0f;
+        const int per = n_head_kv * n_tokens;
+        for (int q = 0; q < n_tokens; ++q) {
+            for (int h = 0; h < n_head_kv; ++h) {
+                const float* k0 = K.data()    + (size_t)(q * n_head_kv + h) * hd;
+                const float* k1 = Krec.data() + (size_t)(q * n_head_kv + h) * hd;
+                const float* v0 = V.data()    + (size_t)(q * n_head_kv + h) * hd;
+                const float* v1 = Vrec.data() + (size_t)(q * n_head_kv + h) * hd;
+                float kc = corr(k0, k1, hd);
+                float vc = corr(v0, v1, hd);
+                k_sum += kc; v_sum += vc;
+                if (kc < k_min) k_min = kc;
+                if (vc < v_min) v_min = vc;
+            }
+        }
+        std::printf("K corr: mean=%.4f  min=%.4f  (over %d vectors, hd=%d)\n",
+                    k_sum / per, k_min, per, hd);
+        std::printf("V corr: mean=%.4f  min=%.4f\n", v_sum / per, v_min);
+        std::printf("compression ratio = %.2fx\n", kv->compression_ratio());
         return 0;
     }
 
