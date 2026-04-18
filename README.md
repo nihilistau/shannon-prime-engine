@@ -132,6 +132,102 @@ regenerating the GGUF each time.
 | Dolphin-1B ship | *"...jumps over the lazy dog. The sentence \"The quick brown fox jumps over the lazy dog.\" is"* |
 | Dolphin-1B sqfree+spinor | *"...What is the correct order of the sentence? To determine the correct order"* |
 
+## Settings reference
+
+### CLI verbs
+
+| Verb | Purpose |
+|---|---|
+| `version` / `banner` | Build info. |
+| `info --model <gguf>` | Hparams + tensor summary + vocab sample. |
+| `encode --model <gguf> <text>` | Tokenise to IDs. |
+| `decode --model <gguf> <id…>` | IDs to text. |
+| `embed --model <gguf> <text>` | Token-embedding lookup only. |
+| `block1 --model <gguf> <text>` | Layer-0 transformer block forward. |
+| `logits --model <gguf> <text>` | Full forward, print logit stats + top-5. |
+| `kv_smoke` | Synthetic gaussian K/V → cache → readback correlation + compression. No model needed. |
+| `prefill --model <gguf> <text>` | Real RoPE'd K/V through the compressed cache, per-layer correlation report. Set `SP_CALIBRATE=1` to force adaptive calibration. |
+| `chat --model <gguf> --n-predict N <prompt>` | Greedy generation: prefill + single-token decode reading from the compressed cache. Add `--naive` to force-forward-full each step. |
+| `perplexity --model <gguf> <textfile>` | Baseline PPL (`forward_full` per chunk). Add `--cache` for decode-through-compressed-cache PPL. |
+| `cache_ppl --model <gguf> <textfile>` | Baseline PPL + K/V round-trip correlation + scaling-law input per chunk. Fast diagnostic alternative to `perplexity --cache`. |
+
+### Cache-config flags (shared across `kv_smoke` / `prefill` / `chat` / `perplexity --cache` / `cache_ppl`)
+
+| Flag | Effect |
+|---|---|
+| *(none)* | **Ship path.** VHT2 forward → Möbius reorder (K) → 4-band banded quant (5,5,4,3 K, flat-3 V). Default and most-validated. |
+| `--sqfree` | Sqfree prime-Hartley path. Pads head_dim to next sqfree multiple (64 → 66, 128 → 154, 256 → 330), Vilenkin-transforms, extracts a Knight skeleton (default L/2 of pad_dim), quantises skeleton + Möbius-CSR-predicted residual (3 bits). Cross-attention-style bit allocation (K and V both banded). |
+| `--sqfree --spinor` | Sqfree + SU(2) sheet-bit correction at the causal-mask boundary. Typical K_corr lift over `--sqfree`: ≈0.008–0.010. |
+| `--hierarchical` | Hierarchical Vilenkin predictor (`sp_hier_cache_t`). Kronecker sub-projection picks the Z/2Z × smallest-few-primes subgroup as a ~9% skeleton; a per-slot calibrated ridge-regression linear map predicts the remaining ~91% from the skeleton; tiny residual correction on top. **Needs ≥24-token calibration prompt** — warns below that. |
+| `--no-mobius` | Disable Möbius reorder on ship path. |
+| `--k-bits CSV` | Per-band K bit allocation, e.g. `5,5,4,3`. |
+| `--v-bits CSV` | Per-band V bits (ship default `3` = 1 band flat). |
+| `--residual-bits N` | Sqfree residual bit depth (1–4, default 3; 3 is the Pareto point — 1 is catastrophic, 4 is flat). |
+| `--hier-level N` | Hierarchical skeleton level (0 = auto, picks second-to-last prime grouping). |
+| `--hier-res-bits N` | Hierarchical residual bits (default 2). |
+| `--hier-skel-bits CSV` | Hierarchical skeleton band bits (default `5,5`). |
+
+### Cache-system deep dive
+
+**Ship path (`sp_shadow_cache_t`)** — the validated default, straight from the CLAUDE.md invariants. On write: raw K → VHT2 → Möbius reorder (K only; V stays in its natural basis) → band-quantise using (5,5,4,3) for K and flat 3 bits for V. On read: dequantise → Möbius unreorder → VHT2 forward (self-inverse, no 1/N on the reverse). K_corr ≥ 0.993 on real RoPE'd K. Typical compression 3.8–4.1×.
+
+**Sqfree path (`sp_sqfree_cache_t`)** — aggressive compression for Q8+ backbones. Pads head_dim to the nearest sqfree multiple so the Vilenkin transform factors across small primes {2, 3, 5, 7, 11}. Extracts a Knight skeleton by variance-ranked top-K selection (since v1.14; v1.13 and earlier used an algebraic T² rule which loses the 0/476 comparisons documented in `sp_regime_analysis.py`). Remainder goes through a Möbius-CSR predictor + 3-bit residual quant. Default skeleton size is L/2 (pad_dim / 2) — the universal phase-transition point identified by the chord diagnostic.
+
+**Sqfree+spinor** — adds the SU(2) sheet-bit correction. 50% skeleton. Same write/read layout as sqfree; costs 1 extra bit per coefficient (the sheet bit) and picks the right double-cover sign at the causal-mask boundary. Small but reliable K_corr lift.
+
+**Hierarchical Vilenkin predictor (`sp_hier_cache_t`, v1.15)** — the maximum-compression path. The Vilenkin basis on sqfree-padded dims has Kronecker structure:
+
+```
+hd=128 → pad=154 = 2 · 7 · 11 → Z/2Z × Z/7Z × Z/11Z
+```
+
+Hierarchical uses the low-prime subgroup (Z/2Z × Z/7Z = 14 coefficients, ~9% of pad_dim) as its skeleton. At calibrate-end, a ridge-regression linear map is fit per (layer, head) slot from skeleton → the remaining 140 high-prime refinement coefficients. At write-time, only the 14 skeleton coefficients + a small residual correction are stored. At read-time, the predictor reconstructs the refinement; residual adds back the part the predictor missed.
+
+Three properties:
+
+- Skeleton = 9% vs sqfree's 50% = **5.5× smaller skeleton storage** per vector.
+- Requires **calibration** before any write. Single prefill of ≥24 tokens per slot is usually enough; the engine's `ForwardContext::prefill` auto-calibrates on the first call and warns below the threshold.
+- Calibration is **per-slot** (each layer × head pair has its own linear predictor), unlike sqfree/shadow which share a global mask.
+
+### PrimePE-RoPE-ALiBi (positional encoding family)
+
+| Flag | Mode |
+|---|---|
+| `--pe-mode standard` | Default geometric RoPE. Byte-for-byte identical to llama.cpp. |
+| `--pe-mode primepe` | Lattice-drawn freq_factors (composite-tiered or prime-tiered). Alpha-blended with identity. |
+| `--pe-mode primepe_alibi` | PrimePE + per-head ALiBi slopes (max_bias = 8·α). |
+| `--pe-mode alibi` | Standard geometric RoPE + ALiBi-only (ablation). |
+| `--pe-alpha F` | Blend factor 0..1. Default 0 (identity; `--pe-mode primepe --pe-alpha 0` is byte-equal to `standard`). Paper sweet spot 0.15–0.22. |
+| `--pe-tier 0` / `--pe-tier 1` | Composite lattice (default) vs prime generators. |
+
+Precedence at graph build: PrimePE lattice (if `--pe-alpha > 0`) > `.sp_freq_factors.bin` sidecar (if present next to the model) > GGUF `rope_freqs.weight` tensor (for Llama-3.2 YaRN, etc.) > nullptr (pure geometric).
+
+### Calibration behaviour
+
+Opt-in cache modes (`--sqfree`, `--sqfree --spinor`, `--hierarchical`) auto-calibrate on the **first `ForwardContext::prefill` call** against an uncalibrated cache. Calibration:
+
+- **Ship** (shadow cache): builds a variance-ranked coefficient permutation across the VHT2 output. Replaces the Möbius reorder for write and read.
+- **Sqfree**: rebuilds the Knight skeleton at L/2 by variance-ranked selection.
+- **Hierarchical**: fits a ridge-regression linear map per (layer × head) slot.
+
+The `calibrated` flag lives on the `KvCache` object, not on `ForwardContext`. `bind_cache(kv)` zeros `kv_pos` between chunks but preserves calibration — so `perplexity --cache` calibrates once on chunk 0's warmup and reuses the masks for every subsequent chunk. `chat` gets the same behaviour for free.
+
+Override: `SP_CALIBRATE=1` on the `prefill` CLI verb forces explicit calibration even though that verb normally just does `forward_full + kv->write` directly.
+
+### Environment variables
+
+| Variable | Effect |
+|---|---|
+| `SP_CALIBRATE=1` | Force `prefill` CLI to calibrate before writing to cache. Default is no-calibrate for diagnostic use; `ForwardContext::prefill` always auto-calibrates regardless. |
+| `SP_DEBUG_DECODE=1` | Print layer-0 K / X correlation diff between decode and a reference `forward_full` at each step. Diagnostic for decode-graph bugs. |
+| `SP_SKIP_CAPTURE=1` | Disable K/V capture in decode (and thus cache writes). Was a debug harness during the V-capture-view regression hunt; leave off. |
+
+### Sidecar auto-load (`.sp_freq_factors.bin`)
+
+At `ForwardContext::create`, the engine looks for `<gguf_path_without_ext>.sp_freq_factors.bin` — the file `sp_inject_freqs.py` writes alongside its injected GGUF. If present and sized for `n_rot/2 × fp32`, it's loaded into the RoPE freq_factors path (priority between PrimePE and GGUF `rope_freqs.weight`). Size-mismatched sidecars are rejected with a stderr warning.
+
+Practical use: drop alternate-α `.bin` sidecars next to the same base GGUF to A/B different injection strengths without regenerating the GGUF each time. Measured on Dolphin-1B-Q8: α=0.17 sidecar auto-loaded gives **−2.1% PPL** vs GGUF `rope_freqs.weight` alone (12.38 vs 12.65 baseline).
+
 ## Building
 
 Requires:
