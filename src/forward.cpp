@@ -768,10 +768,19 @@ bool ForwardContext::prefill(const std::vector<int32_t>& token_ids,
     // modes (sqfree Knight mask, ship variance-ranked permutation) use
     // the single-arg feed that accumulates globally across all heads.
     if (!impl_->cache->is_calibrated()) {
+        const bool hier = impl_->cache->is_hierarchical();
+        // Hierarchical needs per-slot calibration; samples per slot = n
+        // (tokens in this prefill batch). Underdetermined slots produce
+        // garbage predictors. Warn when n is too small for hier.
+        if (hier && n < 24) {
+            std::fprintf(stderr,
+                "[sp-engine] warning: hierarchical cache is calibrating on only "
+                "%d samples per slot; predictor is underdetermined. Use a prompt "
+                "of >= 24 tokens for coherent decode, or switch to --sqfree.\n", n);
+        }
         if (impl_->cache->calibrate_begin()) {
             const int H  = impl_->n_head_kv;
             const int hd = impl_->head_dim;
-            const bool hier = impl_->cache->is_hierarchical();
             for (int L = 0; L < impl_->n_layer; ++L) {
                 const float* K_data = Ks[(size_t)L].data();
                 // Layout: K_data[(q * H + h) * hd + d]
