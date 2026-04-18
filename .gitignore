@@ -42,3 +42,6 @@ logs/*.log
 logs/*.bin
 logs/*.sp_freq_factors.bin
 !logs/.gitkeep
+
+# Internal templates not for the published repo
+COPYRIGHT_HEADER.txt

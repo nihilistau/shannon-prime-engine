@@ -23,20 +23,46 @@ different user stories.
 
 ## Status
 
-Pre-alpha. Scaffolding only. Core dependencies wired, build system
-produces a trivial banner binary, no inference implemented yet.
+Pre-alpha but live. The full forward pass (token-embedding →
+RMSNorm → attention with PrimePE-RoPE + optional ALiBi → SwiGLU
+FFN → output_norm → output projection → logits) runs end-to-end
+on Llama-family GGUFs. Greedy generation through a stateful
+decode loop reads past K/V from a compressed KvCache, attends,
+writes new K/V back — and produces clean continuations across
+ship + sqfree + sqfree+spinor configs.
 
-Roadmap:
+| Stage | Verb | What it proves | Status |
+|---|---|---|---|
+| 3a | `embed` | ggml graph + backend init + token-embedding lookup. | ✓ |
+| 3b | `block1` | One transformer block: norm + attn + FFN + residual. | ✓ |
+| 3c | `logits` | All `n_layer` blocks + output head → real logits. | ✓ |
+| 3d | `logits --pe-mode primepe` | PrimePE-RoPE-ALiBi (composite/prime-tiered lattice, alpha-blended). | ✓ |
+| 4   | `kv_smoke` | KvCache wrapper around `sp_shadow_cache_t` / `sp_sqfree_cache_t`. | ✓ |
+| 5a  | `prefill` | Real RoPE'd K from prefill compressed through KvCache; per-layer K/V correlation reported. | ✓ |
+| 5b  | `chat` | Stateful prefill + optimised single-token decode reading from compressed cache. | ✓ |
+| 6   | (planned) | Persistent backend KV tensors (avoid the per-step host round-trip); perplexity verb. | — |
+| 7   | (planned) | CUDA / Vulkan backend selection; release packaging. | — |
 
-- [ ] GGUF loader wrapper (thin shim over ggml)
-- [ ] Qwen/Llama model arch — one family to start
-- [ ] Tokenizer (wrap ggml BPE)
-- [ ] Attention kernel (Q·K^T, softmax, ·V, causal) reading compressed KV directly
-- [ ] RoPE application (ggml_rope_ext + optional sidecar factors)
-- [ ] Compressed-by-default KV management (VHT2 + sqfree + spinor)
-- [ ] Sampling (temperature / top-k / top-p / min-p)
-- [ ] CLI: `sp-engine perplexity`, `sp-engine run`
-- [ ] Release packaging (GitHub Actions → Windows / Linux / Mac / Android)
+### Measured K correlation on real RoPE'd K (engine `prefill` verb)
+
+| Model | Path | K_corr (mean) | V_corr | Compression |
+|---|---|---|---|---|
+| Dolphin3.0-Llama3.2-1B-Q8 (hd=64, 16 layers) | ship 5,5,4,3 / 3 | **0.9941** | 0.9712 | 3.76× |
+| Dolphin3.0-Llama3.2-1B-Q8 | sqfree (pad 66) | 0.9768 | 0.9484 | 3.76× |
+| Dolphin3.0-Llama3.2-1B-Q8 | sqfree+spinor | 0.9869 | 0.9601 | 3.76× |
+| Qwen3-8B-Q8 (hd=128, 36 layers) | ship 5,5,4,3 / 3 | **0.9934** | 0.9691 | 4.06× |
+
+Spinor's +0.008–0.010 K-corr lift on the Knight skeleton matches
+the value documented in `lib/shannon-prime/CLAUDE.md`. Ship hits the
+0.992+ target on real model data, end-to-end, on both architectures.
+
+### Greedy chat smoke tests (n_predict=20, prompt = "The quick brown fox")
+
+| Config | Output |
+|---|---|
+| Dolphin-1B ship | *"...jumps over the lazy dog. The sentence \"The quick brown fox jumps over the lazy dog.\" is"* |
+| Dolphin-1B sqfree+spinor | *"...What is the correct order of the sentence? To determine the correct order"* |
+| Qwen3-8B-Q8 ship | *"...This sentence is a well-known pangram. It is used to test"* |
 
 ## Building
 
@@ -78,14 +104,6 @@ cp /c/ProgramData/mingw64/mingw64/bin/libwinpthread-1.dll  build/bin/
 
 MSVC-based release builds (planned) will ship the runtime statically.
 
-## License
-
-AGPLv3 for open-source / academic / non-proprietary use. Commercial
-license available — contact raydaniels@gmail.com.
-
-Third-party components (ggml) retain their original MIT license; see
-[LICENSE.third_party](LICENSE.third_party).
-
 ## Repo layout
 
 ```
@@ -93,11 +111,34 @@ shannon-prime-engine/
 ├── lib/
 │   └── shannon-prime/       ← git submodule → github.com/nihilistau/shannon-prime
 ├── vendor/
-│   └── ggml/                ← git submodule → github.com/ggml-org/ggml
+│   └── ggml/                ← git submodule → github.com/ggml-org/ggml (MIT)
 ├── src/                     ← engine code (this repo's original contribution)
-│   ├── engine.cpp
-│   └── cli/
-│       └── main.cpp
+│   ├── engine.{h,cpp}       Public API + Config (PeMode, sqfree, mobius)
+│   ├── gguf_loader.{h,cpp}  Typed view over gguf_context
+│   ├── vocab.{h,cpp}        tokenizer.ggml.* arrays
+│   ├── tokenizer.{h,cpp}    GPT-2-style BPE encode / decode
+│   ├── llama_weights.{h,cpp} Llama-family arch binding
+│   ├── forward.{h,cpp}      ggml graph: embed, block, full, prefill, decode
+│   ├── prime_pe.{h,cpp}     PrimePE-RoPE-ALiBi lattice math
+│   ├── kv_cache.{h,cpp}     Wrapper around sp_shadow_cache_t / sp_sqfree_cache_t
+│   └── cli/main.cpp         Verbs: info, encode, decode, embed, block1,
+│                             logits, kv_smoke, prefill, chat
 ├── tests/
 └── CMakeLists.txt
 ```
+
+## License
+
+**AGPLv3** for open-source, academic, and non-proprietary use.
+Everyone can use it and benefit. Derivative works must share alike.
+
+**Dual License** — the primary goal is that the work belongs to the
+commons and is protected from closure. A commercial license is
+available for proprietary integration.
+
+Third-party components (ggml) retain their original **MIT** license;
+see [LICENSE.third_party](LICENSE.third_party).
+
+## Contact
+
+Email: raydaniels@gmail.com
