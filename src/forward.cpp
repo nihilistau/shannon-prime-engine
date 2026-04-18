@@ -142,6 +142,43 @@ std::unique_ptr<ForwardContext> ForwardContext::create(const Model& model,
     // ggml_rope_ext when PrimePE is inactive.
     fc->impl_->model_rope_freqs = weights.rope_freqs;
 
+    // Sidecar discovery: sp_inject_freqs.py writes an fp32 sidecar
+    // `<model>.sp_freq_factors.bin` alongside the injected GGUF. It's
+    // primarily debug/diagnostic now (the factors are also embedded in
+    // the modified GGUF as rope_freqs.weight), but we still load it if
+    // found — handy for A/B-ing different alphas against an unmodified
+    // GGUF. PrimePE takes precedence when active; otherwise the sidecar
+    // replaces model_rope_freqs.
+    if (fc->impl_->freq_factors_vec.empty()) {
+        const std::string& mp = model.path();
+        const size_t dot = mp.find_last_of('.');
+        const std::string base = (dot == std::string::npos) ? mp : mp.substr(0, dot);
+        const std::string sidecar_path = base + ".sp_freq_factors.bin";
+        if (std::FILE* sf = std::fopen(sidecar_path.c_str(), "rb")) {
+            std::fseek(sf, 0, SEEK_END);
+            const long bytes = std::ftell(sf);
+            std::fseek(sf, 0, SEEK_SET);
+            const size_t expect = (size_t)(fc->impl_->n_rot / 2) * sizeof(float);
+            if (bytes > 0 && (size_t)bytes == expect) {
+                fc->impl_->freq_factors_vec.resize((size_t)(fc->impl_->n_rot / 2));
+                if (std::fread(fc->impl_->freq_factors_vec.data(), 1, expect, sf) == expect) {
+                    std::fprintf(stderr,
+                        "[sp-engine] loaded RoPE sidecar: %s (%d freqs)\n",
+                        sidecar_path.c_str(), fc->impl_->n_rot / 2);
+                } else {
+                    fc->impl_->freq_factors_vec.clear();
+                    std::fprintf(stderr,
+                        "[sp-engine] sidecar read failed: %s\n", sidecar_path.c_str());
+                }
+            } else if (bytes > 0) {
+                std::fprintf(stderr,
+                    "[sp-engine] sidecar size mismatch (%ld B, expected %zu B) — ignoring %s\n",
+                    bytes, expect, sidecar_path.c_str());
+            }
+            std::fclose(sf);
+        }
+    }
+
     fc->impl_->backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
     if (!fc->impl_->backend) {
         std::fprintf(stderr, "[sp-engine] ForwardContext: failed to init CPU backend\n");
