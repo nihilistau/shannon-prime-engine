@@ -65,10 +65,16 @@ public:
     //
     // Feed ALL calibration vectors between begin/end. Typical use: feed
     // K vectors from the first forward pass (warmup), then end.
+    //
+    // For hierarchical mode, calibrate_feed takes a slot index (layer * H + head)
+    // so each predictor is trained on its own head's data. The single-arg
+    // overload feeds ALL slots (used by sqfree/shadow which have shared masks).
     bool calibrate_begin();
     void calibrate_feed(const float* vec);
+    void calibrate_feed(int slot, const float* vec);  // hierarchical per-slot
     bool calibrate_end();
     bool is_calibrated() const;
+    bool is_hierarchical() const;
 
     // --- diagnostics / introspection ---
     int  n_layer()           const;

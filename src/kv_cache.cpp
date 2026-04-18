@@ -39,18 +39,21 @@ static std::vector<int> parse_csv_bits(const std::string& csv) {
 
 struct KvCache::Impl {
     bool                 sqfree = false;
+    bool                 hierarchical = false;
     int                  n_layer    = 0;
     int                  n_head_kv  = 0;
     int                  head_dim   = 0;
-    int                  pad_dim    = 0;   // = head_dim (ship) or sqfree pad (sqfree)
+    int                  pad_dim    = 0;   // = head_dim (ship) or sqfree pad (sqfree/hier)
     int                  max_seq    = 0;
 
     // Exactly one of these is initialised at any time.
     sp_shadow_cache_t    shadow{};
     sp_sqfree_cache_t    sq{};
+    sp_hier_cache_t      hier{};
 
     bool                 shadow_inited = false;
     bool                 sq_inited     = false;
+    bool                 hier_inited   = false;
 
     sp_config_t          cfg{};
     bool                 calibrated = false;
@@ -78,6 +81,9 @@ struct KvCache::Impl {
         if (sq_inited) {
             sp_sqfree_cache_free(&sq);
         }
+        if (hier_inited) {
+            sp_hier_cache_free(&hier);
+        }
     }
 };
 
@@ -95,13 +101,24 @@ float KvCache::compression_ratio() const {
 }
 
 std::string KvCache::describe() const {
-    char buf[192];
+    const char* mode = impl_->hierarchical ? "hierarchical" :
+                       impl_->sqfree       ? "sqfree"       : "shadow";
+    char buf[256];
     std::snprintf(buf, sizeof(buf),
                   "%s cache: n_layer=%d n_head_kv=%d head_dim=%d "
                   "pad_dim=%d max_seq=%d compression=%.2fx",
-                  impl_->sqfree ? "sqfree" : "shadow",
+                  mode,
                   impl_->n_layer, impl_->n_head_kv, impl_->head_dim,
                   impl_->pad_dim, impl_->max_seq, compression_ratio());
+    if (impl_->hier_inited) {
+        char extra[128];
+        std::snprintf(extra, sizeof(extra), " skel=%d/%d (%.0f%%)",
+                      impl_->hier.predictors[0].n_skeleton,
+                      impl_->hier.predictors[0].pad_dim,
+                      100.0f * impl_->hier.predictors[0].n_skeleton /
+                      impl_->hier.predictors[0].pad_dim);
+        std::strncat(buf, extra, sizeof(buf) - std::strlen(buf) - 1);
+    }
     return std::string(buf);
 }
 
@@ -133,6 +150,29 @@ std::unique_ptr<KvCache> KvCache::create(int n_layer, int n_head_kv,
     sc->v_n_bands = (int)vbits.size();
     for (size_t i = 0; i < kbits.size(); ++i) sc->k_band_bits[i] = kbits[i];
     for (size_t i = 0; i < vbits.size(); ++i) sc->v_band_bits[i] = vbits[i];
+
+    // Hierarchical Vilenkin predictor — maximum compression path.
+    // Mutually exclusive with sqfree; takes precedence if both are set.
+    if (cfg.hierarchical) {
+        auto skel_bits = parse_csv_bits(cfg.hier_skel_bits);
+        if (skel_bits.empty()) skel_bits = {5, 5};
+        if ((int)skel_bits.size() > SP_MAX_BANDS) skel_bits.resize(SP_MAX_BANDS);
+        const int res_bits = (cfg.hier_res_bits >= 1 && cfg.hier_res_bits <= 4)
+                             ? cfg.hier_res_bits : 2;
+
+        if (sp_hier_cache_init(&kv->impl_->hier, sc, max_seq,
+                               cfg.hier_level,
+                               (int)skel_bits.size(), skel_bits.data(),
+                               res_bits) != 0) {
+            std::fprintf(stderr, "[sp-engine] KvCache: hier_cache_init failed\n");
+            return nullptr;
+        }
+        kv->impl_->hier_inited   = true;
+        kv->impl_->hierarchical  = true;
+        kv->impl_->sqfree        = false;  // hierarchical supersedes sqfree
+        kv->impl_->pad_dim       = kv->impl_->hier.pad_dim;
+        return kv;
+    }
 
     if (cfg.sqfree) {
         const int rbits = (cfg.residual_bits >= 1 && cfg.residual_bits <= 4) ? cfg.residual_bits : 3;
@@ -191,7 +231,10 @@ bool KvCache::write(int layer, int pos_offset, int n_tokens,
         for (int h = 0; h < H; ++h) {
             const float* k_vec = K_flat + (size_t)(q * H + h) * hd;
             const float* v_vec = V_flat + (size_t)(q * H + h) * hd;
-            if (impl_->sqfree) {
+            if (impl_->hier_inited) {
+                sp_hier_cache_write_k(&impl_->hier, layer, h, pos, k_vec);
+                sp_hier_cache_write_v(&impl_->hier, layer, h, pos, v_vec);
+            } else if (impl_->sqfree) {
                 sp_sqfree_write_k(&impl_->sq, layer, h, pos, k_vec);
                 sp_sqfree_write_v(&impl_->sq, layer, h, pos, v_vec);
             } else {
@@ -217,7 +260,10 @@ bool KvCache::read(int layer, int kv_len,
         for (int h = 0; h < H; ++h) {
             float* k_vec = K_out.data() + (size_t)(q * H + h) * hd;
             float* v_vec = V_out.data() + (size_t)(q * H + h) * hd;
-            if (impl_->sqfree) {
+            if (impl_->hier_inited) {
+                sp_hier_cache_read_k(&impl_->hier, layer, h, q, k_vec);
+                sp_hier_cache_read_v(&impl_->hier, layer, h, q, v_vec);
+            } else if (impl_->sqfree) {
                 sp_sqfree_read_k(&impl_->sq, layer, h, q, k_vec);
                 sp_sqfree_read_v(&impl_->sq, layer, h, q, v_vec);
             } else {
@@ -232,7 +278,9 @@ bool KvCache::read(int layer, int kv_len,
 // ── Adaptive calibration ────────────────────────────────────────────
 
 bool KvCache::calibrate_begin() {
-    if (impl_->sqfree) {
+    if (impl_->hier_inited) {
+        return sp_hier_cache_calibrate_begin(&impl_->hier) == 0;
+    } else if (impl_->sqfree) {
         return sp_sqfree_calibrate_begin(&impl_->sq) == 0;
     } else {
         return sp_shadow_calibrate_begin(&impl_->shadow) == 0;
@@ -240,16 +288,31 @@ bool KvCache::calibrate_begin() {
 }
 
 void KvCache::calibrate_feed(const float* vec) {
+    // Shared-mask feed: sqfree and shadow accumulate globally.
+    // NOT valid for hierarchical — use the per-slot overload instead.
     if (impl_->sqfree) {
         sp_sqfree_calibrate_feed(&impl_->sq, vec);
-    } else {
+    } else if (!impl_->hier_inited) {
         sp_shadow_calibrate_feed(&impl_->shadow, vec);
+    }
+}
+
+void KvCache::calibrate_feed(int slot, const float* vec) {
+    // Per-slot feed: hierarchical mode trains each predictor on its own
+    // head's data. slot = layer * n_head_kv + head.
+    if (impl_->hier_inited) {
+        sp_hier_cache_calibrate_feed(&impl_->hier, slot, vec);
+    } else {
+        // Non-hierarchical paths ignore the slot — forward to shared feed.
+        calibrate_feed(vec);
     }
 }
 
 bool KvCache::calibrate_end() {
     int rc;
-    if (impl_->sqfree) {
+    if (impl_->hier_inited) {
+        rc = sp_hier_cache_calibrate_end(&impl_->hier);
+    } else if (impl_->sqfree) {
         rc = sp_sqfree_calibrate_end(&impl_->sq);
     } else {
         rc = sp_shadow_calibrate_end(&impl_->shadow);
@@ -263,6 +326,10 @@ bool KvCache::calibrate_end() {
 
 bool KvCache::is_calibrated() const {
     return impl_->calibrated;
+}
+
+bool KvCache::is_hierarchical() const {
+    return impl_->hier_inited;
 }
 
 } // namespace sp::engine

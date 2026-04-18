@@ -26,6 +26,15 @@ struct Config {
     std::string k_bits_csv  = "5,5,4,3"; // Per-band K bit allocation
     std::string v_bits_csv  = "3";       // Per-band V (default flat)
 
+    // Hierarchical Vilenkin predictor — maximum compression path.
+    // Uses Kronecker sub-projection as a small skeleton (~9% of pad_dim)
+    // and a calibrated linear map to predict the remaining coefficients.
+    // Requires calibration (first prefill). Mutually exclusive with sqfree.
+    bool        hierarchical    = false;
+    int         hier_level      = 0;       // 0 = auto (second-to-last prime grouping)
+    int         hier_res_bits   = 2;       // 1-4 bits for target residuals
+    std::string hier_skel_bits  = "5,5";   // Band bits for skeleton quantisation
+
     // Backend selection.
     enum class Backend { CPU, CUDA, Vulkan };
     Backend     backend = Backend::CPU;

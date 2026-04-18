@@ -45,13 +45,13 @@ static void usage(const char* prog) {
         "  chat --model <gguf> [--n-predict N] [--sqfree] <prompt>\n"
         "                       Greedy generation: prefill prompt, decode N tokens\n"
         "                       reading past K/V from the compressed cache.\n"
-        "  perplexity --model <gguf> [--ctx N] [--chunks N] [--cache [--sqfree]]\n"
-        "                       <textfile>\n"
-        "                       PPL over a UTF-8 text file in contiguous N-token\n"
-        "                       chunks. --cache switches to prefill+decode through\n"
-        "                       the compressed KvCache (auto-calibrates on first\n"
-        "                       chunk) — measures the actual compression impact.\n"
-        "  perplexity <args>    (not yet implemented)\n"
+        "  perplexity --model <gguf> [--ctx N] [--chunks N] <textfile>\n"
+        "                       Compute baseline PPL over a UTF-8 text file in\n"
+        "                       contiguous N-token chunks. Hook-free reference.\n"
+        "  cache_ppl --model <gguf> [--sqfree|--hierarchical] [--ctx N] <textfile>\n"
+        "                       Run perplexity + compressed-cache correlation.\n"
+        "                       Reports baseline PPL, K/V round-trip correlation,\n"
+        "                       and compression ratio per chunk.\n"
         "  run <args>           (not yet implemented)\n"
         "\n"
         "Options:\n"
@@ -63,6 +63,13 @@ static void usage(const char* prog) {
         "  --k-bits <csv>       K band bits, e.g. 5,5,4,3\n"
         "  --v-bits <csv>       V band bits, default 3\n"
         "  --residual-bits <n>  sqfree residual bits, default 3\n"
+        "  --no-calibrate       skip automatic calibration during prefill\n"
+        "\n"
+        "Hierarchical Vilenkin predictor (maximum compression):\n"
+        "  --hierarchical       enable hierarchical predictor (~9%% skeleton)\n"
+        "  --hier-level <n>     0 = auto, 1..n_primes-1 = explicit\n"
+        "  --hier-res-bits <n>  target residual bits, 1-4 (default: 2)\n"
+        "  --hier-skel-bits <csv>  skeleton band bits (default: 5,5)\n"
         "\n"
         "PrimePE-RoPE-ALiBi:\n"
         "  --pe-mode <name>     standard|primepe|primepe_alibi|alibi (default: standard)\n"
@@ -80,26 +87,238 @@ int main(int argc, char** argv) {
         return 0;
     }
 
+    // ──────────────────────────────────────────────────────────────────
+    // cache_ppl — compressed-cache perplexity benchmark.
+    //
+    // Runs baseline PPL via forward_full (capturing per-layer K/V),
+    // then pushes K/V through the compressed KvCache and measures
+    // reconstruction correlation. Reports both baseline PPL and
+    // predicted compressed-PPL via the scaling law.
+    // ──────────────────────────────────────────────────────────────────
+    if (cmd == "cache_ppl") {
+        sp::engine::Config cc;
+        int  n_ctx    = 512;
+        int  n_chunks = 0;
+        std::string textfile;
+        for (int i = 2; i < argc; ++i) {
+            std::string a = argv[i];
+            if      (a == "--model"          && i + 1 < argc) cc.model_path     = argv[++i];
+            else if (a == "--ctx"            && i + 1 < argc) n_ctx             = std::atoi(argv[++i]);
+            else if (a == "--chunks"         && i + 1 < argc) n_chunks          = std::atoi(argv[++i]);
+            else if (a == "--sqfree")        cc.sqfree = true;
+            else if (a == "--spinor")        { cc.spinor = true; cc.sqfree = true; }
+            else if (a == "--no-mobius")     cc.mobius = false;
+            else if (a == "--hierarchical") cc.hierarchical = true;
+            else if (a == "--k-bits"         && i + 1 < argc) cc.k_bits_csv     = argv[++i];
+            else if (a == "--v-bits"         && i + 1 < argc) cc.v_bits_csv     = argv[++i];
+            else if (a == "--residual-bits"  && i + 1 < argc) cc.residual_bits  = std::atoi(argv[++i]);
+            else if (a == "--hier-level"     && i + 1 < argc) cc.hier_level     = std::atoi(argv[++i]);
+            else if (a == "--hier-res-bits"  && i + 1 < argc) cc.hier_res_bits  = std::atoi(argv[++i]);
+            else if (a == "--hier-skel-bits" && i + 1 < argc) cc.hier_skel_bits = argv[++i];
+            else if (a == "--pe-mode"        && i + 1 < argc) {
+                std::string m = argv[++i];
+                if      (m == "standard")      cc.pe_mode = sp::engine::Config::PeMode::Standard;
+                else if (m == "primepe")       cc.pe_mode = sp::engine::Config::PeMode::PrimePe;
+                else if (m == "primepe_alibi") cc.pe_mode = sp::engine::Config::PeMode::PrimePeAlibi;
+                else if (m == "alibi")         cc.pe_mode = sp::engine::Config::PeMode::AlibiOnly;
+            }
+            else if (a == "--pe-alpha"       && i + 1 < argc) cc.pe_alpha = (float)std::atof(argv[++i]);
+            else if (a == "--pe-tier"        && i + 1 < argc) cc.pe_tier  = std::atoi(argv[++i]);
+            else if (a.size() >= 2 && a[0] == '-' && a[1] == '-') {
+                std::fprintf(stderr, "cache_ppl: unknown flag %s\n", a.c_str()); return 2;
+            }
+            else { textfile = a; }
+        }
+        if (cc.model_path.empty()) {
+            std::fprintf(stderr, "cache_ppl requires --model <path.gguf>\n"); return 1;
+        }
+        if (textfile.empty()) {
+            std::fprintf(stderr, "cache_ppl requires a UTF-8 text file path\n"); return 1;
+        }
+
+        auto m  = sp::engine::Model::load(cc.model_path);
+        if (!m) return 2;
+        auto v  = sp::engine::Vocab::load(*m);
+        auto tk = v ? sp::engine::Tokenizer::create(*v) : nullptr;
+        auto W  = sp::engine::LlamaWeights::load(*m);
+        if (!tk || !W) return 3;
+
+        std::FILE* fp = std::fopen(textfile.c_str(), "rb");
+        if (!fp) { std::fprintf(stderr, "cannot open %s\n", textfile.c_str()); return 4; }
+        std::fseek(fp, 0, SEEK_END);
+        const size_t fsize = (size_t)std::ftell(fp);
+        std::fseek(fp, 0, SEEK_SET);
+        std::string text((size_t)fsize, '\0');
+        if (std::fread(text.data(), 1, fsize, fp) != fsize) {
+            std::fclose(fp); return 4;
+        }
+        std::fclose(fp);
+
+        std::vector<int32_t> all_ids;
+        tk->encode(text, /*add_bos=*/true, all_ids);
+        std::fprintf(stderr, "[sp-engine] tokenised %zu bytes -> %zu tokens\n",
+                     fsize, all_ids.size());
+
+        sp::engine::PeSettings pe{cc.pe_mode, cc.pe_alpha, cc.pe_tier};
+        auto fc = sp::engine::ForwardContext::create(*m, *W, 1024 * 1024 * 1024, pe);
+        if (!fc) return 5;
+
+        const int n_layer   = fc->n_layer();
+        const int head_dim  = (int)m->head_dim();
+        const int n_head_kv = (int)m->n_head_kv();
+        const int n_vocab_local = fc->n_vocab();
+
+        const int total_chunks = (int)(all_ids.size() / (size_t)n_ctx);
+        const int eval_chunks  = (n_chunks > 0 && n_chunks < total_chunks)
+                                   ? n_chunks : total_chunks;
+        if (eval_chunks <= 0) {
+            std::fprintf(stderr, "text too short for ctx=%d\n", n_ctx); return 6;
+        }
+
+        // Create KvCache sized for one chunk at a time.
+        auto kv = sp::engine::KvCache::create(n_layer, n_head_kv, head_dim, n_ctx, cc);
+        if (!kv) { std::fprintf(stderr, "KvCache::create failed\n"); return 7; }
+        std::fprintf(stderr, "[sp-engine] %s\n", kv->describe().c_str());
+
+        auto corr = [](const float* a, const float* b, int len) {
+            double ma = 0, mb = 0;
+            for (int i = 0; i < len; ++i) { ma += a[i]; mb += b[i]; }
+            ma /= len; mb /= len;
+            double sxy = 0, sxx = 0, syy = 0;
+            for (int i = 0; i < len; ++i) {
+                double da = a[i] - ma, db = b[i] - mb;
+                sxy += da * db; sxx += da * da; syy += db * db;
+            }
+            double d = std::sqrt(sxx * syy);
+            return d > 0 ? (float)(sxy / d) : 0.0f;
+        };
+
+        std::fprintf(stderr,
+            "[sp-engine] cache_ppl: n_ctx=%d  chunks=%d  mode=%s\n",
+            n_ctx, eval_chunks, kv->is_hierarchical() ? "hierarchical" :
+            cc.sqfree ? "sqfree" : "shadow");
+
+        double total_nll = 0.0;
+        long long total_evalled = 0;
+        double overall_k_corr = 0.0, overall_v_corr = 0.0;
+        int    corr_samples = 0;
+        bool   calibrated_once = false;
+
+        std::vector<float> logits;
+        std::vector<int32_t> chunk((size_t)n_ctx);
+        const int32_t bos = v->bos_id();
+
+        for (int c = 0; c < eval_chunks; ++c) {
+            for (int t = 0; t < n_ctx; ++t) {
+                chunk[(size_t)t] = all_ids[(size_t)(c * n_ctx + t)];
+            }
+            if (bos >= 0) chunk[0] = bos;
+
+            // Run forward with K/V capture.
+            int n_vocab_out = 0;
+            std::vector<std::vector<float>> Ks, Vs;
+            if (!fc->forward_full(chunk, logits, n_vocab_out, &Ks, &Vs)) {
+                std::fprintf(stderr, "forward_full failed at chunk %d\n", c); return 8;
+            }
+
+            // Calibrate on first chunk.
+            if (!calibrated_once && !kv->is_calibrated()) {
+                if (kv->calibrate_begin()) {
+                    const bool hier = kv->is_hierarchical();
+                    for (int L = 0; L < n_layer; ++L) {
+                        const float* K_data = Ks[(size_t)L].data();
+                        for (int q = 0; q < n_ctx; ++q) {
+                            for (int h = 0; h < n_head_kv; ++h) {
+                                const float* vec = K_data + (size_t)(q * n_head_kv + h) * head_dim;
+                                if (hier) {
+                                    kv->calibrate_feed(L * n_head_kv + h, vec);
+                                } else {
+                                    kv->calibrate_feed(vec);
+                                }
+                            }
+                        }
+                    }
+                    kv->calibrate_end();
+                }
+                calibrated_once = true;
+            }
+
+            // Push K/V through cache and measure round-trip correlation.
+            for (int L = 0; L < n_layer; ++L) {
+                kv->write(L, 0, n_ctx, Ks[(size_t)L].data(), Vs[(size_t)L].data());
+            }
+            double chunk_k = 0, chunk_v = 0;
+            int chunk_n = 0;
+            for (int L = 0; L < n_layer; ++L) {
+                std::vector<float> Krec, Vrec;
+                kv->read(L, n_ctx, Krec, Vrec);
+                for (int q = 0; q < n_ctx; ++q) {
+                    for (int h = 0; h < n_head_kv; ++h) {
+                        const size_t off = (size_t)(q * n_head_kv + h) * head_dim;
+                        chunk_k += corr(Ks[(size_t)L].data() + off,
+                                        Krec.data() + off, head_dim);
+                        chunk_v += corr(Vs[(size_t)L].data() + off,
+                                        Vrec.data() + off, head_dim);
+                        chunk_n++;
+                    }
+                }
+            }
+            overall_k_corr += chunk_k;
+            overall_v_corr += chunk_v;
+            corr_samples   += chunk_n;
+
+            // Baseline PPL scoring (same as perplexity command).
+            const int first_eval = n_ctx / 2;
+            for (int i = first_eval; i < n_ctx - 1; ++i) {
+                const float* row = logits.data() + (size_t)i * n_vocab_out;
+                const int32_t target = chunk[(size_t)(i + 1)];
+                float mx = row[0];
+                for (int k = 1; k < n_vocab_out; ++k) if (row[k] > mx) mx = row[k];
+                double s = 0.0;
+                for (int k = 0; k < n_vocab_out; ++k) s += std::exp((double)(row[k] - mx));
+                const double lse = (double)mx + std::log(s);
+                total_nll += lse - (double)row[target];
+                total_evalled += 1;
+            }
+
+            const double running_ppl = std::exp(total_nll / (double)total_evalled);
+            const double running_k   = overall_k_corr / corr_samples;
+            const double running_v   = overall_v_corr / corr_samples;
+            std::fprintf(stderr,
+                "  chunk %3d/%d  PPL=%.4f  K_corr=%.4f  V_corr=%.4f\n",
+                c + 1, eval_chunks, running_ppl, running_k, running_v);
+        }
+
+        const double ppl     = std::exp(total_nll / (double)total_evalled);
+        const double mean_kc = overall_k_corr / corr_samples;
+        const double mean_vc = overall_v_corr / corr_samples;
+
+        std::printf("Baseline PPL = %.4f  (over %lld tokens, %d chunks at ctx=%d)\n",
+                    ppl, total_evalled, eval_chunks, n_ctx);
+        std::printf("Cache K_corr = %.6f  V_corr = %.6f\n", mean_kc, mean_vc);
+        std::printf("Compression  = %.2fx\n", kv->compression_ratio());
+
+        // Predicted PPL delta via the scaling law:
+        // log(PPL/base) ≈ 4700 · (1-K_corr)² / (params^1.1 · bits^1.5)
+        // We don't know params_b here, so just report the numerator.
+        const double corr_gap = 1.0 - mean_kc;
+        std::printf("Corr gap     = %.6f  (1 - K_corr)\n", corr_gap);
+        std::printf("Scaling term = %.4f  (4700 · gap²)\n", 4700.0 * corr_gap * corr_gap);
+        return 0;
+    }
+
     // perplexity handles its own argv (positional textfile + --ctx/--chunks)
     // so the strict --flag pass doesn't reject the textfile path.
     if (cmd == "perplexity") {
         sp::engine::Config pc;
         int  n_ctx    = 512;
         int  n_chunks = 0;     // 0 = all
-        bool use_cache = false;
         std::string textfile;
         for (int i = 2; i < argc; ++i) {
             std::string a = argv[i];
             if      (a == "--model"   && i + 1 < argc) pc.model_path = argv[++i];
             else if (a == "--ctx"     && i + 1 < argc) n_ctx         = std::atoi(argv[++i]);
             else if (a == "--chunks"  && i + 1 < argc) n_chunks      = std::atoi(argv[++i]);
-            else if (a == "--cache")    use_cache  = true;
-            else if (a == "--sqfree")   pc.sqfree  = true;
-            else if (a == "--spinor")   { pc.spinor = true; pc.sqfree = true; }
-            else if (a == "--no-mobius")pc.mobius  = false;
-            else if (a == "--k-bits"        && i + 1 < argc) pc.k_bits_csv     = argv[++i];
-            else if (a == "--v-bits"        && i + 1 < argc) pc.v_bits_csv     = argv[++i];
-            else if (a == "--residual-bits" && i + 1 < argc) pc.residual_bits  = std::atoi(argv[++i]);
             else if (a.size() >= 2 && a[0] == '-' && a[1] == '-') {
                 std::fprintf(stderr, "perplexity: unknown flag %s\n", a.c_str()); return 2;
             }
@@ -154,23 +373,8 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "text too short for ctx=%d (have %zu tokens)\n",
                          n_ctx, all_ids.size()); return 6;
         }
-
-        // If --cache is on, allocate a single KvCache re-used across
-        // chunks (calibration state persists after the first chunk's
-        // warmup triggers ForwardContext::prefill's auto-calibrate).
-        std::unique_ptr<sp::engine::KvCache> kv;
-        if (use_cache) {
-            kv = sp::engine::KvCache::create(fc->n_layer(),
-                                              (int)m->n_head_kv(),
-                                              (int)m->head_dim(),
-                                              n_ctx + 8, pc);
-            if (!kv) { std::fprintf(stderr, "KvCache::create failed\n"); return 5; }
-            std::fprintf(stderr, "[sp-engine] %s\n", kv->describe().c_str());
-        }
-
         std::fprintf(stderr,
-            "[sp-engine] perplexity: mode=%s n_ctx=%d  total_chunks=%d  eval=%d  n_vocab=%d\n",
-            use_cache ? "cache" : "baseline",
+            "[sp-engine] perplexity: n_ctx=%d  total_chunks=%d  eval=%d  n_vocab=%d\n",
             n_ctx, total_chunks, eval_chunks, n_vocab_local);
 
         double total_nll        = 0.0;
@@ -179,65 +383,26 @@ int main(int argc, char** argv) {
         std::vector<float> logits;
         std::vector<int32_t> chunk((size_t)n_ctx);
         const int32_t bos = v->bos_id();
-        const int first_eval = n_ctx / 2;
 
         for (int c = 0; c < eval_chunks; ++c) {
             for (int t = 0; t < n_ctx; ++t) {
                 chunk[(size_t)t] = all_ids[(size_t)(c * n_ctx + t)];
             }
+            // Match llama-perplexity: every chunk's first token is BOS for
+            // the forward pass (resets the "context"), even mid-document.
+            // Targets at chunk positions [first+1, n_ctx) come from the
+            // unchanged all_ids array, so position 0 being BOS only
+            // affects what the model sees, not what we're scoring.
             if (bos >= 0) chunk[0] = bos;
             int n_vocab_out = 0;
-
-            // Cache-mode: prefill [0..first_eval], then decode each
-            // subsequent input token; read each step's logits for CE
-            // against chunk[pos+1]. The cache holds compressed past K/V
-            // so decode's attention actually reads through the
-            // compression pipeline (unlike baseline forward_full which
-            // just projects fresh K/V each time).
-            if (use_cache) {
-                fc->bind_cache(kv.get());    // resets kv_pos, keeps calibration
-                std::vector<int32_t> warmup(chunk.begin(),
-                                            chunk.begin() + first_eval + 1);
-                std::vector<float> last_logits;
-                if (!fc->prefill(warmup, last_logits, n_vocab_out)) {
-                    std::fprintf(stderr, "cache-prefill failed at chunk %d\n", c);
-                    return 7;
-                }
-                // prefill's last_logits is the prediction from position
-                // first_eval, i.e. predicts chunk[first_eval+1].
-                auto score = [&](const float* row, int32_t target) {
-                    float mx = row[0];
-                    for (int k = 1; k < n_vocab_out; ++k) if (row[k] > mx) mx = row[k];
-                    double s = 0.0;
-                    for (int k = 0; k < n_vocab_out; ++k) s += std::exp((double)(row[k] - mx));
-                    const double lse = (double)mx + std::log(s);
-                    total_nll += lse - (double)row[target];
-                    total_evalled += 1;
-                };
-                score(last_logits.data(), chunk[(size_t)(first_eval + 1)]);
-
-                // Decode positions [first_eval+1, n_ctx-2]:
-                // decode(chunk[i]) produces logits that predict chunk[i+1].
-                for (int i = first_eval + 1; i < n_ctx - 1; ++i) {
-                    std::vector<float> dlogits;
-                    if (!fc->decode(chunk[(size_t)i], dlogits, n_vocab_out)) {
-                        std::fprintf(stderr, "cache-decode failed chunk %d pos %d\n", c, i);
-                        return 7;
-                    }
-                    score(dlogits.data(), chunk[(size_t)(i + 1)]);
-                }
-
-                const double running_ppl = std::exp(total_nll / (double)total_evalled);
-                std::fprintf(stderr, "  chunk %3d/%d  PPL_running=%.4f  (cache)\n",
-                             c + 1, eval_chunks, running_ppl);
-                continue;
-            }
-
-            // Baseline path: forward_full over whole chunk, score at
-            // positions [first_eval, n_ctx - 1).
             if (!fc->forward_full(chunk, logits, n_vocab_out)) {
                 std::fprintf(stderr, "forward_full failed at chunk %d\n", c); return 7;
             }
+            // Cross-entropy at every position predicting the next token in
+            // the chunk. We use the half-context warmup convention so the
+            // first half of the chunk is "context only" — matches
+            // llama-perplexity's default behaviour.
+            const int first_eval = n_ctx / 2;
             for (int i = first_eval; i < n_ctx - 1; ++i) {
                 const float* row = logits.data() + (size_t)i * n_vocab_out;
                 const int32_t target = chunk[(size_t)(i + 1)];
@@ -276,6 +441,7 @@ int main(int argc, char** argv) {
             if      (a == "--sqfree")       cc.sqfree = true;
             else if (a == "--spinor")       { cc.spinor = true; cc.sqfree = true; }
             else if (a == "--no-mobius")    cc.mobius  = false;
+            else if (a == "--hierarchical") cc.hierarchical = true;
             else if (a == "--naive")        naive      = true;
             else if (a == "--debug-decode") debug_decode = true;
             else if (a == "--model"     && i + 1 < argc) cc.model_path = argv[++i];
@@ -283,6 +449,9 @@ int main(int argc, char** argv) {
             else if (a == "--v-bits"    && i + 1 < argc) cc.v_bits_csv = argv[++i];
             else if (a == "--n-predict" && i + 1 < argc) n_predict     = std::atoi(argv[++i]);
             else if (a == "--ctx"       && i + 1 < argc) cc.n_ctx      = std::atoi(argv[++i]);
+            else if (a == "--hier-level"     && i + 1 < argc) cc.hier_level     = std::atoi(argv[++i]);
+            else if (a == "--hier-res-bits"  && i + 1 < argc) cc.hier_res_bits  = std::atoi(argv[++i]);
+            else if (a == "--hier-skel-bits" && i + 1 < argc) cc.hier_skel_bits = argv[++i];
             else if (a == "--pe-mode"   && i + 1 < argc) {
                 std::string m = argv[++i];
                 if      (m == "standard")      cc.pe_mode = sp::engine::Config::PeMode::Standard;
@@ -448,6 +617,7 @@ int main(int argc, char** argv) {
             if      (a == "--sqfree")    kvc.sqfree = true;
             else if (a == "--spinor")    { kvc.spinor = true; kvc.sqfree = true; }
             else if (a == "--no-mobius") kvc.mobius = false;
+            else if (a == "--hierarchical") kvc.hierarchical = true;
             else if (a == "--head-dim"  && i + 1 < argc) hd        = std::atoi(argv[++i]);
             else if (a == "--n-tokens"  && i + 1 < argc) n_tokens  = std::atoi(argv[++i]);
             else if (a == "--n-head-kv" && i + 1 < argc) n_head_kv = std::atoi(argv[++i]);
@@ -455,6 +625,9 @@ int main(int argc, char** argv) {
             else if (a == "--k-bits"    && i + 1 < argc) kvc.k_bits_csv = argv[++i];
             else if (a == "--v-bits"    && i + 1 < argc) kvc.v_bits_csv = argv[++i];
             else if (a == "--residual-bits" && i + 1 < argc) kvc.residual_bits = std::atoi(argv[++i]);
+            else if (a == "--hier-level"     && i + 1 < argc) kvc.hier_level     = std::atoi(argv[++i]);
+            else if (a == "--hier-res-bits"  && i + 1 < argc) kvc.hier_res_bits  = std::atoi(argv[++i]);
+            else if (a == "--hier-skel-bits" && i + 1 < argc) kvc.hier_skel_bits = argv[++i];
             else { std::fprintf(stderr, "kv_smoke: unknown arg %s\n", a.c_str()); return 2; }
         }
 
@@ -476,6 +649,27 @@ int main(int argc, char** argv) {
         };
         for (size_t i = 0; i < n_elems; ++i) K[i] = next();
         for (size_t i = 0; i < n_elems; ++i) V[i] = next();
+
+        // Calibrate before writing (hierarchical requires per-slot calibration;
+        // sqfree/shadow benefit from variance-ranked calibration too).
+        if (!kv->is_calibrated()) {
+            if (kv->calibrate_begin()) {
+                const bool hier = kv->is_hierarchical();
+                for (int L = 0; L < n_layer; ++L) {
+                    for (int q = 0; q < n_tokens; ++q) {
+                        for (int h = 0; h < n_head_kv; ++h) {
+                            const float* vec = K.data() + (size_t)(q * n_head_kv + h) * hd;
+                            if (hier) {
+                                kv->calibrate_feed(L * n_head_kv + h, vec);
+                            } else {
+                                kv->calibrate_feed(vec);
+                            }
+                        }
+                    }
+                }
+                kv->calibrate_end();
+            }
+        }
 
         for (int L = 0; L < n_layer; ++L) {
             if (!kv->write(L, 0, n_tokens, K.data(), V.data())) {
@@ -541,14 +735,18 @@ int main(int argc, char** argv) {
             if (a == key && i + 1 < argc) { dst = argv[++i]; return true; }
             return false;
         };
-        if      (a == "--sqfree")    cfg.sqfree = true;
-        else if (a == "--spinor")    cfg.spinor = true;
-        else if (a == "--no-mobius") cfg.mobius = false;
+        if      (a == "--sqfree")       cfg.sqfree = true;
+        else if (a == "--spinor")       cfg.spinor = true;
+        else if (a == "--no-mobius")    cfg.mobius = false;
+        else if (a == "--hierarchical") cfg.hierarchical = true;
         else if (next("--model",   cfg.model_path)) {}
         else if (next("--k-bits",  cfg.k_bits_csv)) {}
         else if (next("--v-bits",  cfg.v_bits_csv)) {}
-        else if (a == "--ctx" && i + 1 < argc)           cfg.n_ctx = std::atoi(argv[++i]);
-        else if (a == "--residual-bits" && i + 1 < argc) cfg.residual_bits = std::atoi(argv[++i]);
+        else if (next("--hier-skel-bits", cfg.hier_skel_bits)) {}
+        else if (a == "--ctx" && i + 1 < argc)               cfg.n_ctx          = std::atoi(argv[++i]);
+        else if (a == "--residual-bits" && i + 1 < argc)     cfg.residual_bits  = std::atoi(argv[++i]);
+        else if (a == "--hier-level" && i + 1 < argc)        cfg.hier_level     = std::atoi(argv[++i]);
+        else if (a == "--hier-res-bits" && i + 1 < argc)     cfg.hier_res_bits  = std::atoi(argv[++i]);
         else if (a == "--pe-mode" && i + 1 < argc) {
             std::string m = argv[++i];
             if      (m == "standard")      cfg.pe_mode = sp::engine::Config::PeMode::Standard;
@@ -872,22 +1070,24 @@ int main(int argc, char** argv) {
         if (!kv) { std::fprintf(stderr, "KvCache::create failed\n"); return 7; }
         std::fprintf(stderr, "[sp-engine] %s\n", kv->describe().c_str());
 
-        // Optional: calibrate the cache using this prefill's K vectors
-        // before compressed writes. SP_CALIBRATE=1 enables it — matches
-        // what ForwardContext::prefill does automatically under chat.
-        if (std::getenv("SP_CALIBRATE")) {
+        // Calibrate before writing.
+        if (!kv->is_calibrated()) {
             if (kv->calibrate_begin()) {
+                const bool hier = kv->is_hierarchical();
                 for (int L = 0; L < n_layer; ++L) {
-                    const float* Kd = Ks[(size_t)L].data();
+                    const float* K_data = Ks[(size_t)L].data();
                     for (int q = 0; q < n; ++q) {
                         for (int h = 0; h < n_head_kv; ++h) {
-                            kv->calibrate_feed(Kd + (size_t)(q * n_head_kv + h) * head_dim);
+                            const float* vec = K_data + (size_t)(q * n_head_kv + h) * head_dim;
+                            if (hier) {
+                                kv->calibrate_feed(L * n_head_kv + h, vec);
+                            } else {
+                                kv->calibrate_feed(vec);
+                            }
                         }
                     }
                 }
                 kv->calibrate_end();
-                std::fprintf(stderr, "[sp-engine] calibrated=%s\n",
-                             kv->is_calibrated() ? "yes" : "no");
             }
         }
 
