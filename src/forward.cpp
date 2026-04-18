@@ -227,7 +227,15 @@ static ggml_tensor* build_block(ggml_context* gctx,
                                  int n_head_kv,
                                  int n_rot,
                                  float freq_base,
-                                 float freq_scale) {
+                                 float freq_scale,
+                                 // Optional captures: if non-null, the
+                                 // post-RoPE pre-GQA-broadcast K and V
+                                 // tensors are returned through these.
+                                 // Caller marks them as outputs (so the
+                                 // gallocr keeps them addressable) and
+                                 // reads them after compute.
+                                 ggml_tensor** k_capture = nullptr,
+                                 ggml_tensor** v_capture = nullptr) {
     const int n_embd_q = n_head * head_dim;
 
     // Attention pre-norm + projections.
@@ -258,6 +266,13 @@ static ggml_tensor* build_block(ggml_context* gctx,
                       n_rot, 0, 0, freq_base, freq_scale, 0, 1, 32, 1);
     K = ggml_rope_ext(gctx, K, pos, freq_factors,
                       n_rot, 0, 0, freq_base, freq_scale, 0, 1, 32, 1);
+
+    // Capture point — post-RoPE for K, post-projection for V, both
+    // shaped [head_dim, n_head_kv, n] (the layout the KvCache expects).
+    // These are returned as graph nodes; caller decides whether to
+    // ggml_set_output() them.
+    if (k_capture) *k_capture = K;
+    if (v_capture) *v_capture = V;
 
     // GQA broadcast.
     if (n_head != n_head_kv) {
@@ -390,16 +405,28 @@ bool ForwardContext::forward_one_block(const std::vector<int32_t>& token_ids,
 // ------------------------------------------------------------------
 // 3c: full forward — loop over all layers, output_norm + output head.
 // Returns (n, n_vocab) logits flat.
+//
+// Stage 5a: when `per_layer_K` / `per_layer_V` are non-null, the
+// post-RoPE pre-GQA K/V for every layer are pulled out after compute
+// and copied into the host vectors in [head_dim, n_head_kv, n] order.
+// This is what KvCache::write expects.
 // ------------------------------------------------------------------
 bool ForwardContext::forward_full(const std::vector<int32_t>& token_ids,
                                    std::vector<float>& logits_flat,
-                                   int& out_n_vocab) {
+                                   int& out_n_vocab,
+                                   std::vector<std::vector<float>>* per_layer_K,
+                                   std::vector<std::vector<float>>* per_layer_V) {
     if (token_ids.empty()) return false;
     auto* W = impl_->weights;
     if (W->layers().empty()) return false;
 
     const int n = (int)token_ids.size();
     out_n_vocab = impl_->n_vocab;
+    const bool capture = (per_layer_K && per_layer_V);
+    if (capture) {
+        per_layer_K->assign((size_t)impl_->n_layer, std::vector<float>{});
+        per_layer_V->assign((size_t)impl_->n_layer, std::vector<float>{});
+    }
 
     ggml_init_params gip = {};
     gip.mem_size   = impl_->ctx_size;
@@ -424,11 +451,27 @@ bool ForwardContext::forward_full(const std::vector<int32_t>& token_ids,
 
     ggml_tensor* x = ggml_get_rows(gctx, W->tok_embd, ids);
 
+    std::vector<ggml_tensor*> cap_K, cap_V;
+    if (capture) {
+        cap_K.assign((size_t)impl_->n_layer, nullptr);
+        cap_V.assign((size_t)impl_->n_layer, nullptr);
+    }
+
     for (int i = 0; i < impl_->n_layer; ++i) {
+        ggml_tensor* k_cap = nullptr;
+        ggml_tensor* v_cap = nullptr;
         x = build_block(gctx, x, pos, kq_mask, freq_factors, impl_->alibi_max_bias,
                          W->layers()[(size_t)i], n,
                          impl_->head_dim, impl_->n_head, impl_->n_head_kv,
-                         impl_->n_rot, impl_->rope_freq_base, impl_->rope_freq_scale);
+                         impl_->n_rot, impl_->rope_freq_base, impl_->rope_freq_scale,
+                         capture ? &k_cap : nullptr,
+                         capture ? &v_cap : nullptr);
+        if (capture) {
+            ggml_set_output(k_cap);
+            ggml_set_output(v_cap);
+            cap_K[(size_t)i] = k_cap;
+            cap_V[(size_t)i] = v_cap;
+        }
     }
 
     // Output norm + projection.
@@ -475,6 +518,22 @@ bool ForwardContext::forward_full(const std::vector<int32_t>& token_ids,
     logits_flat.resize((size_t)n * (size_t)impl_->n_vocab);
     ggml_backend_tensor_get(logits, logits_flat.data(), 0,
                             logits_flat.size() * sizeof(float));
+
+    // Pull per-layer K/V back to host for the KvCache write (stage 5a).
+    if (capture) {
+        const size_t kv_elems = (size_t)n * impl_->n_head_kv * impl_->head_dim;
+        for (int i = 0; i < impl_->n_layer; ++i) {
+            (*per_layer_K)[(size_t)i].resize(kv_elems);
+            (*per_layer_V)[(size_t)i].resize(kv_elems);
+            ggml_backend_tensor_get(cap_K[(size_t)i],
+                                    (*per_layer_K)[(size_t)i].data(),
+                                    0, kv_elems * sizeof(float));
+            ggml_backend_tensor_get(cap_V[(size_t)i],
+                                    (*per_layer_V)[(size_t)i].data(),
+                                    0, kv_elems * sizeof(float));
+        }
+    }
+
     ggml_free(gctx);
     return true;
 }

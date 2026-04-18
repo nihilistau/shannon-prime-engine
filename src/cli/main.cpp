@@ -39,6 +39,9 @@ static void usage(const char* prog) {
         "  kv_smoke [--sqfree] [--head-dim N] [--n-tokens N]\n"
         "                       Push synthetic K/V through compressed cache, report\n"
         "                       compression ratio + per-head correlation.\n"
+        "  prefill --model <gguf> [--sqfree] <text>\n"
+        "                       Run prefill, push real RoPE'd K/V through KvCache,\n"
+        "                       report per-layer correlation (cache vs uncompressed).\n"
         "  perplexity <args>    (not yet implemented)\n"
         "  run <args>           (not yet implemented)\n"
         "\n"
@@ -459,6 +462,103 @@ int main(int argc, char** argv) {
                         topv[i].first);
         }
         std::printf("\n");
+        return 0;
+    }
+
+    if (cmd == "prefill") {
+        if (cfg.model_path.empty()) {
+            std::fprintf(stderr, "prefill requires --model <path.gguf>\n"); return 1;
+        }
+        auto m = sp::engine::Model::load(cfg.model_path);
+        if (!m) return 2;
+        auto v = sp::engine::Vocab::load(*m);
+        auto tk = v ? sp::engine::Tokenizer::create(*v) : nullptr;
+        auto W = sp::engine::LlamaWeights::load(*m);
+        if (!tk || !W) return 3;
+
+        std::string text;
+        for (size_t i = 0; i < rest.size(); ++i) {
+            if (i) text.push_back(' ');
+            text += rest[i];
+        }
+        std::vector<int32_t> ids;
+        tk->encode(text, /*add_bos=*/true, ids);
+        const int n = (int)ids.size();
+        if (n == 0) { std::fprintf(stderr, "prefill: empty text\n"); return 4; }
+
+        sp::engine::PeSettings pe{cfg.pe_mode, cfg.pe_alpha, cfg.pe_tier};
+        auto fc = sp::engine::ForwardContext::create(*m, *W, 1024 * 1024 * 1024, pe);
+        if (!fc) return 5;
+
+        std::vector<float> logits;
+        int n_vocab = 0;
+        std::vector<std::vector<float>> Ks, Vs;
+        if (!fc->forward_full(ids, logits, n_vocab, &Ks, &Vs)) {
+            std::fprintf(stderr, "prefill: forward_full failed\n"); return 6;
+        }
+
+        const int n_layer   = fc->n_layer();
+        const int head_dim  = (int)m->head_dim();
+        const int n_head_kv = (int)m->n_head_kv();
+
+        auto kv = sp::engine::KvCache::create(n_layer, n_head_kv, head_dim, n, cfg);
+        if (!kv) { std::fprintf(stderr, "KvCache::create failed\n"); return 7; }
+        std::fprintf(stderr, "[sp-engine] %s\n", kv->describe().c_str());
+
+        // Push every layer's captured K/V through the compressed cache.
+        for (int L = 0; L < n_layer; ++L) {
+            if (!kv->write(L, /*pos_offset=*/0, n, Ks[(size_t)L].data(), Vs[(size_t)L].data())) {
+                std::fprintf(stderr, "kv->write layer %d failed\n", L); return 8;
+            }
+        }
+
+        auto corr = [](const float* a, const float* b, int len) {
+            double ma = 0, mb = 0;
+            for (int i = 0; i < len; ++i) { ma += a[i]; mb += b[i]; }
+            ma /= len; mb /= len;
+            double sxy = 0, sxx = 0, syy = 0;
+            for (int i = 0; i < len; ++i) {
+                double da = a[i] - ma, db = b[i] - mb;
+                sxy += da * db; sxx += da * da; syy += db * db;
+            }
+            double denom = std::sqrt(sxx * syy);
+            return (denom > 0) ? (float)(sxy / denom) : 0.0f;
+        };
+
+        // Read every layer back, compute mean K corr / V corr per layer.
+        std::printf("layer  K_corr   V_corr  K_min   V_min\n");
+        double overall_k = 0, overall_v = 0;
+        for (int L = 0; L < n_layer; ++L) {
+            std::vector<float> Krec, Vrec;
+            if (!kv->read(L, n, Krec, Vrec)) {
+                std::fprintf(stderr, "kv->read layer %d failed\n", L); return 9;
+            }
+            double k_sum = 0, v_sum = 0;
+            float  k_min = 1.0f, v_min = 1.0f;
+            const int per = n_head_kv * n;
+            for (int q = 0; q < n; ++q) {
+                for (int h = 0; h < n_head_kv; ++h) {
+                    const float* k0 = Ks[(size_t)L].data() + (size_t)(q * n_head_kv + h) * head_dim;
+                    const float* k1 = Krec.data()           + (size_t)(q * n_head_kv + h) * head_dim;
+                    const float* v0 = Vs[(size_t)L].data() + (size_t)(q * n_head_kv + h) * head_dim;
+                    const float* v1 = Vrec.data()           + (size_t)(q * n_head_kv + h) * head_dim;
+                    float kc = corr(k0, k1, head_dim);
+                    float vc = corr(v0, v1, head_dim);
+                    k_sum += kc; v_sum += vc;
+                    if (kc < k_min) k_min = kc;
+                    if (vc < v_min) v_min = vc;
+                }
+            }
+            float km = (float)(k_sum / per), vm = (float)(v_sum / per);
+            overall_k += km; overall_v += vm;
+            // Show a sample of layers to keep the table small.
+            if (L < 4 || L == n_layer - 1 || L == n_layer / 2) {
+                std::printf("%3d   %6.4f  %6.4f  %6.4f  %6.4f\n", L, km, vm, k_min, v_min);
+            }
+        }
+        std::printf("---\nmean over %d layers: K_corr=%.4f  V_corr=%.4f  compression=%.2fx\n",
+                    n_layer, overall_k / n_layer, overall_v / n_layer,
+                    kv->compression_ratio());
         return 0;
     }
 

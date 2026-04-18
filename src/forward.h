@@ -80,9 +80,17 @@ public:
     // Run the 3c-stage graph: prefill through all n_layer transformer
     // blocks, then output_norm + output head → logits. Returns the
     // (n, n_vocab) fp32 logits flat.
+    //
+    // Stage 5a: optional per-layer K/V capture. When `per_layer_K` and
+    // `per_layer_V` are non-null, the post-RoPE pre-GQA-broadcast K
+    // and V tensors for every layer are pulled back into host vectors
+    // in `[head_dim, n_head_kv, n]` order — exactly what
+    // KvCache::write expects.
     bool forward_full(const std::vector<int32_t>& token_ids,
                       std::vector<float>& logits_flat,
-                      int& out_n_vocab);
+                      int& out_n_vocab,
+                      std::vector<std::vector<float>>* per_layer_K = nullptr,
+                      std::vector<std::vector<float>>* per_layer_V = nullptr);
 
     // Hparams the caller set at create(); exposed for diagnostics.
     int n_embd()  const;
