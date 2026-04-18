@@ -42,6 +42,9 @@ static void usage(const char* prog) {
         "  prefill --model <gguf> [--sqfree] <text>\n"
         "                       Run prefill, push real RoPE'd K/V through KvCache,\n"
         "                       report per-layer correlation (cache vs uncompressed).\n"
+        "  chat --model <gguf> [--n-predict N] [--sqfree] <prompt>\n"
+        "                       Greedy generation: prefill prompt, decode N tokens\n"
+        "                       reading past K/V from the compressed cache.\n"
         "  perplexity <args>    (not yet implemented)\n"
         "  run <args>           (not yet implemented)\n"
         "\n"
@@ -68,6 +71,127 @@ int main(int argc, char** argv) {
 
     if (cmd == "version") {
         std::printf("sp-engine 0.1.0 (scaffolding)\n");
+        return 0;
+    }
+
+    // chat handles its own argv so the strict --flag pass doesn't reject
+    // --n-predict and so on. Kept above the global parser for the same
+    // reason kv_smoke is.
+    if (cmd == "chat") {
+        sp::engine::Config cc;
+        int  n_predict = 32;
+        bool naive     = false;
+        std::string text;
+        for (int i = 2; i < argc; ++i) {
+            std::string a = argv[i];
+            if      (a == "--sqfree")       cc.sqfree = true;
+            else if (a == "--spinor")       { cc.spinor = true; cc.sqfree = true; }
+            else if (a == "--no-mobius")    cc.mobius  = false;
+            else if (a == "--naive")        naive      = true;
+            else if (a == "--model"     && i + 1 < argc) cc.model_path = argv[++i];
+            else if (a == "--k-bits"    && i + 1 < argc) cc.k_bits_csv = argv[++i];
+            else if (a == "--v-bits"    && i + 1 < argc) cc.v_bits_csv = argv[++i];
+            else if (a == "--n-predict" && i + 1 < argc) n_predict     = std::atoi(argv[++i]);
+            else if (a == "--ctx"       && i + 1 < argc) cc.n_ctx      = std::atoi(argv[++i]);
+            else if (a == "--pe-mode"   && i + 1 < argc) {
+                std::string m = argv[++i];
+                if      (m == "standard")      cc.pe_mode = sp::engine::Config::PeMode::Standard;
+                else if (m == "primepe")       cc.pe_mode = sp::engine::Config::PeMode::PrimePe;
+                else if (m == "primepe_alibi") cc.pe_mode = sp::engine::Config::PeMode::PrimePeAlibi;
+                else if (m == "alibi")         cc.pe_mode = sp::engine::Config::PeMode::AlibiOnly;
+            }
+            else if (a == "--pe-alpha"  && i + 1 < argc) cc.pe_alpha = (float)std::atof(argv[++i]);
+            else if (a == "--pe-tier"   && i + 1 < argc) cc.pe_tier  = std::atoi(argv[++i]);
+            else if (a.size() >= 2 && a[0] == '-' && a[1] == '-') {
+                std::fprintf(stderr, "chat: unknown flag %s\n", a.c_str()); return 2;
+            }
+            else {
+                if (!text.empty()) text.push_back(' ');
+                text += a;
+            }
+        }
+        if (cc.model_path.empty()) {
+            std::fprintf(stderr, "chat requires --model <path.gguf>\n"); return 1;
+        }
+        if (text.empty()) {
+            std::fprintf(stderr, "chat requires a prompt\n"); return 1;
+        }
+
+        auto m = sp::engine::Model::load(cc.model_path);
+        if (!m) return 2;
+        auto v  = sp::engine::Vocab::load(*m);
+        auto tk = v ? sp::engine::Tokenizer::create(*v) : nullptr;
+        auto W  = sp::engine::LlamaWeights::load(*m);
+        if (!tk || !W) return 3;
+
+        std::vector<int32_t> ids;
+        tk->encode(text, /*add_bos=*/true, ids);
+        const int n_prompt = (int)ids.size();
+        const int max_seq  = n_prompt + n_predict + 4;
+
+        sp::engine::PeSettings pe{cc.pe_mode, cc.pe_alpha, cc.pe_tier};
+        auto fc = sp::engine::ForwardContext::create(*m, *W, 1024 * 1024 * 1024, pe);
+        if (!fc) return 4;
+
+        auto kv = sp::engine::KvCache::create(fc->n_layer(),
+                                               (int)m->n_head_kv(),
+                                               (int)m->head_dim(),
+                                               max_seq, cc);
+        if (!kv) { std::fprintf(stderr, "KvCache::create failed\n"); return 5; }
+        std::fprintf(stderr, "[sp-engine] %s\n", kv->describe().c_str());
+        std::fprintf(stderr, "[sp-engine] PE: %s\n",
+                     sp::engine::prime_pe_describe(cc.pe_mode, cc.pe_alpha, cc.pe_tier).c_str());
+
+        fc->bind_cache(kv.get());
+
+        std::vector<float> last_logits;
+        int n_vocab = 0;
+        std::vector<int32_t> running = ids;  // for --naive path
+        if (naive) {
+            std::vector<float> all;
+            if (!fc->forward_full(running, all, n_vocab)) {
+                std::fprintf(stderr, "naive forward failed\n"); return 6;
+            }
+            last_logits.assign(all.end() - n_vocab, all.end());
+        } else {
+            if (!fc->prefill(ids, last_logits, n_vocab)) {
+                std::fprintf(stderr, "prefill failed\n"); return 6;
+            }
+        }
+
+        // Print the prompt as-is so the user sees what we tokenised.
+        std::printf("%s", text.c_str());
+        std::fflush(stdout);
+
+        std::string out_so_far;
+        for (int step = 0; step < n_predict; ++step) {
+            int arg = 0;
+            float best = last_logits[0];
+            for (int i = 1; i < n_vocab; ++i) {
+                if (last_logits[(size_t)i] > best) { best = last_logits[(size_t)i]; arg = i; }
+            }
+            std::vector<int32_t> one = { arg };
+            std::string piece = tk->decode(one);
+            std::printf("%s", piece.c_str());
+            std::fflush(stdout);
+
+            if (step + 1 == n_predict) break;
+            if (naive) {
+                running.push_back(arg);
+                std::vector<float> all;
+                if (!fc->forward_full(running, all, n_vocab)) {
+                    std::fprintf(stderr, "\nnaive forward failed at step %d\n", step); return 7;
+                }
+                last_logits.assign(all.end() - n_vocab, all.end());
+            } else {
+                if (!fc->decode(arg, last_logits, n_vocab)) {
+                    std::fprintf(stderr, "\ndecode failed at step %d\n", step); return 7;
+                }
+            }
+        }
+        std::printf("\n");
+        std::fprintf(stderr, "[sp-engine] kv_pos=%d  (prompt=%d, generated=%d)\n",
+                     fc->kv_pos(), n_prompt, n_predict);
         return 0;
     }
 

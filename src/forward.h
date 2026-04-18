@@ -92,6 +92,30 @@ public:
                       std::vector<std::vector<float>>* per_layer_K = nullptr,
                       std::vector<std::vector<float>>* per_layer_V = nullptr);
 
+    // ---- Stage 5b: stateful prefill + decode over a compressed KV ----
+    //
+    // Bind a KvCache to this context. The cache is non-owning; the
+    // caller must outlive the ForwardContext. Resets kv_pos to 0.
+    void bind_cache(class KvCache* cache);
+
+    // Run prefill: forward_full(token_ids) → write every layer's K/V
+    // into the bound cache → advance kv_pos by token_ids.size().
+    // Returns the logits of ONLY the last token (n_vocab floats), which
+    // is all decode loops actually consume.
+    bool prefill(const std::vector<int32_t>& token_ids,
+                 std::vector<float>& last_logits,
+                 int& out_n_vocab);
+
+    // Run a single decode step: read past K/V from the bound cache,
+    // project new Q/K/V for `token_id`, concat, attend, write the new
+    // K/V back to the cache at slot kv_pos, advance kv_pos by 1.
+    // Returns logits for the new position.
+    bool decode(int32_t token_id,
+                std::vector<float>& logits,
+                int& out_n_vocab);
+
+    int kv_pos() const;
+
     // Hparams the caller set at create(); exposed for diagnostics.
     int n_embd()  const;
     int n_vocab() const;
