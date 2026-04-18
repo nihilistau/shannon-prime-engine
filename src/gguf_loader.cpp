@@ -159,6 +159,10 @@ int64_t Model::find_tensor(const std::string& name) const {
     return gguf_find_tensor(impl_->gguf, name.c_str());
 }
 
+void* Model::_gguf_context_opaque() const {
+    return reinterpret_cast<void*>(impl_->gguf);
+}
+
 // ------------------------------------------------------------------
 // Pretty-print
 // ------------------------------------------------------------------

@@ -71,6 +71,12 @@ public:
     // Pretty-print: one-line summary good enough for CLI `info` verb.
     void print_summary(std::FILE* f) const;
 
+    // Escape hatch for companion classes (Vocab, ModelArchBinding, ...)
+    // that need direct gguf_context access. Returns a `void*` so the
+    // header doesn't pull ggml's types in; callers reinterpret-cast.
+    // Stable while the Model object lives.
+    void* _gguf_context_opaque() const;
+
 private:
     Model();
 

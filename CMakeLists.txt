@@ -87,7 +87,8 @@ add_library(sp_engine STATIC
     src/engine.cpp
     src/kv_cache.cpp
     src/model_loader.cpp
-    src/gguf_loader.cpp)
+    src/gguf_loader.cpp
+    src/vocab.cpp)
 target_include_directories(sp_engine PUBLIC src)
 target_link_libraries(sp_engine PUBLIC
     shannon_prime_core

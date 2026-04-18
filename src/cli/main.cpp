@@ -6,6 +6,7 @@
 
 #include "engine.h"
 #include "gguf_loader.h"
+#include "vocab.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -98,6 +99,18 @@ int main(int argc, char** argv) {
         }
         if (m->tensor_count() > 8) {
             std::printf("    ... (%zu total)\n", m->tensor_count());
+        }
+
+        std::printf("\n");
+        auto v = sp::engine::Vocab::load(*m);
+        if (v) {
+            v->print_summary(stdout);
+            if (v->size() >= 3) {
+                std::printf("  sample: [0]=%-12s [1]=%-12s [2]=%-12s\n",
+                            v->token(0).c_str(), v->token(1).c_str(), v->token(2).c_str());
+            }
+        } else {
+            std::printf("Tokenizer: (no vocab section in this GGUF)\n");
         }
         return 0;
     }
