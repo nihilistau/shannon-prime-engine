@@ -325,29 +325,24 @@ static ggml_tensor* build_block(ggml_context* gctx,
     if (k_capture) *k_capture = K;
     if (v_capture) *v_capture = V;
 
-    // GQA broadcast.
-    if (n_head != n_head_kv) {
-        const int n_rep = n_head / n_head_kv;
-        ggml_tensor* Kx = ggml_reshape_4d(gctx, K, head_dim, 1, n_head_kv, n);
-        ggml_tensor* Kt = ggml_new_tensor_4d(gctx, K->type, head_dim, n_rep, n_head_kv, n);
-        Kx = ggml_repeat(gctx, Kx, Kt);
-        K  = ggml_reshape_3d(gctx, Kx, head_dim, n_head, n);
-        ggml_tensor* Vx = ggml_reshape_4d(gctx, V, head_dim, 1, n_head_kv, n);
-        ggml_tensor* Vt = ggml_new_tensor_4d(gctx, V->type, head_dim, n_rep, n_head_kv, n);
-        Vx = ggml_repeat(gctx, Vx, Vt);
-        V  = ggml_reshape_3d(gctx, Vx, head_dim, n_head, n);
-    }
-
-    // Attention: Q·K^T / sqrt(d) + causal softmax.
-    ggml_tensor* Qp = ggml_cont(gctx, ggml_permute(gctx, Q, 0, 2, 1, 3));
-    ggml_tensor* Kp = ggml_cont(gctx, ggml_permute(gctx, K, 0, 2, 1, 3));
-    ggml_tensor* KQ = ggml_mul_mat(gctx, Kp, Qp);
-    KQ = ggml_soft_max_ext(gctx, KQ, kq_mask,
-                           1.0f / sqrtf((float)head_dim), alibi_max_bias);
-
-    ggml_tensor* Vp = ggml_cont(gctx, ggml_permute(gctx, V, 1, 2, 0, 3));
-    ggml_tensor* attn = ggml_mul_mat(gctx, Vp, KQ);
-    attn = ggml_cont(gctx, ggml_permute(gctx, attn, 0, 2, 1, 3));
+    // Attention via ggml_flash_attn_ext — fused, numerically stable for
+    // long sequences, handles GQA broadcast internally (no manual repeat
+    // needed). Permute Q/K/V to [head_dim, n, n_head_or_kv]; cast K and
+    // V to F16 (the op's expected operand type for the matmul kernels);
+    // F16 mask is required when max_bias > 0 (and tolerated otherwise).
+    // Output comes back shaped [head_dim, n_head, n] which reshape_2d
+    // flattens to [n_embd_q, n] for the wo projection. Output precision
+    // is set to F32 explicitly.
+    ggml_tensor* qp = ggml_permute(gctx, Q, 0, 2, 1, 3);
+    ggml_tensor* kp = ggml_permute(gctx, K, 0, 2, 1, 3);
+    ggml_tensor* vp = ggml_permute(gctx, V, 0, 2, 1, 3);
+    if (kp->type == GGML_TYPE_F32) kp = ggml_cast(gctx, kp, GGML_TYPE_F16);
+    if (vp->type == GGML_TYPE_F32) vp = ggml_cast(gctx, vp, GGML_TYPE_F16);
+    ggml_tensor* mask_f16 = ggml_cast(gctx, kq_mask, GGML_TYPE_F16);
+    ggml_tensor* attn = ggml_flash_attn_ext(gctx, qp, kp, vp, mask_f16,
+                                            1.0f / sqrtf((float)head_dim),
+                                            alibi_max_bias, 0.0f);
+    ggml_flash_attn_ext_set_prec(attn, GGML_PREC_F32);
     attn = ggml_reshape_2d(gctx, attn, n_embd_q, n);
 
     ggml_tensor* y1 = ggml_mul_mat(gctx, L.wo, attn);
