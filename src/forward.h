@@ -90,7 +90,11 @@ public:
                       std::vector<float>& logits_flat,
                       int& out_n_vocab,
                       std::vector<std::vector<float>>* per_layer_K = nullptr,
-                      std::vector<std::vector<float>>* per_layer_V = nullptr);
+                      std::vector<std::vector<float>>* per_layer_V = nullptr,
+                      // Optional: post-block hidden state of layer 0,
+                      // shape [n_embd, n_tokens]. Used to compare
+                      // against decode's per-step layer-0 hidden.
+                      std::vector<float>* dbg_X_layer0 = nullptr);
 
     // ---- Stage 5b: stateful prefill + decode over a compressed KV ----
     //
@@ -110,9 +114,16 @@ public:
     // project new Q/K/V for `token_id`, concat, attend, write the new
     // K/V back to the cache at slot kv_pos, advance kv_pos by 1.
     // Returns logits for the new position.
+    //
+    // `dbg_K_layer0` (optional out): receives the freshly-projected
+    // post-RoPE K for layer 0 (size n_head_kv * head_dim) BEFORE it
+    // is written to cache. Useful for comparing against forward_full's
+    // K at the same position to localise decode-graph bugs.
     bool decode(int32_t token_id,
                 std::vector<float>& logits,
-                int& out_n_vocab);
+                int& out_n_vocab,
+                std::vector<float>* dbg_K_layer0 = nullptr,
+                std::vector<float>* dbg_X_layer0 = nullptr);
 
     int kv_pos() const;
 

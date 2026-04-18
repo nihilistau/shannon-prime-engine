@@ -279,10 +279,14 @@ static ggml_tensor* build_block(ggml_context* gctx,
     K = ggml_rope_ext(gctx, K, pos, freq_factors,
                       n_rot, 0, 0, freq_base, freq_scale, 0, 1, 32, 1);
 
-    // Capture point — post-RoPE for K, post-projection for V, both
-    // shaped [head_dim, n_head_kv, n] (the layout the KvCache expects).
-    // These are returned as graph nodes; caller decides whether to
-    // ggml_set_output() them.
+    // V is a ggml_reshape_3d view over the projection output. ggml_set_output
+    // on a view does not preserve the underlying buffer through subsequent
+    // ops (the gallocr can repurpose the source buffer once the view is
+    // "consumed" by the next reshape). Materialise V via ggml_cont and
+    // reuse the materialised tensor downstream so the gallocr sees a real
+    // buffer-owning node on the compute path.
+    V = ggml_cont(gctx, V);
+
     if (k_capture) *k_capture = K;
     if (v_capture) *v_capture = V;
 
@@ -427,7 +431,8 @@ bool ForwardContext::forward_full(const std::vector<int32_t>& token_ids,
                                    std::vector<float>& logits_flat,
                                    int& out_n_vocab,
                                    std::vector<std::vector<float>>* per_layer_K,
-                                   std::vector<std::vector<float>>* per_layer_V) {
+                                   std::vector<std::vector<float>>* per_layer_V,
+                                   std::vector<float>* dbg_X_layer0) {
     if (token_ids.empty()) return false;
     auto* W = impl_->weights;
     if (W->layers().empty()) return false;
@@ -469,6 +474,7 @@ bool ForwardContext::forward_full(const std::vector<int32_t>& token_ids,
         cap_V.assign((size_t)impl_->n_layer, nullptr);
     }
 
+    ggml_tensor* x_layer0 = nullptr;
     for (int i = 0; i < impl_->n_layer; ++i) {
         ggml_tensor* k_cap = nullptr;
         ggml_tensor* v_cap = nullptr;
@@ -483,6 +489,10 @@ bool ForwardContext::forward_full(const std::vector<int32_t>& token_ids,
             ggml_set_output(v_cap);
             cap_K[(size_t)i] = k_cap;
             cap_V[(size_t)i] = v_cap;
+        }
+        if (i == 0 && dbg_X_layer0) {
+            x_layer0 = x;
+            ggml_set_output(x_layer0);
         }
     }
 
@@ -546,6 +556,12 @@ bool ForwardContext::forward_full(const std::vector<int32_t>& token_ids,
         }
     }
 
+    if (x_layer0 && dbg_X_layer0) {
+        const size_t nbytes = (size_t)n * impl_->n_embd * sizeof(float);
+        dbg_X_layer0->resize((size_t)n * impl_->n_embd);
+        ggml_backend_tensor_get(x_layer0, dbg_X_layer0->data(), 0, nbytes);
+    }
+
     ggml_free(gctx);
     return true;
 }
@@ -565,18 +581,17 @@ bool ForwardContext::forward_full(const std::vector<int32_t>& token_ids,
 // soft_max_ext accepts a nullptr mask when max_bias = 0. For ALiBi
 // modes, we build a 1×kv_total mask of -(kv_pos - kv) values.
 //
-// FIXME(stage 5b): output logits at position past_n have ~half the
-// magnitude of forward_full's logits at the same position, even with
-// near-lossless cache (8-bit K, V). The shape/type/dim of every
-// tensor on the path checks out (past_K and new_K both F32 [hd,
-// n_kv, *], concat dim=2 is correct, GQA broadcast index math
-// matches Llama-3 convention). chat --naive (forward_full per step)
-// produces a perfect "The quick brown fox jumps over the lazy dog."
-// continuation, so the chat loop and sampling are correct — the bug
-// is squarely in this graph. Next session should compare the
-// captured K from this graph against the K forward_full produces at
-// the same position to localize whether the divergence is in the
-// projection or the attention.
+// Note on the V capture: V at the projection point is a
+// `ggml_reshape_3d` view over the mul_mat output and does not own a
+// buffer. ggml_set_output on a view does not pin the underlying
+// source buffer through subsequent ops, so the gallocr would
+// repurpose it during the GQA broadcast / concat — corrupting both
+// the captured V and the V data the attention op actually consumes.
+// We materialise V via ggml_cont once and reuse the materialised
+// tensor for both capture and the downstream concat / GQA path; the
+// gallocr then sees one real buffer-owning node on the compute path
+// and everything stays put. K does not need this because it comes
+// out of ggml_rope_ext, which is a real op output (own buffer).
 // ------------------------------------------------------------------
 static ggml_tensor* build_block_decode(ggml_context* gctx,
                                         ggml_tensor* x,
@@ -626,6 +641,13 @@ static ggml_tensor* build_block_decode(ggml_context* gctx,
                       n_rot, 0, 0, freq_base, freq_scale, 0, 1, 32, 1);
     K = ggml_rope_ext(gctx, K, pos, freq_factors,
                       n_rot, 0, 0, freq_base, freq_scale, 0, 1, 32, 1);
+
+    // V at this point is a ggml_reshape_3d view over the projection
+    // output. Materialise it once via ggml_cont and reuse for both the
+    // capture and the downstream concat — that way the gallocr sees a
+    // single buffer-owning node on the compute path. K is the output of
+    // ggml_rope_ext, already a real op result, so no cont needed.
+    V = ggml_cont(gctx, V);
 
     // Capture for cache write-back BEFORE the concat; what the cache
     // stores is the new single-token K/V, not the union.
@@ -713,7 +735,9 @@ bool ForwardContext::prefill(const std::vector<int32_t>& token_ids,
 
 bool ForwardContext::decode(int32_t token_id,
                              std::vector<float>& logits,
-                             int& out_n_vocab) {
+                             int& out_n_vocab,
+                             std::vector<float>* dbg_K_layer0,
+                             std::vector<float>* dbg_X_layer0) {
     if (!impl_->cache) {
         std::fprintf(stderr, "[sp-engine] decode: no cache bound\n");
         return false;
@@ -770,18 +794,19 @@ bool ForwardContext::decode(int32_t token_id,
         }
     }
 
-    // Optional ALiBi mask (1 query × kv_total keys).
-    ggml_tensor* mask = nullptr;
-    if (impl_->alibi_max_bias > 0.0f) {
-        mask = ggml_new_tensor_2d(gctx, GGML_TYPE_F32, kv_tot, 1);
-        ggml_set_input(mask);
-    }
+    // Causal mask: 1 query × kv_total keys. Always present so the
+    // graph topology is identical between Standard and ALiBi PE
+    // (max_bias > 0 requires a mask tensor; max_bias = 0 still uses
+    // the mask values as additive offsets with slope=1).
+    ggml_tensor* mask = ggml_new_tensor_2d(gctx, GGML_TYPE_F32, kv_tot, 1);
+    ggml_set_input(mask);
 
     ggml_tensor* x = ggml_get_rows(gctx, W->tok_embd, ids);
 
     std::vector<ggml_tensor*> new_K(impl_->n_layer, nullptr);
     std::vector<ggml_tensor*> new_V(impl_->n_layer, nullptr);
 
+    ggml_tensor* x_layer0 = nullptr;
     for (int L = 0; L < impl_->n_layer; ++L) {
         ggml_tensor* k_cap = nullptr;
         ggml_tensor* v_cap = nullptr;
@@ -798,6 +823,10 @@ bool ForwardContext::decode(int32_t token_id,
         ggml_set_output(v_cap);
         new_K[(size_t)L] = k_cap;
         new_V[(size_t)L] = v_cap;
+        if (L == 0 && dbg_X_layer0) {
+            x_layer0 = x;
+            ggml_set_output(x_layer0);
+        }
     }
 
     ggml_tensor* h = ggml_rms_norm(gctx, x, 1e-5f);
@@ -830,9 +859,11 @@ bool ForwardContext::decode(int32_t token_id,
                                     past_V_all[(size_t)L].data(), 0, nbytes);
         }
     }
-    if (mask) {
-        std::vector<float> mvals((size_t)kv_tot);
-        for (int kv = 0; kv < kv_tot; ++kv) mvals[(size_t)kv] = -(float)(past_n - kv);
+    {
+        std::vector<float> mvals((size_t)kv_tot, 0.0f);
+        if (impl_->alibi_max_bias > 0.0f) {
+            for (int kv = 0; kv < kv_tot; ++kv) mvals[(size_t)kv] = -(float)(past_n - kv);
+        }
         ggml_backend_tensor_set(mask, mvals.data(), 0, mvals.size() * sizeof(float));
     }
 
@@ -847,6 +878,7 @@ bool ForwardContext::decode(int32_t token_id,
     for (int L = 0; L < impl_->n_layer; ++L) {
         ggml_backend_tensor_get(new_K[(size_t)L], K_one.data(), 0, kv_elems * sizeof(float));
         ggml_backend_tensor_get(new_V[(size_t)L], V_one.data(), 0, kv_elems * sizeof(float));
+        if (L == 0 && dbg_K_layer0) *dbg_K_layer0 = K_one;
         if (!impl_->cache->write(L, past_n, 1, K_one.data(), V_one.data())) {
             std::fprintf(stderr, "[sp-engine] decode: cache write layer %d failed\n", L);
             ggml_free(gctx); return false;
@@ -855,6 +887,12 @@ bool ForwardContext::decode(int32_t token_id,
 
     logits.resize((size_t)out_n_vocab);
     ggml_backend_tensor_get(logits_t, logits.data(), 0, logits.size() * sizeof(float));
+
+    if (x_layer0 && dbg_X_layer0) {
+        const size_t nbytes = (size_t)impl_->n_embd * sizeof(float);
+        dbg_X_layer0->resize((size_t)impl_->n_embd);
+        ggml_backend_tensor_get(x_layer0, dbg_X_layer0->data(), 0, nbytes);
+    }
 
     ggml_free(gctx);
     impl_->kv_pos += 1;

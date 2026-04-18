@@ -81,6 +81,7 @@ int main(int argc, char** argv) {
         sp::engine::Config cc;
         int  n_predict = 32;
         bool naive     = false;
+        bool debug_decode = false;
         std::string text;
         for (int i = 2; i < argc; ++i) {
             std::string a = argv[i];
@@ -88,6 +89,7 @@ int main(int argc, char** argv) {
             else if (a == "--spinor")       { cc.spinor = true; cc.sqfree = true; }
             else if (a == "--no-mobius")    cc.mobius  = false;
             else if (a == "--naive")        naive      = true;
+            else if (a == "--debug-decode") debug_decode = true;
             else if (a == "--model"     && i + 1 < argc) cc.model_path = argv[++i];
             else if (a == "--k-bits"    && i + 1 < argc) cc.k_bits_csv = argv[++i];
             else if (a == "--v-bits"    && i + 1 < argc) cc.v_bits_csv = argv[++i];
@@ -184,8 +186,61 @@ int main(int argc, char** argv) {
                 }
                 last_logits.assign(all.end() - n_vocab, all.end());
             } else {
-                if (!fc->decode(arg, last_logits, n_vocab)) {
+                std::vector<float> dbg_K, dbg_X;
+                std::vector<float>* dbg_K_ptr = debug_decode ? &dbg_K : nullptr;
+                std::vector<float>* dbg_X_ptr = debug_decode ? &dbg_X : nullptr;
+                if (!fc->decode(arg, last_logits, n_vocab, dbg_K_ptr, dbg_X_ptr)) {
                     std::fprintf(stderr, "\ndecode failed at step %d\n", step); return 7;
+                }
+                if (debug_decode) {
+                    running.push_back(arg);
+                    std::vector<float> ref_logits, ref_X;
+                    int rn = 0;
+                    std::vector<std::vector<float>> ref_K, ref_V;
+                    if (!fc->forward_full(running, ref_logits, rn, &ref_K, &ref_V, &ref_X)) {
+                        std::fprintf(stderr, "\nref forward failed at step %d\n", step); return 8;
+                    }
+                    const int n_kv     = (int)m->n_head_kv();
+                    const int hd       = (int)m->head_dim();
+                    const int n_embd   = fc->n_embd();
+                    const int last_pos = (int)running.size() - 1;
+                    const float* ref_K_last = ref_K[0].data() + (size_t)last_pos * n_kv * hd;
+                    const float* ref_X_last = ref_X.data()    + (size_t)last_pos * n_embd;
+                    auto corr = [&](const float* a, const float* b, int len) {
+                        double ma = 0, mb = 0;
+                        for (int i = 0; i < len; ++i) { ma += a[i]; mb += b[i]; }
+                        ma /= len; mb /= len;
+                        double sxy = 0, sxx = 0, syy = 0;
+                        for (int i = 0; i < len; ++i) {
+                            double da = a[i] - ma, db = b[i] - mb;
+                            sxy += da * db; sxx += da * da; syy += db * db;
+                        }
+                        double d = std::sqrt(sxx * syy);
+                        return d > 0 ? (float)(sxy / d) : 0.0f;
+                    };
+                    auto magn = [](const float* a, int len) {
+                        double s = 0; for (int i = 0; i < len; ++i) s += a[i]*a[i];
+                        return std::sqrt(s / len);
+                    };
+                    float k_corr_total = corr(dbg_K.data(), ref_K_last, n_kv * hd);
+                    float x_corr       = corr(dbg_X.data(), ref_X_last, n_embd);
+                    float dec_x_mag    = magn(dbg_X.data(), n_embd);
+                    float ref_x_mag    = magn(ref_X_last, n_embd);
+                    int ref_arg = 0; float ref_best = ref_logits[ref_logits.size() - n_vocab];
+                    for (int i = 1; i < n_vocab; ++i) {
+                        float v = ref_logits[ref_logits.size() - n_vocab + i];
+                        if (v > ref_best) { ref_best = v; ref_arg = i; }
+                    }
+                    int dec_arg = 0; float dec_best = last_logits[0];
+                    for (int i = 1; i < n_vocab; ++i) {
+                        if (last_logits[(size_t)i] > dec_best) { dec_best = last_logits[(size_t)i]; dec_arg = i; }
+                    }
+                    std::fprintf(stderr,
+                        "\n[debug step %d past_n=%d] L0 K corr=%.4f  L0 X corr=%.4f  X rms dec=%.3f ref=%.3f  "
+                        "dec argmax=%d (%+.3f)  ref argmax=%d (%+.3f)\n",
+                        step, fc->kv_pos() - 1, k_corr_total, x_corr,
+                        dec_x_mag, ref_x_mag,
+                        dec_arg, dec_best, ref_arg, ref_best);
                 }
             }
         }
