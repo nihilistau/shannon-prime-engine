@@ -6,6 +6,7 @@
 
 #include "engine.h"
 #include "gguf_loader.h"
+#include "llama_weights.h"
 #include "tokenizer.h"
 #include "vocab.h"
 
@@ -118,6 +119,14 @@ int main(int argc, char** argv) {
             }
         } else {
             std::printf("Tokenizer: (no vocab section in this GGUF)\n");
+        }
+
+        std::printf("\n");
+        auto w = sp::engine::LlamaWeights::load(*m);
+        if (w) {
+            w->print_summary(stdout);
+        } else {
+            std::printf("Weights: (arch binding failed — unsupported arch or missing tensor)\n");
         }
         return 0;
     }
