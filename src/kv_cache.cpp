@@ -5,6 +5,7 @@
 
 extern "C" {
 #include "shannon_prime.h"
+#include "shannon_prime_modelpack.h"
 }
 
 #ifdef SP_ENGINE_WITH_CUDA
@@ -40,6 +41,86 @@ static std::vector<int> parse_csv_bits(const std::string& csv) {
         i = j + 1;
     }
     return out;
+}
+
+// Resolve model_preset (if set) and overlay K/V/residual onto kbits/vbits/rbits
+// IFF the caller kept the engine's shipping defaults. This honours the layering
+// contract in docs/MODEL-PACK.md: shipping defaults < preset < env < CLI.
+//
+//  model_preset values:
+//    ""     — preset disabled (shipping defaults / explicit flags only)
+//    "off"  — same as ""
+//    "auto" — resolve from cfg.arch_name (caller populates from GGUF)
+//    other  — treated as an explicit preset name / arch match string
+//
+// Returns true if a preset was applied. Logs one line to stderr either way
+// (including the "no match" case) so the auto-adapts story is auditable.
+static bool apply_model_preset_overlay(const Config& cfg,
+                                       int head_dim, int n_layer, int n_head_kv,
+                                       std::vector<int>& kbits,
+                                       std::vector<int>& vbits,
+                                       int& rbits) {
+    if (cfg.model_preset.empty() || cfg.model_preset == "off") return false;
+
+    // Shipping defaults from engine.h Config — detection is string-equality
+    // against those defaults. Any explicit --k-bits/--v-bits/--residual-bits
+    // at the CLI will have mutated these; in that case the user wins.
+    const bool k_is_default  = (cfg.k_bits_csv  == "5,5,4,3");
+    const bool v_is_default  = (cfg.v_bits_csv  == "3");
+    const bool r_is_default  = (cfg.residual_bits == 3);
+
+    const char* match_arg = nullptr;
+    if (cfg.model_preset == "auto") {
+        if (cfg.arch_name.empty()) {
+            std::fprintf(stderr, "[sp-engine] model-pack: auto requested but "
+                         "arch_name is empty (model not loaded yet?) — keeping "
+                         "shipping defaults\n");
+            return false;
+        }
+        match_arg = cfg.arch_name.c_str();
+    } else {
+        // Explicit preset name — the registry matches by arch substring, so
+        // pass the preset name as the arch string. "qwen3-moe" contains
+        // "qwen3moe" in the registry pattern, so for named lookups callers
+        // should use the GGUF-style arch string.
+        match_arg = cfg.model_preset.c_str();
+    }
+
+    const sp_model_preset_t* preset = sp_model_preset_resolve(
+        match_arg, head_dim, n_layer, n_head_kv);
+    if (!preset) {
+        std::fprintf(stderr, "[sp-engine] model-pack: no preset matches '%s' — "
+                     "keeping shipping defaults\n", match_arg);
+        return false;
+    }
+
+    char buf[256];
+    sp_model_preset_describe(preset, buf, sizeof(buf));
+    std::fprintf(stderr, "[sp-engine] model-pack: %s\n", buf);
+
+    if (!k_is_default && !v_is_default && !r_is_default) {
+        std::fprintf(stderr, "[sp-engine] model-pack: all tunables explicitly "
+                     "set — preset is informational only\n");
+        return false;
+    }
+
+    bool applied = false;
+    if (k_is_default && preset->k_n_bands > 0) {
+        kbits.assign(preset->k_band_bits,
+                     preset->k_band_bits + preset->k_n_bands);
+        applied = true;
+    }
+    if (v_is_default && preset->v_n_bands > 0) {
+        vbits.assign(preset->v_band_bits,
+                     preset->v_band_bits + preset->v_n_bands);
+        applied = true;
+    }
+    if (r_is_default && preset->residual_bits >= 1 &&
+        preset->residual_bits <= 4) {
+        rbits = preset->residual_bits;
+        applied = true;
+    }
+    return applied;
 }
 
 } // namespace
@@ -192,6 +273,11 @@ std::unique_ptr<KvCache> KvCache::create(int n_layer, int n_head_kv,
     auto vbits = parse_csv_bits(cfg.v_bits_csv);
     if (kbits.empty()) kbits = {5, 5, 4, 3};
     if (vbits.empty()) vbits = {3};
+    int rbits_cpu = (cfg.residual_bits >= 1 && cfg.residual_bits <= 4)
+                    ? cfg.residual_bits : 3;
+    // Model-pack overlay (shipping defaults < preset < env < CLI).
+    apply_model_preset_overlay(cfg, head_dim, n_layer, n_head_kv,
+                               kbits, vbits, rbits_cpu);
     if ((int)kbits.size() > SP_MAX_BANDS) kbits.resize(SP_MAX_BANDS);
     if ((int)vbits.size() > SP_MAX_BANDS) vbits.resize(SP_MAX_BANDS);
     sc->k_n_bands = (int)kbits.size();
@@ -223,7 +309,7 @@ std::unique_ptr<KvCache> KvCache::create(int n_layer, int n_head_kv,
     }
 
     if (cfg.sqfree) {
-        const int rbits = (cfg.residual_bits >= 1 && cfg.residual_bits <= 4) ? cfg.residual_bits : 3;
+        const int rbits = rbits_cpu;
         if (sp_sqfree_cache_init(&kv->impl_->sq, sc, max_seq, rbits, cfg.spinor) != 0) {
             std::fprintf(stderr, "[sp-engine] KvCache: sqfree_cache_init failed\n");
             return nullptr;
@@ -676,6 +762,11 @@ std::unique_ptr<KvCache> KvCache::create_gpu(int n_layer, int n_head_kv,
     auto vbits = parse_csv_bits(cfg.v_bits_csv);
     if (kbits.empty()) kbits = {5, 5, 4, 3};
     if (vbits.empty()) vbits = {3};
+    int rbits_gpu = (cfg.residual_bits >= 1 && cfg.residual_bits <= 4)
+                    ? cfg.residual_bits : 3;
+    // Model-pack overlay (shipping defaults < preset < env < CLI).
+    apply_model_preset_overlay(cfg, head_dim, n_layer, n_head_kv,
+                               kbits, vbits, rbits_gpu);
     if ((int)kbits.size() > SP_MAX_BANDS) kbits.resize(SP_MAX_BANDS);
     if ((int)vbits.size() > SP_MAX_BANDS) vbits.resize(SP_MAX_BANDS);
     sc->k_n_bands = (int)kbits.size();
@@ -686,8 +777,7 @@ std::unique_ptr<KvCache> KvCache::create_gpu(int n_layer, int n_head_kv,
     // Sqfree GPU cache dispatches to a different backing. Ship falls
     // through to sp_cuda_cache_init below.
     if (is_sqfree) {
-        const int rbits = (cfg.residual_bits >= 1 && cfg.residual_bits <= 4)
-                          ? cfg.residual_bits : 3;
+        const int rbits = rbits_gpu;
         if (sp_cuda_sqfree_cache_init(&kv->impl_->cuda_sqfree_cache, sc,
                                        max_seq, rbits,
                                        /*use_spinor=*/cfg.spinor ? 1 : 0,

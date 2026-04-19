@@ -26,6 +26,17 @@ struct Config {
     std::string k_bits_csv  = "5,5,4,3"; // Per-band K bit allocation
     std::string v_bits_csv  = "3";       // Per-band V (default flat)
 
+    // Model-pack preset selection — arch-aware defaults.
+    //   ""    / "off"  — use shipping defaults / explicit flags (default)
+    //   "auto"         — resolve from model's GGUF arch_name at load time
+    //   "<preset>"     — force a specific preset (e.g. "qwen3-moe")
+    // Preset overlays apply only when k_bits_csv/v_bits_csv/residual_bits
+    // are still at their shipping defaults — any explicit user flag wins.
+    std::string model_preset = "";
+    // Populated from GGUF general.architecture at model load; used by
+    // KvCache::create_gpu when model_preset == "auto".
+    std::string arch_name = "";
+
     // Hierarchical Vilenkin predictor — maximum compression path.
     // Uses Kronecker sub-projection as a small skeleton (~9% of pad_dim)
     // and a calibrated linear map to predict the remaining coefficients.

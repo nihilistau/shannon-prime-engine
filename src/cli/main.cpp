@@ -103,6 +103,9 @@ static void usage(const char* prog) {
         "  --k-bits <csv>       K band bits, e.g. 5,5,4,3\n"
         "  --v-bits <csv>       V band bits, default 3\n"
         "  --residual-bits <n>  sqfree residual bits, default 3\n"
+        "  --model-preset <n>   model-pack overlay: auto | off | <arch-name>\n"
+        "                       (auto resolves from GGUF general.architecture;\n"
+        "                        explicit --k-bits/--v-bits/--residual-bits win)\n"
         "  --no-calibrate       skip automatic calibration during prefill\n"
         "\n"
         "Hierarchical Vilenkin predictor (maximum compression):\n"
@@ -163,6 +166,7 @@ int main(int argc, char** argv) {
             else if (a == "--k-bits"         && i + 1 < argc) cc.k_bits_csv     = argv[++i];
             else if (a == "--v-bits"         && i + 1 < argc) cc.v_bits_csv     = argv[++i];
             else if (a == "--residual-bits"  && i + 1 < argc) cc.residual_bits  = std::atoi(argv[++i]);
+            else if (a == "--model-preset"   && i + 1 < argc) cc.model_preset   = argv[++i];
             else if (a == "--hier-level"     && i + 1 < argc) cc.hier_level     = std::atoi(argv[++i]);
             else if (a == "--hier-res-bits"  && i + 1 < argc) cc.hier_res_bits  = std::atoi(argv[++i]);
             else if (a == "--hier-skel-bits" && i + 1 < argc) cc.hier_skel_bits = argv[++i];
@@ -195,6 +199,7 @@ int main(int argc, char** argv) {
         SpBackendGuard bk(sp_select_backend());
         auto m  = sp::engine::Model::load(cc.model_path);
         if (!m) return 2;
+        cc.arch_name = m->architecture();
         auto v  = sp::engine::Vocab::load(*m);
         auto tk = v ? sp::engine::Tokenizer::create(*v) : nullptr;
         auto W  = sp::engine::LlamaWeights::load(*m, bk);
@@ -398,6 +403,7 @@ int main(int argc, char** argv) {
             else if (a == "--k-bits"        && i + 1 < argc) pc.k_bits_csv    = argv[++i];
             else if (a == "--v-bits"        && i + 1 < argc) pc.v_bits_csv    = argv[++i];
             else if (a == "--residual-bits" && i + 1 < argc) pc.residual_bits = std::atoi(argv[++i]);
+            else if (a == "--model-preset"  && i + 1 < argc) pc.model_preset  = argv[++i];
             else if (a == "--hier-level"    && i + 1 < argc) pc.hier_level    = std::atoi(argv[++i]);
             else if (a == "--hier-res-bits" && i + 1 < argc) pc.hier_res_bits = std::atoi(argv[++i]);
             else if (a == "--hier-skel-bits"&& i + 1 < argc) pc.hier_skel_bits= argv[++i];
@@ -424,6 +430,7 @@ int main(int argc, char** argv) {
         SpBackendGuard bk(sp_select_backend());
         auto m  = sp::engine::Model::load(pc.model_path);
         if (!m) return 2;
+        pc.arch_name = m->architecture();
         auto v  = sp::engine::Vocab::load(*m);
         auto tk = v ? sp::engine::Tokenizer::create(*v) : nullptr;
         auto W  = sp::engine::LlamaWeights::load(*m, bk);
@@ -681,6 +688,7 @@ int main(int argc, char** argv) {
             else if (a == "--model"     && i + 1 < argc) cc.model_path = argv[++i];
             else if (a == "--k-bits"    && i + 1 < argc) cc.k_bits_csv = argv[++i];
             else if (a == "--v-bits"    && i + 1 < argc) cc.v_bits_csv = argv[++i];
+            else if (a == "--model-preset" && i + 1 < argc) cc.model_preset = argv[++i];
             else if (a == "--n-predict" && i + 1 < argc) n_predict     = std::atoi(argv[++i]);
             else if (a == "--ctx"       && i + 1 < argc) cc.n_ctx      = std::atoi(argv[++i]);
             else if (a == "--hier-level"     && i + 1 < argc) cc.hier_level     = std::atoi(argv[++i]);
@@ -722,6 +730,7 @@ int main(int argc, char** argv) {
         SpBackendGuard bk(sp_select_backend());
         auto m = sp::engine::Model::load(cc.model_path);
         if (!m) return 2;
+        cc.arch_name = m->architecture();
         auto v  = sp::engine::Vocab::load(*m);
         auto tk = v ? sp::engine::Tokenizer::create(*v) : nullptr;
         auto W  = sp::engine::LlamaWeights::load(*m, bk);
@@ -1076,6 +1085,7 @@ int main(int argc, char** argv) {
         else if (next("--model",   cfg.model_path)) {}
         else if (next("--k-bits",  cfg.k_bits_csv)) {}
         else if (next("--v-bits",  cfg.v_bits_csv)) {}
+        else if (next("--model-preset", cfg.model_preset)) {}
         else if (next("--hier-skel-bits", cfg.hier_skel_bits)) {}
         else if (a == "--ctx" && i + 1 < argc)               cfg.n_ctx          = std::atoi(argv[++i]);
         else if (a == "--residual-bits" && i + 1 < argc)     cfg.residual_bits  = std::atoi(argv[++i]);
@@ -1370,6 +1380,7 @@ int main(int argc, char** argv) {
         }
         auto m = sp::engine::Model::load(cfg.model_path);
         if (!m) return 2;
+        cfg.arch_name = m->architecture();
         auto v = sp::engine::Vocab::load(*m);
         auto tk = v ? sp::engine::Tokenizer::create(*v) : nullptr;
         auto W = sp::engine::LlamaWeights::load(*m);
