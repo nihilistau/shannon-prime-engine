@@ -337,57 +337,70 @@ __global__ void kernel_unpack_levels(const uint8_t* packed, int n_res,
 4. Coherent chat output on Qwen3 sqfree GPU.
 5. No crash / OOM on max_seq=520 Qwen3 config.
 
-## MVP status (end of this session)
+## MVP status (commits `c4a25db`, `fca9fb2`, `95ff818`)
 
 Landed:
 * Full sqfree cache infrastructure: `sp_cuda_sqfree_cache_t` struct,
   `_init`/`_free`, `_write_k/v`, `_read_k/v`, all kernels
-  (gather, scatter, residual deviation, mean_abs, quantize, dequantize,
-  pack, unpack).
-* `KvCache::create_gpu` sqfree branch + all 3 verb routing (perplexity,
-  chat, kv_smoke).
+  (gather, scatter, residual deviation, mean_abs, quantize,
+  dequantize, pack, unpack).
+* `KvCache::create_gpu` sqfree branch + all 3 verb routing
+  (perplexity, chat, kv_smoke).
 * `KvCache::read`/`write` host-pointer shim routes to GPU-staging
   path for both ship and sqfree.
-* Clean build, no crashes, `kv_smoke --sqfree` runs end-to-end on
-  GPU and reports K_corr.
+* **Numerical parity fix** (`95ff818`): `kernel_quantize_residual`
+  and `kernel_dequantize_residual` now byte-identical to
+  `sp_quantize_residual` / `sp_dequantize_residual`. Two bugs:
+    - `sat = mag * bits` (was `sat = mag` alone — 3× off for
+      residual_bits=3).
+    - Plain round-half-up `(int)(q + 0.5f)` (was a centered-sign
+      variant via `copysignf(0.5f, f - half)`).
 
-Known fidelity bug (open for next session):
-* GPU sqfree K_corr is **0.834 mean / 0.659 min** on the smoke test
-  (hd=128, n_tokens=32, n_head_kv=4, n_layer=2, residual_bits=3)
-  vs **0.944 mean / 0.887 min** on CPU sqfree with identical input.
-  Delta = −0.11 mean. Persists whether calibration is applied on
-  CPU side or not — GPU path has a real numerical problem independent
-  of calibration.
-* Calibration is not re-synced to GPU (CPU shadow re-ranks on
-  `calibrate_end` but the GPU Knight-mask uploads stay at the initial
-  squarefree-first ordering). That's ONE known gap; it accounts for
-  roughly 0.02 of the delta based on CPU with/without calibration.
-* The remaining ~0.09 K_corr gap is in the kernel pipeline itself.
-  Most likely suspects (to investigate):
-  1. `kernel_pack_levels` / `kernel_unpack_levels` — single-thread
-     bit packing matches CPU logic line-for-line, but bit-widths >8
-     may have an off-by-one in the second-byte OR branch.
-  2. `kernel_quantize_residual` / `kernel_dequantize_residual` —
-     formula matches `sp_quantize_residual` from the CPU core, but
-     rounding direction and `copysignf` handling of exactly zero
-     deviations could diverge.
-  3. `kernel_mean_abs` — single-block reduction, should be fine.
-  4. Gather/scatter — trivial; extremely unlikely.
-  5. The residual pipeline uses `d_pred_scratch` on the read path but
-     also passes it to `sp_cuda_mobius_predict` as `(float *)` cast
-     off `const` — the struct is `const sp_cuda_sqfree_cache_t *` in
-     the read path but the API wants non-const. Check the const-casts
-     didn't mask a genuine aliasing issue.
+Measured on `kv_smoke --sqfree hd=128 n_tokens=32 n_head_kv=4
+n_layer=2 residual_bits=3`:
 
-Next-session plan:
-* Write a CPU-vs-GPU per-step diagnostic: run `sp_sqfree_compress_one`
-  and `sp_cuda_sqfree_write_one` on the same input, dump the
-  compressed bytes from each, diff. Whichever byte range diverges
-  first pins the buggy kernel.
-* Apply the calibration sync (same as ship `SHANNON_PRIME_SYNC_
-  CALIB_TO_GPU`) for sqfree — re-upload mask arrays after
-  `calibrate_end`. Gate behind same env.
-* Add spinor support (full scope, as originally planned).
+| Path              | K_corr mean | K_corr min | V_corr mean |
+|-------------------|-------------|------------|-------------|
+| CPU sqfree        | 0.9447      | 0.8867     | 0.9151      |
+| GPU sqfree (pre)  | 0.8340      | 0.6594     | 0.8157      |
+| GPU sqfree (post) | 0.9347      | 0.8291     | 0.9144      |
+
+K_corr delta collapsed from −0.11 to −0.01 mean; V_corr essentially
+matches. Remaining 0.01 is attributable to the calibration-sync gap
+(open issue 2 below).
+
+## Open issues for next session
+
+1. **Kernel-launch-overhead bound on the real bench.** Qwen3-8B-Q8
+   sqfree bench ran >28 min before being killed (vs ship GPU cache
+   at 1m28s on identical config). The per-vec sqfree pipeline does
+   ~9 kernel launches per slot; at past_n=256 × 36 layers × 8 heads
+   = 73K slots per decode step → ~660K launches per step. At ~5 µs
+   launch latency that's ~3 s/step of overhead alone — dwarfs the
+   actual compute.
+
+   Fix direction: **batched kernels**. Mirror the ship path's
+   `sp_cuda_read_k_batch` — one kernel call per (layer, head) that
+   processes all kv_len positions at once. Prefill writes can
+   similarly batch across n_tokens.
+
+   Target: Qwen3-8B sqfree in the 2–5 min range.
+
+2. **Calibration sync for the GPU Knight mask.** CPU companion
+   `sp_sqfree_cache_t` rebuilds its mask with variance ranking on
+   `calibrate_end`, but the GPU cache's `d_skeleton_idx` /
+   `d_residual_idx` / `d_csr_*` stay on the initial squarefree-first
+   ordering. Re-upload after `calibrate_end`, gated behind
+   `SHANNON_PRIME_SYNC_CALIB_TO_GPU=1` same as the ship path.
+   Expected synthetic-K_corr improvement: ~0.01.
+
+3. **Spinor sheet bit (full scope).**
+   * `sp_cuda_sqfree_cache_init(use_spinor=1)` — allocate sheet bit
+     storage per slot.
+   * `kernel_residual_deviation_spinor` variant: emit sheet bit,
+     use `min(|v_plus|, |v_minus|)`.
+   * Read path reads sheet bits and flips pred sign accordingly.
+   * Expected gain: matches CPU +0.01 PPL at 2.8× on Q8+ 8B.
 
 ## Files
 
