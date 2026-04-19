@@ -132,6 +132,11 @@ public:
     // Check whether a reset should fire at this decode position.
     int  cauchy_check(int pos);
 
+    // Override the cooldown (minimum positions between resets). Lower
+    // values let the controller fire more often — useful with partial
+    // reset, risky with full reset. Default is 64.
+    void cauchy_set_cooldown(int n);
+
     // Manual feed path for the Ricci sentinel (when the caller wants to
     // feed a VHT2-domain K vector from some place other than the normal
     // write() call — e.g. per-token during decode without going through

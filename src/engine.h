@@ -60,9 +60,21 @@ struct Config {
     //           oracle (zeta-zero-scheduled proactive reset points)
     // params_b is the model size in billions — used to tune Ricci threshold
     // (small models need tighter detection).
-    int         cauchy_mode    = 0;
-    int         cauchy_fixed_n = 512;
-    float       params_b       = 0.0f;
+    int         cauchy_mode     = 0;
+    int         cauchy_fixed_n  = 512;
+    // Minimum positions between resets. Default 64 keeps reset rate
+    // bounded (measured ~3-5 resets per chunk). Lower values allow
+    // more frequent resets — each one pays a full forward_full pass,
+    // so use with care until partial-reset lands.
+    int         cauchy_cooldown = 64;
+    // Initial delay before Cauchy is allowed to fire, counted from
+    // the start of the decode loop within a chunk. The first N decode
+    // positions post-prefill have low accumulated compression error —
+    // resetting them is pure overhead. Measured sweet spot on Qwen3-8B
+    // ctx=1024: warmup=64 (best PPL recovery), warmup=128 (same PPL,
+    // fewer resets). warmup=256 starves the mechanism.
+    int         cauchy_warmup   = 64;
+    float       params_b        = 0.0f;
 };
 
 class Engine {

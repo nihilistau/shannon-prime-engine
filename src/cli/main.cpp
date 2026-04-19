@@ -116,10 +116,12 @@ static void usage(const char* prog) {
         "  --pe-alpha <f>       blend factor 0..1 (default: 0.0 = identity)\n"
         "  --pe-tier  <n>       0 = composite lattice, 1 = prime generators\n"
         "\n"
-        "Cauchy reset system (decode-chain causal stability, cache_ppl):\n"
-        "  --cauchy-mode <n>    0=off, 1=fixed-N, 2=dynamic (Ricci+Mertens)\n"
-        "  --cauchy-fixed-n <n> reset every N tokens (mode 1, default 512)\n"
-        "  --params-b <f>       model size in billions (tunes Ricci threshold)\n"
+        "Cauchy reset system (decode-chain causal stability, cache_ppl/perplexity --cache):\n"
+        "  --cauchy-mode <n>     0=off, 1=fixed-N, 2=dynamic (Ricci+Mertens)\n"
+        "  --cauchy-fixed-n <n>  reset every N tokens (mode 1, default 512)\n"
+        "  --cauchy-cooldown <n> min positions between resets (default 64)\n"
+        "  --cauchy-warmup <n>   suppress resets for first N decode positions (default 0)\n"
+        "  --params-b <f>        model size in billions (tunes Ricci threshold)\n"
         "\n", prog);
 }
 
@@ -169,9 +171,10 @@ int main(int argc, char** argv) {
             }
             else if (a == "--pe-alpha"       && i + 1 < argc) cc.pe_alpha = (float)std::atof(argv[++i]);
             else if (a == "--pe-tier"        && i + 1 < argc) cc.pe_tier  = std::atoi(argv[++i]);
-            else if (a == "--cauchy-mode"    && i + 1 < argc) cc.cauchy_mode    = std::atoi(argv[++i]);
-            else if (a == "--cauchy-fixed-n" && i + 1 < argc) cc.cauchy_fixed_n = std::atoi(argv[++i]);
-            else if (a == "--params-b"       && i + 1 < argc) cc.params_b       = (float)std::atof(argv[++i]);
+            else if (a == "--cauchy-mode"     && i + 1 < argc) cc.cauchy_mode     = std::atoi(argv[++i]);
+            else if (a == "--cauchy-fixed-n"  && i + 1 < argc) cc.cauchy_fixed_n  = std::atoi(argv[++i]);
+            else if (a == "--cauchy-cooldown" && i + 1 < argc) cc.cauchy_cooldown = std::atoi(argv[++i]);
+            else if (a == "--params-b"        && i + 1 < argc) cc.params_b        = (float)std::atof(argv[++i]);
             else if (a.size() >= 2 && a[0] == '-' && a[1] == '-') {
                 std::fprintf(stderr, "cache_ppl: unknown flag %s\n", a.c_str()); return 2;
             }
@@ -234,6 +237,7 @@ int main(int argc, char** argv) {
         // used to calibrate the main cache. A no-op when cauchy_mode=0.
         if (cc.cauchy_mode > 0) {
             kv->init_cauchy(cc.cauchy_mode, cc.cauchy_fixed_n, cc.params_b);
+            kv->cauchy_set_cooldown(cc.cauchy_cooldown);
         }
 
         auto corr = [](const float* a, const float* b, int len) {
@@ -391,9 +395,11 @@ int main(int argc, char** argv) {
             else if (a == "--hier-level"    && i + 1 < argc) pc.hier_level    = std::atoi(argv[++i]);
             else if (a == "--hier-res-bits" && i + 1 < argc) pc.hier_res_bits = std::atoi(argv[++i]);
             else if (a == "--hier-skel-bits"&& i + 1 < argc) pc.hier_skel_bits= argv[++i];
-            else if (a == "--cauchy-mode"   && i + 1 < argc) pc.cauchy_mode    = std::atoi(argv[++i]);
-            else if (a == "--cauchy-fixed-n"&& i + 1 < argc) pc.cauchy_fixed_n = std::atoi(argv[++i]);
-            else if (a == "--params-b"      && i + 1 < argc) pc.params_b       = (float)std::atof(argv[++i]);
+            else if (a == "--cauchy-mode"     && i + 1 < argc) pc.cauchy_mode     = std::atoi(argv[++i]);
+            else if (a == "--cauchy-fixed-n"  && i + 1 < argc) pc.cauchy_fixed_n  = std::atoi(argv[++i]);
+            else if (a == "--cauchy-cooldown" && i + 1 < argc) pc.cauchy_cooldown = std::atoi(argv[++i]);
+            else if (a == "--cauchy-warmup"   && i + 1 < argc) pc.cauchy_warmup   = std::atoi(argv[++i]);
+            else if (a == "--params-b"        && i + 1 < argc) pc.params_b        = (float)std::atof(argv[++i]);
             else if (a.size() >= 2 && a[0] == '-' && a[1] == '-') {
                 std::fprintf(stderr, "perplexity: unknown flag %s\n", a.c_str()); return 2;
             }
@@ -496,6 +502,7 @@ int main(int argc, char** argv) {
             // vectors that build the cache's masks.
             if (pc.cauchy_mode > 0) {
                 kv->init_cauchy(pc.cauchy_mode, pc.cauchy_fixed_n, pc.params_b);
+                kv->cauchy_set_cooldown(pc.cauchy_cooldown);
             }
         }
 
@@ -559,7 +566,15 @@ int main(int argc, char** argv) {
                     // the original token stream. This pays a full
                     // forward_full but gives us a clean ground-truth
                     // cache for all subsequent decode steps.
-                    if (pc.cauchy_mode > 0) {
+                    // Initial warmup: suppress resets for the first N decode
+                    // positions post-prefill. These positions have low
+                    // accumulated compression error — resetting them is pure
+                    // overhead. The `first_eval + 1` is the decode start;
+                    // gate fires until pos >= start + cauchy_warmup.
+                    const int decode_start = first_eval + 1;
+                    const bool cauchy_active = (pc.cauchy_mode > 0) &&
+                                                (i >= decode_start + pc.cauchy_warmup);
+                    if (cauchy_active) {
                         int r = kv->cauchy_check(i);
                         if (r > 0) {
                             // After decode(chunk[i]): kv_pos = i+1, cache

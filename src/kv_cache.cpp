@@ -877,6 +877,12 @@ int KvCache::cauchy_check(int pos) {
     return sp_cauchy_check(&impl_->cauchy, pos);
 }
 
+void KvCache::cauchy_set_cooldown(int n) {
+    if (!impl_->cauchy_inited) return;
+    if (n < 1) n = 1;
+    impl_->cauchy.partial_window = n;
+}
+
 void KvCache::ricci_feed(const float* vht2_coeffs, int hd) {
     if (!impl_->ricci) return;
     sp_ricci_check(impl_->ricci, vht2_coeffs, hd);
