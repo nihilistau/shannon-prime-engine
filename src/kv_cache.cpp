@@ -373,9 +373,44 @@ void KvCache::calibrate_feed(const float* vec) {
     // NOT valid for hierarchical — use the per-slot overload instead.
     if (impl_->sqfree) {
         sp_sqfree_calibrate_feed(&impl_->sq, vec);
-    } else if (!impl_->hier_inited) {
-        sp_shadow_calibrate_feed(&impl_->shadow, vec);
+        return;
     }
+    if (impl_->hier_inited) return;
+#ifdef SP_ENGINE_WITH_CUDA
+    if (impl_->cuda_inited && impl_->shadow_inited &&
+        impl_->shadow.calibrating && impl_->shadow.calib_sum &&
+        impl_->shadow.calib_sum2) {
+        // GPU-domain calibration: upload vector to GPU, run VHT2 there,
+        // download the result, and accumulate variance in shadow's
+        // calib_sum / calib_sum2 using the GPU-VHT2'd values. Writing
+        // straight into shadow's accumulators lets calibrate_end reuse
+        // the existing variance-ranking logic verbatim — but the ranking
+        // now reflects the GPU-domain coefficient structure, which is
+        // what the GPU cache actually compresses. Without this, var_order
+        // ranks CPU-domain variance and the sync to d_mobius_order gives
+        // a wrong-domain order that regresses PPL.
+        const int hd = impl_->head_dim;
+        cudaStream_t s = (cudaStream_t)impl_->cuda_cache.stream;
+
+        cudaMemcpyAsync(impl_->d_stage, vec, (size_t)hd * sizeof(float),
+                        cudaMemcpyHostToDevice, s);
+        sp_cuda_vht2_forward(impl_->d_stage, hd, 1, impl_->cuda_cache.stream);
+        std::vector<float> h_tmp((size_t)hd);
+        cudaMemcpyAsync(h_tmp.data(), impl_->d_stage,
+                        (size_t)hd * sizeof(float),
+                        cudaMemcpyDeviceToHost, s);
+        cudaStreamSynchronize(s);
+
+        for (int i = 0; i < hd; i++) {
+            double v = (double)h_tmp[(size_t)i];
+            impl_->shadow.calib_sum[i]  += v;
+            impl_->shadow.calib_sum2[i] += v * v;
+        }
+        impl_->shadow.calib_n++;
+        return;
+    }
+#endif
+    sp_shadow_calibrate_feed(&impl_->shadow, vec);
 }
 
 void KvCache::calibrate_feed(int slot, const float* vec) {
@@ -401,20 +436,19 @@ bool KvCache::calibrate_end() {
     if (rc == 0) {
         impl_->calibrated = true;
 #ifdef SP_ENGINE_WITH_CUDA
-        // Gated sync of CPU-calibrated variance order to GPU
-        // d_mobius_order. Empirically this REGRESSES Qwen3-8B decode-
-        // chain PPL (19.29 → 19.50 at ctx=512 chunks=2) because the
-        // variance is computed on CPU VHT2 output, but applied to GPU
-        // VHT2 output — CPU and GPU VHT2 produce numerically close but
-        // not bit-identical coefficients (different accumulation order
-        // across 7 butterfly stages), so the rank-by-variance ordering
-        // can flip on positions whose variance differs by less than
-        // the numerical gap between backends. Default-off until we
-        // implement GPU-domain calibration; opt in via
-        // SHANNON_PRIME_SYNC_CALIB_TO_GPU=1 for experimental runs.
+        // GPU-domain calibration produces a correct variance-ranked
+        // order (K_corr parity with CPU on synthetic data: 0.9925
+        // mean, 0.9804 min). BUT on real Qwen3-8B decode chains the
+        // calibrated order regresses PPL (+0.21 vs static Möbius),
+        // while on the CPU cache path the same calibration improves
+        // PPL (-0.25). The asymmetry is likely an interaction between
+        // variance-ranked band assignments and fp16 scale handling in
+        // the CUDA band_quantize; not yet root-caused. Default OFF to
+        // keep the best-measured GPU PPL; enable via
+        // SHANNON_PRIME_SYNC_CALIB_TO_GPU=1 when investigating.
         const char* env_sync = std::getenv("SHANNON_PRIME_SYNC_CALIB_TO_GPU");
-        const bool want_sync = env_sync && std::atoi(env_sync) != 0;
-        if (want_sync && impl_->cuda_inited && impl_->shadow_inited &&
+        const bool sync_enabled = env_sync && std::atoi(env_sync) != 0;
+        if (sync_enabled && impl_->cuda_inited && impl_->shadow_inited &&
             impl_->shadow.use_var_reorder && impl_->shadow.var_order &&
             impl_->cuda_cache.d_mobius_order) {
             const int hd = impl_->head_dim;
@@ -431,8 +465,8 @@ bool KvCache::calibrate_end() {
             }
             cudaStreamSynchronize(s);
             std::fprintf(stderr, "[sp-engine:diag] calibrate_end: synced "
-                         "%d-entry variance-ranked order to GPU d_mobius_order "
-                         "(SHANNON_PRIME_SYNC_CALIB_TO_GPU=1)\n", hd);
+                         "%d-entry variance-ranked (GPU-domain) order to "
+                         "GPU d_mobius_order\n", hd);
         }
 #endif
         return true;

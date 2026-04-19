@@ -827,7 +827,13 @@ bool ForwardContext::prefill(const std::vector<int32_t>& token_ids,
     // so each predictor is trained on its own head's data. The shared
     // modes (sqfree Knight mask, ship variance-ranked permutation) use
     // the single-arg feed that accumulates globally across all heads.
-    if (!impl_->cache->is_calibrated()) {
+    // Diagnostic escape hatch: SHANNON_PRIME_NO_CALIBRATE=1 skips
+    // calibration entirely so we can A/B what calibration contributes
+    // to PPL per path. Both CPU and GPU caches fall back to their
+    // static reorder tables (Möbius for ship).
+    const char* env_no_calib = std::getenv("SHANNON_PRIME_NO_CALIBRATE");
+    const bool skip_calibration = env_no_calib && std::atoi(env_no_calib) != 0;
+    if (!skip_calibration && !impl_->cache->is_calibrated()) {
         const bool hier = impl_->cache->is_hierarchical();
         // Hierarchical needs per-slot calibration; samples per slot = n
         // (tokens in this prefill batch). Underdetermined slots produce
