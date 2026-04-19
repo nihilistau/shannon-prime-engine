@@ -80,6 +80,11 @@ struct KvCache::Impl {
     size_t               d_stage_bytes = 0;
     float*               d_scratch_batch       = nullptr;  // [hd, max_seq] per-head read scratch
     size_t               d_scratch_batch_bytes = 0;
+
+    // GPU-resident sqfree cache (step 3 MVP, no spinor). Exclusive with
+    // cuda_cache — when cuda_sqfree_inited is true the ship path is off.
+    sp_cuda_sqfree_cache_t cuda_sqfree_cache{};
+    bool                   cuda_sqfree_inited = false;
 #endif
 
     ~Impl() {
@@ -109,6 +114,9 @@ struct KvCache::Impl {
             if (d_stage)         cudaFree(d_stage);
             if (d_scratch_batch) cudaFree(d_scratch_batch);
             sp_cuda_cache_free(&cuda_cache);
+        }
+        if (cuda_sqfree_inited) {
+            sp_cuda_sqfree_cache_free(&cuda_sqfree_cache);
         }
 #endif
     }
@@ -249,11 +257,12 @@ bool KvCache::write(int layer, int pos_offset, int n_tokens,
     const int hd = impl_->head_dim;
 
 #ifdef SP_ENGINE_WITH_CUDA
-    // GPU-resident cache: stage host vectors to device once, then call
-    // write_gpu which loops sp_cuda_write_k/v per slot. Used by prefill
-    // where forward_full pulls K/V back to host — the staging copy
-    // happens once per prefill chunk, not per decode step.
-    if (impl_->cuda_inited) {
+    // GPU-resident cache (ship or sqfree): stage host vectors to device
+    // once, then call write_gpu which loops per-slot compress on GPU.
+    // Used by prefill (forward_full pulls K/V back to host) and
+    // diagnostic code. Staging cost is one-time per prefill chunk,
+    // not per decode step.
+    if (impl_->cuda_inited || impl_->cuda_sqfree_inited) {
         const size_t n_elems = (size_t)n_tokens * H * hd;
         const size_t n_bytes = n_elems * sizeof(float);
         float* d_stage_K = nullptr;
@@ -264,7 +273,9 @@ bool KvCache::write(int layer, int pos_offset, int n_tokens,
             std::fprintf(stderr, "[sp-engine] write(GPU): stage malloc failed\n");
             return false;
         }
-        cudaStream_t s = (cudaStream_t)impl_->cuda_cache.stream;
+        cudaStream_t s = impl_->cuda_inited
+            ? (cudaStream_t)impl_->cuda_cache.stream
+            : (cudaStream_t)impl_->cuda_sqfree_cache.stream;
         cudaMemcpyAsync(d_stage_K, K_flat, n_bytes, cudaMemcpyHostToDevice, s);
         cudaMemcpyAsync(d_stage_V, V_flat, n_bytes, cudaMemcpyHostToDevice, s);
         const bool ok = write_gpu(layer, pos_offset, n_tokens, d_stage_K, d_stage_V);
@@ -311,10 +322,10 @@ bool KvCache::read(int layer, int kv_len,
     V_out.assign((size_t)kv_len * H * hd, 0.0f);
 
 #ifdef SP_ENGINE_WITH_CUDA
-    // GPU-resident cache: read on device into scratch, then cudaMemcpy
-    // back to host. Used only by diagnostic code paths (forward.cpp's
-    // decode() takes the zero-copy read_gpu fast path directly).
-    if (impl_->cuda_inited && kv_len > 0) {
+    // GPU-resident cache (ship or sqfree): read on device into scratch,
+    // then cudaMemcpy back to host. Used only by diagnostic code paths
+    // (forward.cpp's decode() takes the zero-copy read_gpu fast path).
+    if ((impl_->cuda_inited || impl_->cuda_sqfree_inited) && kv_len > 0) {
         const size_t n_bytes = (size_t)kv_len * H * hd * sizeof(float);
         float* d_K = nullptr;
         float* d_V = nullptr;
@@ -324,7 +335,9 @@ bool KvCache::read(int layer, int kv_len,
             std::fprintf(stderr, "[sp-engine] read(GPU fallback): malloc failed\n");
             return false;
         }
-        cudaStream_t s = (cudaStream_t)impl_->cuda_cache.stream;
+        cudaStream_t s = impl_->cuda_inited
+            ? (cudaStream_t)impl_->cuda_cache.stream
+            : (cudaStream_t)impl_->cuda_sqfree_cache.stream;
         const bool ok = read_gpu(layer, kv_len, d_K, d_V);
         if (ok) {
             cudaMemcpyAsync(K_out.data(), d_K, n_bytes, cudaMemcpyDeviceToHost, s);
@@ -484,7 +497,7 @@ bool KvCache::is_hierarchical() const {
 
 bool KvCache::is_gpu() const {
 #ifdef SP_ENGINE_WITH_CUDA
-    return impl_->cuda_inited;
+    return impl_->cuda_inited || impl_->cuda_sqfree_inited;
 #else
     return false;
 #endif
@@ -503,10 +516,19 @@ std::unique_ptr<KvCache> KvCache::create_gpu(int n_layer, int n_head_kv,
                          "SP_ENGINE_WITH_CUDA\n");
     return nullptr;
 #else
-    if (cfg.sqfree || cfg.hierarchical) {
-        std::fprintf(stderr, "[sp-engine] KvCache::create_gpu: only ship path "
-                             "is GPU-resident in MVP (sqfree/hierarchical "
-                             "still run host-side)\n");
+    if (cfg.hierarchical) {
+        std::fprintf(stderr, "[sp-engine] KvCache::create_gpu: hierarchical "
+                             "path is not yet GPU-resident (still CPU)\n");
+        return nullptr;
+    }
+    // sqfree MVP: GPU-resident compress/decompress, no spinor yet.
+    const bool is_sqfree = cfg.sqfree;
+    if (cfg.spinor) {
+        // spinor implies sqfree. Full-scope, not MVP — fall back so caller
+        // can retry with the host cache path.
+        std::fprintf(stderr, "[sp-engine] KvCache::create_gpu: sqfree+spinor "
+                             "not yet GPU-resident (MVP lands sqfree only; "
+                             "spinor is the next-session follow-up)\n");
         return nullptr;
     }
     if (n_layer <= 0 || n_head_kv <= 0 || head_dim <= 0 || max_seq <= 0) {
@@ -535,6 +557,45 @@ std::unique_ptr<KvCache> KvCache::create_gpu(int n_layer, int n_head_kv,
     sc->v_n_bands = (int)vbits.size();
     for (size_t i = 0; i < kbits.size(); ++i) sc->k_band_bits[i] = kbits[i];
     for (size_t i = 0; i < vbits.size(); ++i) sc->v_band_bits[i] = vbits[i];
+
+    // Sqfree GPU cache dispatches to a different backing. Ship falls
+    // through to sp_cuda_cache_init below.
+    if (is_sqfree) {
+        const int rbits = (cfg.residual_bits >= 1 && cfg.residual_bits <= 4)
+                          ? cfg.residual_bits : 3;
+        if (sp_cuda_sqfree_cache_init(&kv->impl_->cuda_sqfree_cache, sc,
+                                       max_seq, rbits, /*use_spinor=*/0,
+                                       stream) != 0) {
+            std::fprintf(stderr, "[sp-engine] KvCache::create_gpu: "
+                         "sp_cuda_sqfree_cache_init failed\n");
+            return nullptr;
+        }
+        kv->impl_->cuda_sqfree_inited = true;
+        kv->impl_->sqfree             = true;
+        kv->impl_->pad_dim            = kv->impl_->cuda_sqfree_cache.pad_dim;
+
+        // Companion CPU sqfree cache for calibration accounting.
+        // sp_sqfree_calibrate_end reallocates sc->k_cache[s] and
+        // sc->v_cache[s] after rebuilding the Knight mask, so we MUST
+        // leave these pointers intact (not null them) — otherwise the
+        // rebuild loop indexes through a NULL slot array. The overhead
+        // is a few MB of unused host per-slot buffers; acceptable until
+        // we have a proper "calibration-only" shadow mode.
+        if (sp_sqfree_cache_init(&kv->impl_->sq, sc, max_seq, rbits,
+                                  /*use_spinor=*/false) != 0) {
+            std::fprintf(stderr, "[sp-engine] KvCache::create_gpu: companion "
+                         "sqfree_cache_init failed (sqfree calibration will "
+                         "be a no-op)\n");
+        } else {
+            kv->impl_->sq_inited = true;
+        }
+        std::fprintf(stderr, "[sp-engine] KvCache::create_gpu: sqfree path, "
+                     "hd=%d pad_dim=%d sk_k=%d n_res=%d res_bits=%d\n",
+                     head_dim, kv->impl_->cuda_sqfree_cache.pad_dim,
+                     kv->impl_->cuda_sqfree_cache.sk_k,
+                     kv->impl_->cuda_sqfree_cache.n_res, rbits);
+        return kv;
+    }
 
     if (sp_cuda_cache_init(&kv->impl_->cuda_cache, sc, max_seq, stream) != 0) {
         std::fprintf(stderr, "[sp-engine] KvCache::create_gpu: sp_cuda_cache_init failed\n");
@@ -592,7 +653,7 @@ std::unique_ptr<KvCache> KvCache::create_gpu(int n_layer, int n_head_kv,
 // offsets in place — no staging copy needed.
 bool KvCache::write_gpu(int layer, int pos_offset, int n_tokens,
                         const float* d_K_flat, const float* d_V_flat) {
-    if (!impl_->cuda_inited) {
+    if (!impl_->cuda_inited && !impl_->cuda_sqfree_inited) {
         std::fprintf(stderr, "[sp-engine] write_gpu on non-GPU cache\n");
         return false;
     }
@@ -601,6 +662,18 @@ bool KvCache::write_gpu(int layer, int pos_offset, int n_tokens,
 
     const int H  = impl_->n_head_kv;
     const int hd = impl_->head_dim;
+    if (impl_->cuda_sqfree_inited) {
+        for (int q = 0; q < n_tokens; ++q) {
+            const int pos = pos_offset + q;
+            for (int h = 0; h < H; ++h) {
+                const float* d_k_vec = d_K_flat + (size_t)(q * H + h) * hd;
+                const float* d_v_vec = d_V_flat + (size_t)(q * H + h) * hd;
+                sp_cuda_sqfree_write_k(&impl_->cuda_sqfree_cache, layer, h, pos, d_k_vec);
+                sp_cuda_sqfree_write_v(&impl_->cuda_sqfree_cache, layer, h, pos, d_v_vec);
+            }
+        }
+        return true;
+    }
     for (int q = 0; q < n_tokens; ++q) {
         const int pos = pos_offset + q;
         for (int h = 0; h < H; ++h) {
@@ -622,7 +695,7 @@ bool KvCache::write_gpu(int layer, int pos_offset, int n_tokens,
 // async on the cache stream, so latency is the per-layer kernel time.
 bool KvCache::read_gpu(int layer, int kv_len,
                        float* d_K_out, float* d_V_out) const {
-    if (!impl_->cuda_inited) {
+    if (!impl_->cuda_inited && !impl_->cuda_sqfree_inited) {
         std::fprintf(stderr, "[sp-engine] read_gpu on non-GPU cache\n");
         return false;
     }
@@ -632,6 +705,23 @@ bool KvCache::read_gpu(int layer, int kv_len,
 
     const int H  = impl_->n_head_kv;
     const int hd = impl_->head_dim;
+
+    // Sqfree GPU cache doesn't have a batch read; loop per (pos, head)
+    // and write into the strided [hd, n_kv, kv_len] d_K_out / d_V_out
+    // layout directly. Each sp_cuda_sqfree_read_* writes an hd-long vec.
+    if (impl_->cuda_sqfree_inited) {
+        for (int pos = 0; pos < kv_len; ++pos) {
+            for (int h = 0; h < H; ++h) {
+                const size_t off_elems = (size_t)pos * H * hd + (size_t)h * hd;
+                sp_cuda_sqfree_read_k(&impl_->cuda_sqfree_cache, layer, h, pos,
+                                       d_K_out + off_elems);
+                sp_cuda_sqfree_read_v(&impl_->cuda_sqfree_cache, layer, h, pos,
+                                       d_V_out + off_elems);
+            }
+        }
+        return true;
+    }
+
     const size_t row_bytes = (size_t)hd * sizeof(float);
     const size_t dst_pitch = (size_t)H * hd * sizeof(float);
     cudaStream_t s = (cudaStream_t)impl_->cuda_cache.stream;

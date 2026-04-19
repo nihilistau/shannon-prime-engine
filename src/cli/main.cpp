@@ -445,8 +445,10 @@ int main(int argc, char** argv) {
                 ggml_backend_dev_t dev = ggml_backend_get_device((ggml_backend_t)bk);
                 backend_is_gpu = dev && ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU;
             }
-            const bool ship_path = !pc.sqfree && !pc.hierarchical;
-            if (prefer_gpu_cache && backend_is_gpu && ship_path) {
+            // Ship + sqfree (no spinor) are GPU-resident; hierarchical
+            // and spinor still host-side until their GPU cache lands.
+            const bool gpu_ok = !pc.hierarchical && !pc.spinor;
+            if (prefer_gpu_cache && backend_is_gpu && gpu_ok) {
                 kv = sp::engine::KvCache::create_gpu(fc->n_layer(),
                                                       (int)m->n_head_kv(),
                                                       (int)m->head_dim(),
@@ -626,8 +628,10 @@ int main(int argc, char** argv) {
                 ggml_backend_dev_t dev = ggml_backend_get_device((ggml_backend_t)bk);
                 backend_is_gpu = dev && ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU;
             }
-            const bool ship_path = !cc.sqfree && !cc.hierarchical;
-            if (prefer_gpu_cache && backend_is_gpu && ship_path) {
+            // Ship + sqfree (no spinor) are GPU-resident; hierarchical
+            // and spinor still host-side until their GPU cache lands.
+            const bool gpu_ok = !cc.hierarchical && !cc.spinor;
+            if (prefer_gpu_cache && backend_is_gpu && gpu_ok) {
                 kv = sp::engine::KvCache::create_gpu(fc->n_layer(),
                                                       (int)m->n_head_kv(),
                                                       (int)m->head_dim(),
@@ -788,8 +792,10 @@ int main(int argc, char** argv) {
         if ((ggml_backend_t)kv_bk) {
             ggml_backend_dev_t dev = ggml_backend_get_device((ggml_backend_t)kv_bk);
             const bool backend_is_gpu = dev && ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU;
-            const bool ship_path = !kvc.sqfree && !kvc.hierarchical;
-            if (backend_is_gpu && ship_path) {
+            // Ship + sqfree (no spinor) are now GPU-resident; hierarchical
+            // and spinor still fall through to host cache.
+            const bool gpu_ok = !kvc.hierarchical && !kvc.spinor;
+            if (backend_is_gpu && gpu_ok) {
                 kv = sp::engine::KvCache::create_gpu(n_layer, n_head_kv, hd, n_tokens, kvc,
                                                       /*stream=*/nullptr);
                 if (!kv) {
