@@ -90,19 +90,23 @@ samples per slot).
 
 ### Cache-mode PPL (`perplexity --cache`, ctx=512 chunks=2, wiki.test.raw)
 
-**Qwen3-8B-Q8** — 4.06× KV compression, 16.6 GiB weights (does NOT
-fit in 12 GiB RTX 2060 VRAM — GPU run pages to shared memory,
-effectively CPU speed on this hardware; the ship headline is from
-the fits-in-VRAM regime):
+**Qwen3-8B-Q8** — 4.06× KV compression, `Qwen3-8B-Q8_0.gguf` is
+8.2 GiB on disk and fits the 12 GiB RTX 2060 VRAM cleanly:
 
 | Mode | PPL | ΔPPL | Wall time | Compression |
 |---|---|---|---|---|
 | baseline (no cache) | 18.05 | — | — | — |
 | **ship** | **18.14** | **+0.5%** | 15 min CPU / 23 min GPU† | **4.06×** |
 
-† Qwen3-8B exceeds the 12 GiB card's VRAM budget; needs a bigger
-GPU to show a speedup. Scaling-law projection at 70B Q8 remains
-+~0.01% PPL — the regime this tech was built for.
+† The GPU run is *slower* than CPU on this workload, and the
+reason is architectural, not a VRAM spill: the current SP cache
+lives in host memory, so every decode step reads past K/V out,
+uploads `2 × n_layer` tensors to the GPU via `ggml_backend_tensor_
+set`, runs the graph, pulls new K/V back to host, re-compresses.
+On Qwen3-8B (32 layers) that's 64 host↔device cudaMemcpys per
+token — PCIe-bound, not compute-bound. CPU has no PCIe so it's
+free there. Two fixes are in progress (batched memcpy → GPU-
+resident cache); see below.
 
 **Dolphin-1B-Q8** — 3.76× compression, 3 GiB weights fit in VRAM
 cleanly; full four-way decode-chain comparison is tractable here:
@@ -124,13 +128,30 @@ KV in production. What matters for the scaling law:
   for sqfree+spinor at 50% skeleton). At matched compression, hier
   beats sqfree+spinor, consistent with v1.14/v1.15 research.
 
-**The GPU path landed.** Weights-offload refactor in
-`llama_weights.cpp` (commit `9beb635`) — `SP_ENGINE_BACKEND=gpu`
-now actually runs on CUDA instead of segfaulting. Dolphin baseline
-2.8s on RTX 2060 vs ~30s on CPU = 11× speedup where weights fit in
-VRAM. Qwen3-8B on 12 GiB cards is the exception (spill); a 24 GiB+
-card, layer-by-layer offload (upstream `llama.cpp` style), or Q4-
-range quants lift that limit.
+**The GPU weights path landed, but the cache round-trip is the
+next bottleneck.** Weights-offload refactor in `llama_weights.cpp`
+(commit `9beb635`) — `SP_ENGINE_BACKEND=gpu` now runs on CUDA
+instead of segfaulting. Dolphin-1B (22 layers, smaller hd/n_kv):
+baseline 2.8s GPU vs ~30s CPU = 11× speedup, SP cache round-trip
+small enough to stay within budget. Qwen3-8B (32 layers, hd=128,
+n_kv=8): per-token PCIe cost blows up proportional to `n_layer ×
+hd × n_kv × past_n`, so the SP cache round-trip dominates.
+
+Two-step fix in progress:
+
+1. **Batched memcpy (step 2, in progress)** — concat all 32 layers'
+   past K and past V into two contiguous host buffers, upload with
+   2 `cudaMemcpy`s per decode step instead of 64. Closes the
+   launch-overhead portion of the PCIe bill.
+2. **GPU-resident SP cache (step 3, the real goal)** — keep
+   compressed K/V blocks in VRAM, do VHT2 + band quant / dequant
+   as CUDA kernels (the kernels already exist in
+   `backends/cuda/shannon_prime_cuda.cu`). Eliminates the per-token
+   host↔device round-trip entirely.
+
+Numbers in this table will be re-measured and replaced once each
+step lands; until then the GPU column for Qwen3-8B reflects the
+pre-fix (host-side-cache) regime.
 
 ### cache_ppl roundtrip (baseline PPL + K/V correlation)
 
