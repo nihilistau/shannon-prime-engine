@@ -124,16 +124,31 @@ the weight-offload fix in `209507c`):
    ~2.5 GiB headroom, 15.6× pre-fix speedup.
 
 **Known PPL delta (19.29 vs host cache 18.64 = +0.65 PPL).**
-The GPU cache's decompressed values don't round-trip bit-identical
-to the host cache. Smoke test confirms both paths hit K_corr mean
-0.9925 on synthetic data, but CPU and GPU VHT2 produce numerically-
-close-but-not-bit-identical coefficients (different fp32
-accumulation order across 7 butterfly stages). CPU-domain variance
-calibration applied to GPU-domain coefficients regresses PPL to
-19.50 (opt in via `SHANNON_PRIME_SYNC_CALIB_TO_GPU=1` for future
-diagnosis). A proper GPU-domain calibration that accumulates
-variance from GPU VHT2 output is the intended fix; tracked as
-follow-up work.
+Decomposes into two independent issues:
+
+1. *Base kernel drift (+0.40 PPL).* Measured by disabling
+   calibration on both paths (`SHANNON_PRIME_NO_CALIBRATE=1`):
+   host cache lands at 18.89, GPU cache at 19.29. This is the
+   irreducible numerical difference between CPU and GPU
+   compress/decompress kernels on real Qwen3 data. Likely root:
+   CPU matrix-form VHT2 vs GPU pair-butterfly VHT2 — mathematically
+   equivalent for p=2 Hadamard, numerically differ by a few ULPs
+   per stage × 7 stages on hd=128.
+
+2. *Asymmetric calibration effect (+0.25 PPL).* Same calibration
+   math gives the host cache a -0.25 PPL improvement but the GPU
+   cache a +0.21 PPL regression. Confirmed independent of
+   calibration domain — GPU-domain variance accumulation
+   (variance computed from GPU VHT2 output) produces bit-identical
+   `var_order` to CPU on synthetic data (`kv_smoke` K_corr parity:
+   0.9925 mean, 0.9804 min) yet still regresses Qwen3 PPL to the
+   same 19.50. Not a domain-mismatch bug. Likely a scale-rounding
+   interaction with variance-ranked band assignments; not yet
+   pinned with a smoke test.
+
+Default `SHANNON_PRIME_SYNC_CALIB_TO_GPU=0` (calibration sync off,
+best empirical PPL 19.29). Set `=1` to opt in to the calibrated
+order. Both issues tracked in session memory for future diagnosis.
 
 **Dolphin-1B-Q8** — 3.76× compression, 3 GiB weights fit in VRAM
 cleanly; full four-way decode-chain comparison:
