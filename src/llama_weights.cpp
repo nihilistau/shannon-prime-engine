@@ -5,11 +5,14 @@
 #include "gguf_loader.h"
 
 #include "ggml.h"
+#include "ggml-alloc.h"
+#include "ggml-backend.h"
 #include "gguf.h"
 
 #include <cstdio>
 #include <cstring>
 #include <unordered_set>
+#include <vector>
 
 namespace sp::engine {
 
@@ -19,8 +22,12 @@ struct LlamaWeights::Impl {
     // gguf, freed alongside it.
     ggml_context* meta_ctx = nullptr;
     gguf_context* gguf = nullptr;
+    // When we offloaded to a non-CPU backend, this holds the allocated
+    // buffer so the tensor data stays alive for the Weights' lifetime.
+    ggml_backend_buffer* backend_buf = nullptr;
     ~Impl() {
-        if (ctx)      ggml_free(ctx);
+        if (backend_buf) ggml_backend_buffer_free(backend_buf);
+        if (ctx)         ggml_free(ctx);
         // meta_ctx is owned by the gguf_context we get from gguf_loader
         // (not by us) — we don't free it here; Model destructor handles it.
     }
@@ -42,48 +49,16 @@ static bool supported_arch(const std::string& a) {
 }
 
 // ------------------------------------------------------------------
-// Load
-//
-// Approach: we re-open the GGUF with gguf_init_from_file's `ctx`
-// output parameter set, which makes gguf create a ggml_context with
-// tensor placeholders pointing at the mmapped file data. Then we
-// walk the expected tensor names per layer and bind them into our
-// LlamaLayer structs via ggml_get_tensor(). Missing required tensors
-// fail the load; missing optional ones just leave the field null.
+// Bind pass — shared between CPU-mmap and backend-offload loads.
 // ------------------------------------------------------------------
-std::unique_ptr<LlamaWeights> LlamaWeights::load(const Model& model) {
-    if (!supported_arch(model.architecture())) {
-        std::fprintf(stderr,
-            "[sp-engine] LlamaWeights: unsupported arch '%s'\n",
-            model.architecture().c_str());
-        return nullptr;
-    }
-
-    auto w = std::unique_ptr<LlamaWeights>(new LlamaWeights());
-    w->arch_ = model.architecture();
-
-    // Reopen the GGUF with a ggml_context allocator. We don't reuse the
-    // Model's gguf_context here because that one was opened with
-    // no_alloc=true and doesn't own tensor storage; this call mmaps
-    // the file and materialises tensor handles.
-    gguf_init_params params = {};
-    params.no_alloc = false;
-    params.ctx      = &w->impl_->meta_ctx;
-
-    w->impl_->gguf = gguf_init_from_file(model.path().c_str(), params);
-    if (!w->impl_->gguf) {
-        std::fprintf(stderr,
-            "[sp-engine] LlamaWeights: failed to reopen %s for tensor materialisation\n",
-            model.path().c_str());
-        return nullptr;
-    }
-
-    ggml_context* tctx = w->impl_->meta_ctx;
-
+bool LlamaWeights::bind_tensors_(LlamaWeights& w, ggml_context* tctx,
+                                  const Model& model) {
+    int& n_bound   = w.n_bound_tensors_;
+    int& n_missing = w.n_missing_optional_;
     auto bind_opt = [&](const std::string& name) -> ggml_tensor* {
         ggml_tensor* t = ggml_get_tensor(tctx, name.c_str());
-        if (t) w->n_bound_tensors_++;
-        else   w->n_missing_optional_++;
+        if (t) n_bound++;
+        else   n_missing++;
         return t;
     };
     auto bind_req = [&](const std::string& name) -> ggml_tensor* {
@@ -92,27 +67,21 @@ std::unique_ptr<LlamaWeights> LlamaWeights::load(const Model& model) {
             std::fprintf(stderr,
                 "[sp-engine] LlamaWeights: required tensor missing: %s\n",
                 name.c_str());
-            return nullptr;
+        } else {
+            n_bound++;
         }
-        w->n_bound_tensors_++;
         return t;
     };
 
-    // Top-level
-    w->tok_embd    = bind_req("token_embd.weight");
-    w->output_norm = bind_req("output_norm.weight");
-    w->output      = bind_opt("output.weight");
-    if (!w->output) {
-        // Tied embeddings: llama-3, some Qwens share the weight matrix.
-        w->output = w->tok_embd;
-    }
-    w->rope_freqs  = bind_opt("rope_freqs.weight");
+    w.tok_embd    = bind_req("token_embd.weight");
+    w.output_norm = bind_req("output_norm.weight");
+    w.output      = bind_opt("output.weight");
+    if (!w.output) w.output = w.tok_embd;     // tied embeddings
+    w.rope_freqs  = bind_opt("rope_freqs.weight");
+    if (!w.tok_embd || !w.output_norm) return false;
 
-    if (!w->tok_embd || !w->output_norm) return nullptr;
-
-    // Per-layer
     const int n_layer = (int)model.n_layer();
-    w->layers_.resize((size_t)n_layer);
+    w.layers_.resize((size_t)n_layer);
 
     auto layer_name = [](int i, const char* suffix) {
         char buf[128];
@@ -121,7 +90,7 @@ std::unique_ptr<LlamaWeights> LlamaWeights::load(const Model& model) {
     };
 
     for (int i = 0; i < n_layer; ++i) {
-        LlamaLayer& L = w->layers_[(size_t)i];
+        LlamaLayer& L = w.layers_[(size_t)i];
         L.attn_norm = bind_req(layer_name(i, "attn_norm.weight"));
         L.wq        = bind_req(layer_name(i, "attn_q.weight"));
         L.wk        = bind_req(layer_name(i, "attn_k.weight"));
@@ -141,16 +110,182 @@ std::unique_ptr<LlamaWeights> LlamaWeights::load(const Model& model) {
         L.ffn_up    = bind_req(layer_name(i, "ffn_up.weight"));
         L.ffn_down  = bind_req(layer_name(i, "ffn_down.weight"));
 
-        // If any required tensor missed we bail with a clear message.
         if (!L.attn_norm || !L.wq || !L.wk || !L.wv || !L.wo
             || !L.ffn_norm || !L.ffn_gate || !L.ffn_up || !L.ffn_down) {
             std::fprintf(stderr,
                 "[sp-engine] LlamaWeights: layer %d missing required tensor(s)\n", i);
-            return nullptr;
+            return false;
         }
     }
+    return true;
+}
 
+// ------------------------------------------------------------------
+// Load path A: CPU mmap (current behaviour).
+// Tensor data stays in the GGUF file's memory map; zero-copy for
+// unquantised tensors. Fast load, no extra VRAM.
+// ------------------------------------------------------------------
+std::unique_ptr<LlamaWeights> LlamaWeights::load_cpu_mmap_(const Model& model) {
+    auto w = std::unique_ptr<LlamaWeights>(new LlamaWeights());
+    w->arch_ = model.architecture();
+
+    gguf_init_params params = {};
+    params.no_alloc = false;
+    params.ctx      = &w->impl_->meta_ctx;
+    w->impl_->gguf = gguf_init_from_file(model.path().c_str(), params);
+    if (!w->impl_->gguf) {
+        std::fprintf(stderr,
+            "[sp-engine] LlamaWeights: failed to reopen %s (mmap)\n",
+            model.path().c_str());
+        return nullptr;
+    }
+
+    if (!LlamaWeights::bind_tensors_(*w, w->impl_->meta_ctx, model)) {
+        return nullptr;
+    }
     return w;
+}
+
+// ------------------------------------------------------------------
+// Load path B: backend-resident weights.
+//
+// Step 1: open the GGUF twice.
+//   Pass 1 with no_alloc=false gives us an mmap-backed ctx we can
+//   read tensor data from.
+//   Pass 2 with no_alloc=true gives us a parallel ctx with
+//   "placeholder" tensors (shape + type + name, no buffer) that we
+//   can allocate on the target backend.
+//
+// Step 2: ggml_backend_alloc_ctx_tensors(final_ctx, backend) allocates
+//   a single backend buffer large enough for every weight.
+//
+// Step 3: for each tensor, ggml_backend_tensor_set copies the mmap
+//   bytes into the backend buffer (cudaMemcpy host → device for CUDA).
+//
+// Step 4: free the mmap ctx + gguf (data has been copied out). Keep
+//   final_ctx + the backend_buf for the life of the LlamaWeights.
+//
+// The bind pass then runs on final_ctx so tok_embd / layers[] point
+// at backend-resident tensors.
+// ------------------------------------------------------------------
+std::unique_ptr<LlamaWeights> LlamaWeights::load_backend_offload_(
+        const Model& model, ggml_backend_t backend) {
+    auto w = std::unique_ptr<LlamaWeights>(new LlamaWeights());
+    w->arch_ = model.architecture();
+
+    // Pass 1: mmap copy.
+    ggml_context* mmap_ctx = nullptr;
+    gguf_init_params p1 = {};
+    p1.no_alloc = false;
+    p1.ctx      = &mmap_ctx;
+    gguf_context* mmap_gguf = gguf_init_from_file(model.path().c_str(), p1);
+    if (!mmap_gguf) {
+        std::fprintf(stderr,
+            "[sp-engine] LlamaWeights: failed to reopen %s (pass 1)\n",
+            model.path().c_str());
+        return nullptr;
+    }
+
+    // Count tensors for ctx overhead budget, collect their metadata.
+    struct TensorInfo {
+        std::string name;
+        ggml_type   type;
+        int64_t     ne[GGML_MAX_DIMS];
+        int         n_dims;
+        size_t      n_bytes;
+        void*       src;   // host pointer to mmapped bytes
+    };
+    std::vector<TensorInfo> tensors;
+    tensors.reserve(512);
+    for (ggml_tensor* t = ggml_get_first_tensor(mmap_ctx); t != nullptr;
+         t = ggml_get_next_tensor(mmap_ctx, t)) {
+        TensorInfo ti;
+        ti.name   = ggml_get_name(t);
+        ti.type   = t->type;
+        ti.n_dims = ggml_n_dims(t);
+        for (int d = 0; d < GGML_MAX_DIMS; ++d) ti.ne[d] = t->ne[d];
+        ti.n_bytes = ggml_nbytes(t);
+        ti.src     = t->data;
+        tensors.push_back(std::move(ti));
+    }
+
+    // Pass 2: create a final ctx we own, with tensor placeholders.
+    const size_t ctx_mem = ggml_tensor_overhead() * (tensors.size() + 16);
+    ggml_init_params gip = {};
+    gip.mem_size   = ctx_mem;
+    gip.mem_buffer = nullptr;
+    gip.no_alloc   = true;          // we'll allocate on `backend`
+    w->impl_->ctx  = ggml_init(gip);
+    if (!w->impl_->ctx) {
+        std::fprintf(stderr, "[sp-engine] LlamaWeights: ggml_init failed (backend ctx)\n");
+        ggml_free(mmap_ctx);
+        gguf_free(mmap_gguf);
+        return nullptr;
+    }
+    for (const auto& ti : tensors) {
+        ggml_tensor* t;
+        if      (ti.n_dims == 1) t = ggml_new_tensor_1d(w->impl_->ctx, ti.type, ti.ne[0]);
+        else if (ti.n_dims == 2) t = ggml_new_tensor_2d(w->impl_->ctx, ti.type, ti.ne[0], ti.ne[1]);
+        else if (ti.n_dims == 3) t = ggml_new_tensor_3d(w->impl_->ctx, ti.type, ti.ne[0], ti.ne[1], ti.ne[2]);
+        else                     t = ggml_new_tensor_4d(w->impl_->ctx, ti.type, ti.ne[0], ti.ne[1], ti.ne[2], ti.ne[3]);
+        ggml_set_name(t, ti.name.c_str());
+    }
+
+    // Allocate storage on the target backend.
+    w->impl_->backend_buf = ggml_backend_alloc_ctx_tensors(w->impl_->ctx, backend);
+    if (!w->impl_->backend_buf) {
+        std::fprintf(stderr, "[sp-engine] LlamaWeights: alloc_ctx_tensors on backend failed\n");
+        ggml_free(mmap_ctx);
+        gguf_free(mmap_gguf);
+        return nullptr;
+    }
+
+    // Copy each tensor's mmap bytes into the backend buffer.
+    size_t total_bytes = 0;
+    for (const auto& ti : tensors) {
+        ggml_tensor* dst = ggml_get_tensor(w->impl_->ctx, ti.name.c_str());
+        if (!dst) continue;
+        ggml_backend_tensor_set(dst, ti.src, 0, ti.n_bytes);
+        total_bytes += ti.n_bytes;
+    }
+    std::fprintf(stderr,
+        "[sp-engine] LlamaWeights: offloaded %zu tensors (%.2f MiB) to backend\n",
+        tensors.size(), total_bytes / (1024.0 * 1024.0));
+
+    // Pass-1 data has been copied into the backend buffer; release it.
+    ggml_free(mmap_ctx);
+    gguf_free(mmap_gguf);
+
+    if (!LlamaWeights::bind_tensors_(*w, w->impl_->ctx, model)) {
+        return nullptr;
+    }
+    return w;
+}
+
+// ------------------------------------------------------------------
+// Public load: dispatches to CPU-mmap or backend-offload based on
+// the backend argument. CPU-type backends use mmap for zero-copy
+// load; GPU-type backends require the offload path.
+// ------------------------------------------------------------------
+std::unique_ptr<LlamaWeights> LlamaWeights::load(const Model& model,
+                                                  ggml_backend_t backend) {
+    if (!supported_arch(model.architecture())) {
+        std::fprintf(stderr,
+            "[sp-engine] LlamaWeights: unsupported arch '%s'\n",
+            model.architecture().c_str());
+        return nullptr;
+    }
+
+    // Route: if backend is nullptr OR it's a CPU backend, use mmap.
+    // Otherwise offload to the backend's buffer type.
+    bool use_mmap = (backend == nullptr);
+    if (backend != nullptr) {
+        ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+        if (dev && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+            use_mmap = true;
+        }
+    }
+    return use_mmap ? load_cpu_mmap_(model) : load_backend_offload_(model, backend);
 }
 
 void LlamaWeights::print_summary(std::FILE* f) const {

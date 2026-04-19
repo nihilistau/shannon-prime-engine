@@ -48,6 +48,8 @@ struct ForwardContext::Impl {
     ggml_tensor*       model_rope_freqs = nullptr;
 
     ggml_backend_t        backend = nullptr;   // CPU only at this stage
+    bool                  owns_backend = false; // true if created here, false if
+                                                // passed in from outside
     ggml_backend_buffer_t compute_buf = nullptr;
     ggml_gallocr_t        allocr = nullptr;
 
@@ -61,7 +63,7 @@ struct ForwardContext::Impl {
     ~Impl() {
         if (compute_buf) ggml_backend_buffer_free(compute_buf);
         if (allocr)      ggml_gallocr_free(allocr);
-        if (backend)     ggml_backend_free(backend);
+        if (backend && owns_backend) ggml_backend_free(backend);
     }
 };
 
@@ -82,7 +84,8 @@ int ForwardContext::kv_pos() const { return impl_->kv_pos; }
 std::unique_ptr<ForwardContext> ForwardContext::create(const Model& model,
                                                         const LlamaWeights& weights,
                                                         int ctx_size_bytes,
-                                                        PeSettings pe) {
+                                                        PeSettings pe,
+                                                        ggml_backend_t external_backend) {
     if (!weights.tok_embd) {
         std::fprintf(stderr, "[sp-engine] ForwardContext: weights missing tok_embd\n");
         return nullptr;
@@ -179,43 +182,17 @@ std::unique_ptr<ForwardContext> ForwardContext::create(const Model& model,
         }
     }
 
-    // Backend selection: default CPU. Set SP_ENGINE_BACKEND=gpu (or
-    // =cuda / =vulkan) to prefer a GPU backend when the binary was
-    // built with it. Falls back to CPU if no GPU backend is registered.
-    //
-    // KNOWN LIMITATION: GPU compute currently segfaults because
-    // LlamaWeights loads tensors into a CPU-backed ggml_context (via
-    // GGUF mmap with no_alloc=false). The CUDA backend tries to
-    // dereference those host pointers as device memory. Fixing
-    // requires a llama_weights refactor: load with no_alloc=true,
-    // ggml_backend_alloc_ctx_tensors on the compute backend, then
-    // copy the mmapped data into the backend buffer per-tensor.
-    // Tracked as a planned v1.16 item. Keeping the flag in place
-    // so the build path is wired and the fallback is clean.
-    {
-        const char* backend_env = std::getenv("SP_ENGINE_BACKEND");
-        bool want_gpu = backend_env && (std::strcmp(backend_env, "gpu") == 0 ||
-                                        std::strcmp(backend_env, "cuda") == 0 ||
-                                        std::strcmp(backend_env, "vulkan") == 0);
-        if (want_gpu) {
-            std::fprintf(stderr, "[sp-engine] WARNING: SP_ENGINE_BACKEND=%s selected; "
-                         "GPU compute is NOT YET working (weights remain on CPU mmap). "
-                         "Expect a segfault mid-forward. Unset the env to use CPU.\n",
-                         backend_env);
-            fc->impl_->backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_GPU, nullptr);
-            if (fc->impl_->backend) {
-                ggml_backend_dev_t dev = ggml_backend_get_device(fc->impl_->backend);
-                const char* name = dev ? ggml_backend_dev_name(dev) : "?";
-                std::fprintf(stderr, "[sp-engine] backend: %s (GPU, experimental)\n", name);
-            } else {
-                std::fprintf(stderr, "[sp-engine] no GPU backend available; falling back to CPU\n");
-            }
-        }
+    // Backend selection. If the caller supplied one (usually picked
+    // in main.cpp so it can be shared with LlamaWeights::load for
+    // weights offload), use it non-owning. Otherwise pick CPU here.
+    if (external_backend) {
+        fc->impl_->backend = external_backend;
+        fc->impl_->owns_backend = false;
+    } else {
+        fc->impl_->backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
+        fc->impl_->owns_backend = (fc->impl_->backend != nullptr);
         if (!fc->impl_->backend) {
-            fc->impl_->backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
-        }
-        if (!fc->impl_->backend) {
-            std::fprintf(stderr, "[sp-engine] ForwardContext: failed to init any backend\n");
+            std::fprintf(stderr, "[sp-engine] ForwardContext: failed to init CPU backend\n");
             return nullptr;
         }
     }

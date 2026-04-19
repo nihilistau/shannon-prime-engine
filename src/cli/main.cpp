@@ -13,6 +13,46 @@
 #include "tokenizer.h"
 #include "vocab.h"
 
+#include "ggml-backend.h"
+#include <cstdlib>
+#include <cstring>
+
+// RAII guard: owns an optional ggml_backend_t, frees on scope exit.
+// Implicitly convertible to ggml_backend_t so it drops into the
+// LlamaWeights / ForwardContext calls without extra .get() noise.
+struct SpBackendGuard {
+    ggml_backend_t b = nullptr;
+    SpBackendGuard() = default;
+    explicit SpBackendGuard(ggml_backend_t b) : b(b) {}
+    ~SpBackendGuard() { if (b) ggml_backend_free(b); }
+    SpBackendGuard(const SpBackendGuard&) = delete;
+    SpBackendGuard& operator=(const SpBackendGuard&) = delete;
+    operator ggml_backend_t() const { return b; }
+};
+
+// Backend selection helper shared across verbs: reads SP_ENGINE_BACKEND
+// and returns a ggml_backend_t (caller owns, must ggml_backend_free).
+// Falls through to nullptr for CPU (LlamaWeights / ForwardContext will
+// then use their CPU default paths with mmap zero-copy load).
+static ggml_backend_t sp_select_backend() {
+    const char* env = std::getenv("SP_ENGINE_BACKEND");
+    if (!env) return nullptr;
+    const bool want_gpu = (std::strcmp(env, "gpu") == 0 ||
+                           std::strcmp(env, "cuda") == 0 ||
+                           std::strcmp(env, "vulkan") == 0);
+    if (!want_gpu) return nullptr;
+    ggml_backend_t b = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_GPU, nullptr);
+    if (!b) {
+        std::fprintf(stderr, "[sp-engine] SP_ENGINE_BACKEND=%s but no GPU backend "
+                     "registered; falling back to CPU\n", env);
+        return nullptr;
+    }
+    ggml_backend_dev_t dev = ggml_backend_get_device(b);
+    std::fprintf(stderr, "[sp-engine] backend: %s (GPU)\n",
+                 dev ? ggml_backend_dev_name(dev) : "?");
+    return b;
+}
+
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -136,11 +176,12 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "cache_ppl requires a UTF-8 text file path\n"); return 1;
         }
 
+        SpBackendGuard bk(sp_select_backend());
         auto m  = sp::engine::Model::load(cc.model_path);
         if (!m) return 2;
         auto v  = sp::engine::Vocab::load(*m);
         auto tk = v ? sp::engine::Tokenizer::create(*v) : nullptr;
-        auto W  = sp::engine::LlamaWeights::load(*m);
+        auto W  = sp::engine::LlamaWeights::load(*m, bk);
         if (!tk || !W) return 3;
 
         std::FILE* fp = std::fopen(textfile.c_str(), "rb");
@@ -160,7 +201,7 @@ int main(int argc, char** argv) {
                      fsize, all_ids.size());
 
         sp::engine::PeSettings pe{cc.pe_mode, cc.pe_alpha, cc.pe_tier};
-        auto fc = sp::engine::ForwardContext::create(*m, *W, 1024 * 1024 * 1024, pe);
+        auto fc = sp::engine::ForwardContext::create(*m, *W, 1024 * 1024 * 1024, pe, bk);
         if (!fc) return 5;
 
         const int n_layer   = fc->n_layer();
@@ -343,11 +384,12 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "perplexity requires a UTF-8 text file path\n"); return 1;
         }
 
+        SpBackendGuard bk(sp_select_backend());
         auto m  = sp::engine::Model::load(pc.model_path);
         if (!m) return 2;
         auto v  = sp::engine::Vocab::load(*m);
         auto tk = v ? sp::engine::Tokenizer::create(*v) : nullptr;
-        auto W  = sp::engine::LlamaWeights::load(*m);
+        auto W  = sp::engine::LlamaWeights::load(*m, bk);
         if (!tk || !W) return 3;
 
         // Read whole file. Binary mode so byte-perfect with what llama.cpp's
@@ -374,7 +416,8 @@ int main(int argc, char** argv) {
         // Estimate scratch: full forward at n=ctx for an n_layer=36 / 8B model
         // wants ~1 GB. The 1 GB ctx_size we pass to ForwardContext::create
         // covers up to ctx ~ 1024 on Qwen3-8B comfortably.
-        auto fc = sp::engine::ForwardContext::create(*m, *W, 1024 * 1024 * 1024);
+        sp::engine::PeSettings pe_empty;
+        auto fc = sp::engine::ForwardContext::create(*m, *W, 1024 * 1024 * 1024, pe_empty, bk);
         if (!fc) return 5;
 
         const int n_vocab_local = fc->n_vocab();
@@ -531,11 +574,12 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "chat requires a prompt\n"); return 1;
         }
 
+        SpBackendGuard bk(sp_select_backend());
         auto m = sp::engine::Model::load(cc.model_path);
         if (!m) return 2;
         auto v  = sp::engine::Vocab::load(*m);
         auto tk = v ? sp::engine::Tokenizer::create(*v) : nullptr;
-        auto W  = sp::engine::LlamaWeights::load(*m);
+        auto W  = sp::engine::LlamaWeights::load(*m, bk);
         if (!tk || !W) return 3;
 
         std::vector<int32_t> ids;
@@ -544,7 +588,7 @@ int main(int argc, char** argv) {
         const int max_seq  = n_prompt + n_predict + 4;
 
         sp::engine::PeSettings pe{cc.pe_mode, cc.pe_alpha, cc.pe_tier};
-        auto fc = sp::engine::ForwardContext::create(*m, *W, 1024 * 1024 * 1024, pe);
+        auto fc = sp::engine::ForwardContext::create(*m, *W, 1024 * 1024 * 1024, pe, bk);
         if (!fc) return 4;
 
         auto kv = sp::engine::KvCache::create(fc->n_layer(),

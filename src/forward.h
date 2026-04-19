@@ -27,6 +27,7 @@ struct ggml_backend_buffer;
 struct ggml_cgraph;
 struct ggml_context;
 struct ggml_tensor;
+typedef struct ggml_backend * ggml_backend_t;
 
 namespace sp::engine {
 
@@ -49,10 +50,15 @@ public:
     // caller can override. `pe` selects the positional-encoding variant
     // (default Standard = geometric RoPE, no ALiBi — byte-for-byte
     // compatible with llama.cpp).
+    // `external_backend` — optional pre-selected backend shared with
+    // LlamaWeights. When non-null, ForwardContext uses it for compute
+    // and does NOT free it (caller owns lifetime). When null,
+    // ForwardContext picks a CPU backend internally (current default).
     static std::unique_ptr<ForwardContext> create(const Model&         model,
                                                    const LlamaWeights& weights,
                                                    int ctx_size_bytes = 512 * 1024 * 1024,
-                                                   PeSettings pe = {});
+                                                   PeSettings pe = {},
+                                                   ggml_backend_t external_backend = nullptr);
 
     ~ForwardContext();
     ForwardContext(const ForwardContext&) = delete;

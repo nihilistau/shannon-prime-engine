@@ -18,6 +18,9 @@
 
 struct ggml_context;
 struct ggml_tensor;
+struct ggml_backend;
+struct ggml_backend_buffer;
+typedef struct ggml_backend * ggml_backend_t;
 
 namespace sp::engine {
 
@@ -49,14 +52,24 @@ struct LlamaLayer {
 class LlamaWeights {
 public:
     // Load all tensors from `model` into a ggml_context owned by the
-    // returned object. Tensor DATA stays mmapped from the GGUF file;
-    // the ggml_tensor* handles point into that mmap. Zero-copy for
-    // unquantised tensors; quantised tensors also stay mmapped but the
-    // engine dequantises into scratch at inference time.
+    // returned object.
+    //
+    // * `backend == nullptr` (default) — tensor DATA stays mmapped from
+    //   the GGUF file; the ggml_tensor* handles point into that mmap.
+    //   Zero-copy for unquantised tensors; quantised tensors also stay
+    //   mmapped but the engine dequantises into scratch at inference
+    //   time. Best for CPU compute.
+    //
+    // * `backend != nullptr` — allocates backing storage for every
+    //   weight tensor on `backend`'s buffer type and copies the mmapped
+    //   GGUF data into it via ggml_backend_tensor_set. Required when
+    //   the forward pass runs on a GPU backend (CUDA / Vulkan) — the
+    //   GPU kernels can't dereference CPU mmap pointers.
     //
     // Returns nullptr on unsupported arch, missing required tensors,
     // or I/O error.
-    static std::unique_ptr<LlamaWeights> load(const Model& model);
+    static std::unique_ptr<LlamaWeights> load(const Model& model,
+                                               ggml_backend_t backend = nullptr);
 
     ~LlamaWeights();
     LlamaWeights(const LlamaWeights&) = delete;
@@ -86,6 +99,12 @@ private:
     std::string arch_;
     int n_bound_tensors_ = 0;
     int n_missing_optional_ = 0;
+
+    // Internal helpers (implementation-only; declared here so they can
+    // reach private members without a friend declaration).
+    static bool                             bind_tensors_(LlamaWeights& w, ggml_context* tctx, const Model& model);
+    static std::unique_ptr<LlamaWeights>    load_cpu_mmap_(const Model& model);
+    static std::unique_ptr<LlamaWeights>    load_backend_offload_(const Model& model, ggml_backend_t backend);
 };
 
 } // namespace sp::engine
