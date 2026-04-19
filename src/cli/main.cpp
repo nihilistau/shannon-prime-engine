@@ -434,12 +434,37 @@ int main(int argc, char** argv) {
         // keeps the cache's calibrated masks intact).
         std::unique_ptr<sp::engine::KvCache> kv;
         if (use_cache) {
-            kv = sp::engine::KvCache::create(fc->n_layer(),
-                                              (int)m->n_head_kv(),
-                                              (int)m->head_dim(),
-                                              n_ctx + 8, pc);
+            // Auto-select GPU-resident cache when the engine backend is
+            // non-CPU AND the config is the ship path (sqfree/hier still
+            // run host-side in MVP). Env SHANNON_PRIME_GPU_CACHE=0 forces
+            // the host cache even on GPU, for A/B comparisons.
+            const char* env_gpu = std::getenv("SHANNON_PRIME_GPU_CACHE");
+            bool prefer_gpu_cache = (env_gpu == nullptr) || (std::atoi(env_gpu) != 0);
+            bool backend_is_gpu = false;
+            if ((ggml_backend_t)bk) {
+                ggml_backend_dev_t dev = ggml_backend_get_device((ggml_backend_t)bk);
+                backend_is_gpu = dev && ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU;
+            }
+            const bool ship_path = !pc.sqfree && !pc.hierarchical;
+            if (prefer_gpu_cache && backend_is_gpu && ship_path) {
+                kv = sp::engine::KvCache::create_gpu(fc->n_layer(),
+                                                      (int)m->n_head_kv(),
+                                                      (int)m->head_dim(),
+                                                      n_ctx + 8, pc,
+                                                      /*stream=*/nullptr);
+                if (!kv) {
+                    std::fprintf(stderr, "[sp-engine] create_gpu failed; falling back to host cache\n");
+                }
+            }
+            if (!kv) {
+                kv = sp::engine::KvCache::create(fc->n_layer(),
+                                                  (int)m->n_head_kv(),
+                                                  (int)m->head_dim(),
+                                                  n_ctx + 8, pc);
+            }
             if (!kv) { std::fprintf(stderr, "KvCache::create failed\n"); return 5; }
-            std::fprintf(stderr, "[sp-engine] %s\n", kv->describe().c_str());
+            std::fprintf(stderr, "[sp-engine] %s%s\n", kv->describe().c_str(),
+                         kv->is_gpu() ? " [GPU-resident]" : "");
         }
 
         std::fprintf(stderr,
@@ -591,12 +616,37 @@ int main(int argc, char** argv) {
         auto fc = sp::engine::ForwardContext::create(*m, *W, 1024 * 1024 * 1024, pe, bk);
         if (!fc) return 4;
 
-        auto kv = sp::engine::KvCache::create(fc->n_layer(),
-                                               (int)m->n_head_kv(),
-                                               (int)m->head_dim(),
-                                               max_seq, cc);
+        // Prefer GPU-resident cache when backend is GPU + ship path.
+        std::unique_ptr<sp::engine::KvCache> kv;
+        {
+            const char* env_gpu = std::getenv("SHANNON_PRIME_GPU_CACHE");
+            const bool prefer_gpu_cache = (env_gpu == nullptr) || (std::atoi(env_gpu) != 0);
+            bool backend_is_gpu = false;
+            if ((ggml_backend_t)bk) {
+                ggml_backend_dev_t dev = ggml_backend_get_device((ggml_backend_t)bk);
+                backend_is_gpu = dev && ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU;
+            }
+            const bool ship_path = !cc.sqfree && !cc.hierarchical;
+            if (prefer_gpu_cache && backend_is_gpu && ship_path) {
+                kv = sp::engine::KvCache::create_gpu(fc->n_layer(),
+                                                      (int)m->n_head_kv(),
+                                                      (int)m->head_dim(),
+                                                      max_seq, cc,
+                                                      /*stream=*/nullptr);
+                if (!kv) {
+                    std::fprintf(stderr, "[sp-engine] create_gpu failed; falling back to host cache\n");
+                }
+            }
+            if (!kv) {
+                kv = sp::engine::KvCache::create(fc->n_layer(),
+                                                  (int)m->n_head_kv(),
+                                                  (int)m->head_dim(),
+                                                  max_seq, cc);
+            }
+        }
         if (!kv) { std::fprintf(stderr, "KvCache::create failed\n"); return 5; }
-        std::fprintf(stderr, "[sp-engine] %s\n", kv->describe().c_str());
+        std::fprintf(stderr, "[sp-engine] %s%s\n", kv->describe().c_str(),
+                     kv->is_gpu() ? " [GPU-resident]" : "");
         std::fprintf(stderr, "[sp-engine] PE: %s\n",
                      sp::engine::prime_pe_describe(cc.pe_mode, cc.pe_alpha, cc.pe_tier).c_str());
 

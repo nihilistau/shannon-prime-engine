@@ -9,8 +9,13 @@
 #include "ggml-backend.h"
 #include "gguf.h"
 
+#ifdef SP_ENGINE_WITH_CUDA
+#include <cuda_runtime.h>
+#endif
+
 #include <cstdio>
 #include <cstring>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -173,6 +178,21 @@ std::unique_ptr<LlamaWeights> LlamaWeights::load_backend_offload_(
     auto w = std::unique_ptr<LlamaWeights>(new LlamaWeights());
     w->arch_ = model.architecture();
 
+#ifdef SP_ENGINE_WITH_CUDA
+    auto dump_vram = [](const char* tag) {
+        size_t free_b = 0, total_b = 0;
+        if (cudaMemGetInfo(&free_b, &total_b) == cudaSuccess) {
+            std::fprintf(stderr,
+                "[sp-engine:diag] %-40s VRAM free=%.2f GiB used=%.2f GiB / total=%.2f GiB\n",
+                tag,
+                free_b / (1024.0 * 1024.0 * 1024.0),
+                (total_b - free_b) / (1024.0 * 1024.0 * 1024.0),
+                total_b / (1024.0 * 1024.0 * 1024.0));
+        }
+    };
+    dump_vram("load_backend_offload_: enter");
+#endif
+
     // Pass 1: mmap copy.
     ggml_context* mmap_ctx = nullptr;
     gguf_init_params p1 = {};
@@ -195,19 +215,50 @@ std::unique_ptr<LlamaWeights> LlamaWeights::load_backend_offload_(
         size_t      n_bytes;
         void*       src;   // host pointer to mmapped bytes
     };
+    // IMPORTANT: gguf_init_from_file populates mmap_ctx with BOTH the
+    // named weight tensors AND a single "GGUF tensor data binary blob"
+    // I8 tensor of the full file payload size. Walking the ggml_context
+    // with ggml_get_first/next_tensor picks up both, doubling our
+    // allocation request. Iterate via the gguf API instead — it lists
+    // only the named weights.
     std::vector<TensorInfo> tensors;
-    tensors.reserve(512);
-    for (ggml_tensor* t = ggml_get_first_tensor(mmap_ctx); t != nullptr;
-         t = ggml_get_next_tensor(mmap_ctx, t)) {
+    const int64_t n_gguf_tensors = gguf_get_n_tensors(mmap_gguf);
+    tensors.reserve((size_t)n_gguf_tensors);
+    std::unordered_map<int, size_t> bytes_by_type;
+    std::unordered_map<int, int>    count_by_type;
+    size_t src_total = 0;
+    for (int64_t i = 0; i < n_gguf_tensors; ++i) {
+        const char* name = gguf_get_tensor_name(mmap_gguf, i);
+        ggml_tensor* t = ggml_get_tensor(mmap_ctx, name);
+        if (!t) {
+            std::fprintf(stderr,
+                "[sp-engine] LlamaWeights: gguf index %lld name '%s' not in ggml ctx\n",
+                (long long)i, name ? name : "(null)");
+            continue;
+        }
         TensorInfo ti;
-        ti.name   = ggml_get_name(t);
+        ti.name   = name;
         ti.type   = t->type;
         ti.n_dims = ggml_n_dims(t);
         for (int d = 0; d < GGML_MAX_DIMS; ++d) ti.ne[d] = t->ne[d];
         ti.n_bytes = ggml_nbytes(t);
         ti.src     = t->data;
+        src_total += ti.n_bytes;
+        bytes_by_type[(int)ti.type] += ti.n_bytes;
+        count_by_type[(int)ti.type] += 1;
         tensors.push_back(std::move(ti));
     }
+    std::fprintf(stderr,
+        "[sp-engine:diag] gguf named tensors: %zu, sum(ggml_nbytes)=%.2f MiB\n",
+        tensors.size(), src_total / (1024.0 * 1024.0));
+    for (const auto& kv : bytes_by_type) {
+        std::fprintf(stderr,
+            "[sp-engine:diag]   type=%d count=%d bytes=%.2f MiB\n",
+            kv.first, count_by_type[kv.first], kv.second / (1024.0 * 1024.0));
+    }
+#ifdef SP_ENGINE_WITH_CUDA
+    dump_vram("after mmap_ctx walk");
+#endif
 
     // Pass 2: create a final ctx we own, with tensor placeholders.
     const size_t ctx_mem = ggml_tensor_overhead() * (tensors.size() + 16);
@@ -231,6 +282,9 @@ std::unique_ptr<LlamaWeights> LlamaWeights::load_backend_offload_(
         ggml_set_name(t, ti.name.c_str());
     }
 
+#ifdef SP_ENGINE_WITH_CUDA
+    dump_vram("before ggml_backend_alloc_ctx_tensors");
+#endif
     // Allocate storage on the target backend.
     w->impl_->backend_buf = ggml_backend_alloc_ctx_tensors(w->impl_->ctx, backend);
     if (!w->impl_->backend_buf) {
@@ -239,6 +293,13 @@ std::unique_ptr<LlamaWeights> LlamaWeights::load_backend_offload_(
         gguf_free(mmap_gguf);
         return nullptr;
     }
+    const size_t backend_buf_size = ggml_backend_buffer_get_size(w->impl_->backend_buf);
+    std::fprintf(stderr,
+        "[sp-engine:diag] backend_buf_size=%.2f MiB (what ggml allocated on backend)\n",
+        backend_buf_size / (1024.0 * 1024.0));
+#ifdef SP_ENGINE_WITH_CUDA
+    dump_vram("after ggml_backend_alloc_ctx_tensors");
+#endif
 
     // Copy each tensor's mmap bytes into the backend buffer.
     size_t total_bytes = 0;
@@ -251,10 +312,16 @@ std::unique_ptr<LlamaWeights> LlamaWeights::load_backend_offload_(
     std::fprintf(stderr,
         "[sp-engine] LlamaWeights: offloaded %zu tensors (%.2f MiB) to backend\n",
         tensors.size(), total_bytes / (1024.0 * 1024.0));
+#ifdef SP_ENGINE_WITH_CUDA
+    dump_vram("after all tensor_set copies");
+#endif
 
     // Pass-1 data has been copied into the backend buffer; release it.
     ggml_free(mmap_ctx);
     gguf_free(mmap_gguf);
+#ifdef SP_ENGINE_WITH_CUDA
+    dump_vram("after mmap ctx + gguf free");
+#endif
 
     if (!LlamaWeights::bind_tensors_(*w, w->impl_->ctx, model)) {
         return nullptr;

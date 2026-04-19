@@ -7,6 +7,13 @@ extern "C" {
 #include "shannon_prime.h"
 }
 
+#ifdef SP_ENGINE_WITH_CUDA
+extern "C" {
+#include "shannon_prime_cuda.h"
+}
+#include <cuda_runtime.h>
+#endif
+
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -62,6 +69,19 @@ struct KvCache::Impl {
     size_t               k_bytes = 0;
     size_t               v_bytes = 0;
 
+#ifdef SP_ENGINE_WITH_CUDA
+    // GPU-resident ship cache (step 3). When cuda_inited is true, the
+    // shadow cache above is unused — reads/writes route to cuda_cache.
+    sp_cuda_cache_t      cuda_cache{};
+    bool                 cuda_inited = false;
+    // Scratch for host->device staging of input vectors on write, and
+    // for device->device per-head strided output on read. Lazy-sized.
+    float*               d_stage       = nullptr;
+    size_t               d_stage_bytes = 0;
+    float*               d_scratch_batch       = nullptr;  // [hd, max_seq] per-head read scratch
+    size_t               d_scratch_batch_bytes = 0;
+#endif
+
     ~Impl() {
         if (shadow_inited) {
             // We allocated k_cache/v_cache slot pointers + per-slot buffers.
@@ -84,6 +104,13 @@ struct KvCache::Impl {
         if (hier_inited) {
             sp_hier_cache_free(&hier);
         }
+#ifdef SP_ENGINE_WITH_CUDA
+        if (cuda_inited) {
+            if (d_stage)         cudaFree(d_stage);
+            if (d_scratch_batch) cudaFree(d_scratch_batch);
+            sp_cuda_cache_free(&cuda_cache);
+        }
+#endif
     }
 };
 
@@ -221,6 +248,33 @@ bool KvCache::write(int layer, int pos_offset, int n_tokens,
     const int H  = impl_->n_head_kv;
     const int hd = impl_->head_dim;
 
+#ifdef SP_ENGINE_WITH_CUDA
+    // GPU-resident cache: stage host vectors to device once, then call
+    // write_gpu which loops sp_cuda_write_k/v per slot. Used by prefill
+    // where forward_full pulls K/V back to host — the staging copy
+    // happens once per prefill chunk, not per decode step.
+    if (impl_->cuda_inited) {
+        const size_t n_elems = (size_t)n_tokens * H * hd;
+        const size_t n_bytes = n_elems * sizeof(float);
+        float* d_stage_K = nullptr;
+        float* d_stage_V = nullptr;
+        if (cudaMalloc((void**)&d_stage_K, n_bytes) != cudaSuccess ||
+            cudaMalloc((void**)&d_stage_V, n_bytes) != cudaSuccess) {
+            if (d_stage_K) cudaFree(d_stage_K);
+            std::fprintf(stderr, "[sp-engine] write(GPU): stage malloc failed\n");
+            return false;
+        }
+        cudaStream_t s = (cudaStream_t)impl_->cuda_cache.stream;
+        cudaMemcpyAsync(d_stage_K, K_flat, n_bytes, cudaMemcpyHostToDevice, s);
+        cudaMemcpyAsync(d_stage_V, V_flat, n_bytes, cudaMemcpyHostToDevice, s);
+        const bool ok = write_gpu(layer, pos_offset, n_tokens, d_stage_K, d_stage_V);
+        cudaStreamSynchronize(s);
+        cudaFree(d_stage_K);
+        cudaFree(d_stage_V);
+        return ok;
+    }
+#endif
+
     // Per-position, per-head writes. The K_flat / V_flat layout is the
     // ggml convention `[head_dim, n_head_kv, n_tokens]` — innermost is
     // head_dim, outermost is the position. This is what
@@ -255,6 +309,33 @@ bool KvCache::read(int layer, int kv_len,
     const int hd = impl_->head_dim;
     K_out.assign((size_t)kv_len * H * hd, 0.0f);
     V_out.assign((size_t)kv_len * H * hd, 0.0f);
+
+#ifdef SP_ENGINE_WITH_CUDA
+    // GPU-resident cache: read on device into scratch, then cudaMemcpy
+    // back to host. Used only by diagnostic code paths (forward.cpp's
+    // decode() takes the zero-copy read_gpu fast path directly).
+    if (impl_->cuda_inited && kv_len > 0) {
+        const size_t n_bytes = (size_t)kv_len * H * hd * sizeof(float);
+        float* d_K = nullptr;
+        float* d_V = nullptr;
+        if (cudaMalloc((void**)&d_K, n_bytes) != cudaSuccess ||
+            cudaMalloc((void**)&d_V, n_bytes) != cudaSuccess) {
+            if (d_K) cudaFree(d_K);
+            std::fprintf(stderr, "[sp-engine] read(GPU fallback): malloc failed\n");
+            return false;
+        }
+        cudaStream_t s = (cudaStream_t)impl_->cuda_cache.stream;
+        const bool ok = read_gpu(layer, kv_len, d_K, d_V);
+        if (ok) {
+            cudaMemcpyAsync(K_out.data(), d_K, n_bytes, cudaMemcpyDeviceToHost, s);
+            cudaMemcpyAsync(V_out.data(), d_V, n_bytes, cudaMemcpyDeviceToHost, s);
+        }
+        cudaStreamSynchronize(s);
+        cudaFree(d_K);
+        cudaFree(d_V);
+        return ok;
+    }
+#endif
 
     for (int q = 0; q < kv_len; ++q) {
         for (int h = 0; h < H; ++h) {
@@ -331,5 +412,176 @@ bool KvCache::is_calibrated() const {
 bool KvCache::is_hierarchical() const {
     return impl_->hier_inited;
 }
+
+bool KvCache::is_gpu() const {
+#ifdef SP_ENGINE_WITH_CUDA
+    return impl_->cuda_inited;
+#else
+    return false;
+#endif
+}
+
+// ── GPU-resident ship cache (step 3) ────────────────────────────────
+
+std::unique_ptr<KvCache> KvCache::create_gpu(int n_layer, int n_head_kv,
+                                              int head_dim, int max_seq,
+                                              const Config& cfg,
+                                              void* stream) {
+#ifndef SP_ENGINE_WITH_CUDA
+    (void)n_layer; (void)n_head_kv; (void)head_dim; (void)max_seq;
+    (void)cfg; (void)stream;
+    std::fprintf(stderr, "[sp-engine] KvCache::create_gpu: engine built without "
+                         "SP_ENGINE_WITH_CUDA\n");
+    return nullptr;
+#else
+    if (cfg.sqfree || cfg.hierarchical) {
+        std::fprintf(stderr, "[sp-engine] KvCache::create_gpu: only ship path "
+                             "is GPU-resident in MVP (sqfree/hierarchical "
+                             "still run host-side)\n");
+        return nullptr;
+    }
+    if (n_layer <= 0 || n_head_kv <= 0 || head_dim <= 0 || max_seq <= 0) {
+        std::fprintf(stderr, "[sp-engine] KvCache::create_gpu: bad dims\n");
+        return nullptr;
+    }
+
+    auto kv = std::unique_ptr<KvCache>(new KvCache());
+    kv->impl_->n_layer   = n_layer;
+    kv->impl_->n_head_kv = n_head_kv;
+    kv->impl_->head_dim  = head_dim;
+    kv->impl_->pad_dim   = head_dim;
+    kv->impl_->max_seq   = max_seq;
+
+    sp_config_t* sc = &kv->impl_->cfg;
+    sp_config_init(sc, head_dim, n_layer, n_head_kv);
+    sc->use_mobius_mask = cfg.mobius;
+
+    auto kbits = parse_csv_bits(cfg.k_bits_csv);
+    auto vbits = parse_csv_bits(cfg.v_bits_csv);
+    if (kbits.empty()) kbits = {5, 5, 4, 3};
+    if (vbits.empty()) vbits = {3};
+    if ((int)kbits.size() > SP_MAX_BANDS) kbits.resize(SP_MAX_BANDS);
+    if ((int)vbits.size() > SP_MAX_BANDS) vbits.resize(SP_MAX_BANDS);
+    sc->k_n_bands = (int)kbits.size();
+    sc->v_n_bands = (int)vbits.size();
+    for (size_t i = 0; i < kbits.size(); ++i) sc->k_band_bits[i] = kbits[i];
+    for (size_t i = 0; i < vbits.size(); ++i) sc->v_band_bits[i] = vbits[i];
+
+    if (sp_cuda_cache_init(&kv->impl_->cuda_cache, sc, max_seq, stream) != 0) {
+        std::fprintf(stderr, "[sp-engine] KvCache::create_gpu: sp_cuda_cache_init failed\n");
+        return nullptr;
+    }
+    kv->impl_->cuda_inited = true;
+
+    // Pre-allocate staging and scratch buffers up front so the write/read
+    // hot paths don't call cudaMalloc per step.
+    kv->impl_->d_stage_bytes = (size_t)head_dim * sizeof(float);
+    if (cudaMalloc((void**)&kv->impl_->d_stage,
+                   kv->impl_->d_stage_bytes) != cudaSuccess) {
+        std::fprintf(stderr, "[sp-engine] KvCache::create_gpu: d_stage cudaMalloc failed\n");
+        return nullptr;
+    }
+    kv->impl_->d_scratch_batch_bytes = (size_t)head_dim * max_seq * sizeof(float);
+    if (cudaMalloc((void**)&kv->impl_->d_scratch_batch,
+                   kv->impl_->d_scratch_batch_bytes) != cudaSuccess) {
+        std::fprintf(stderr, "[sp-engine] KvCache::create_gpu: scratch_batch cudaMalloc failed\n");
+        return nullptr;
+    }
+
+    std::fprintf(stderr, "[sp-engine] KvCache::create_gpu: ship path, "
+                 "hd=%d n_layer=%d n_head_kv=%d max_seq=%d k_bytes=%d v_bytes=%d\n",
+                 head_dim, n_layer, n_head_kv, max_seq,
+                 kv->impl_->cuda_cache.k_bands.total_bytes,
+                 kv->impl_->cuda_cache.v_bands.total_bytes);
+    return kv;
+#endif
+}
+
+#ifdef SP_ENGINE_WITH_CUDA
+// write_gpu: d_K_flat / d_V_flat are in [hd, n_kv, n_tokens] layout.
+// For each (token, head) pair, the vector at offset q*n_kv*hd + h*hd is
+// the raw K / V for that slot. We point sp_cuda_write_k/v at those
+// offsets in place — no staging copy needed.
+bool KvCache::write_gpu(int layer, int pos_offset, int n_tokens,
+                        const float* d_K_flat, const float* d_V_flat) {
+    if (!impl_->cuda_inited) {
+        std::fprintf(stderr, "[sp-engine] write_gpu on non-GPU cache\n");
+        return false;
+    }
+    if (layer < 0 || layer >= impl_->n_layer) return false;
+    if (pos_offset < 0 || pos_offset + n_tokens > impl_->max_seq) return false;
+
+    const int H  = impl_->n_head_kv;
+    const int hd = impl_->head_dim;
+    for (int q = 0; q < n_tokens; ++q) {
+        const int pos = pos_offset + q;
+        for (int h = 0; h < H; ++h) {
+            const float* d_k_vec = d_K_flat + (size_t)(q * H + h) * hd;
+            const float* d_v_vec = d_V_flat + (size_t)(q * H + h) * hd;
+            sp_cuda_write_k(&impl_->cuda_cache, layer, h, pos, d_k_vec);
+            sp_cuda_write_v(&impl_->cuda_cache, layer, h, pos, d_v_vec);
+        }
+    }
+    return true;
+}
+
+// read_gpu: fills d_K_out / d_V_out with shape [hd, n_kv, kv_len].
+// CUDA's batched read naturally outputs [hd, n_pos] contiguous per
+// (layer, head). To reach the strided layout expected by the attention
+// graph, we first read each head into a scratch `[hd, kv_len]` buffer,
+// then cudaMemcpy2D with dst_pitch = n_kv*hd*4 to scatter it into the
+// right slot. 2*H calls per layer, 2*H per decode step — all launches
+// async on the cache stream, so latency is the per-layer kernel time.
+bool KvCache::read_gpu(int layer, int kv_len,
+                       float* d_K_out, float* d_V_out) const {
+    if (!impl_->cuda_inited) {
+        std::fprintf(stderr, "[sp-engine] read_gpu on non-GPU cache\n");
+        return false;
+    }
+    if (layer < 0 || layer >= impl_->n_layer) return false;
+    if (kv_len < 0 || kv_len > impl_->max_seq) return false;
+    if (kv_len == 0) return true;
+
+    const int H  = impl_->n_head_kv;
+    const int hd = impl_->head_dim;
+    const size_t row_bytes = (size_t)hd * sizeof(float);
+    const size_t dst_pitch = (size_t)H * hd * sizeof(float);
+    cudaStream_t s = (cudaStream_t)impl_->cuda_cache.stream;
+    float* scratch = impl_->d_scratch_batch;
+
+    for (int h = 0; h < H; ++h) {
+        // K ── dequantize → unreorder → VHT2 into scratch[hd, kv_len]
+        sp_cuda_read_k_batch(&impl_->cuda_cache, layer, h, 0, kv_len, scratch);
+        // Scatter to d_K_out[:, h, :] — each of kv_len "rows" of hd floats
+        // lands at offset q*n_kv*hd + h*hd, so dst_pitch = n_kv*hd*4.
+        if (cudaMemcpy2DAsync(d_K_out + (size_t)h * hd, dst_pitch,
+                               scratch, row_bytes,
+                               row_bytes, (size_t)kv_len,
+                               cudaMemcpyDeviceToDevice, s) != cudaSuccess) {
+            std::fprintf(stderr, "[sp-engine] read_gpu: K scatter failed (L=%d h=%d)\n", layer, h);
+            return false;
+        }
+        // V ── same pipeline, minus Möbius unreorder (handled internally).
+        sp_cuda_read_v_batch(&impl_->cuda_cache, layer, h, 0, kv_len, scratch);
+        if (cudaMemcpy2DAsync(d_V_out + (size_t)h * hd, dst_pitch,
+                               scratch, row_bytes,
+                               row_bytes, (size_t)kv_len,
+                               cudaMemcpyDeviceToDevice, s) != cudaSuccess) {
+            std::fprintf(stderr, "[sp-engine] read_gpu: V scatter failed (L=%d h=%d)\n", layer, h);
+            return false;
+        }
+    }
+    return true;
+}
+#else
+bool KvCache::write_gpu(int, int, int, const float*, const float*) {
+    std::fprintf(stderr, "[sp-engine] write_gpu: built without SP_ENGINE_WITH_CUDA\n");
+    return false;
+}
+bool KvCache::read_gpu(int, int, float*, float*) const {
+    std::fprintf(stderr, "[sp-engine] read_gpu: built without SP_ENGINE_WITH_CUDA\n");
+    return false;
+}
+#endif
 
 } // namespace sp::engine

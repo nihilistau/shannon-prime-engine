@@ -34,6 +34,16 @@ public:
                                            int head_dim, int max_seq,
                                            const Config& cfg);
 
+    // GPU-resident variant (ship path only, MVP). Compressed K/V blocks
+    // live in VRAM; compress / decompress run as CUDA kernels — no host
+    // round-trip on read/write. `stream` is a cudaStream_t; pass nullptr
+    // for default. Returns nullptr if built without SP_ENGINE_WITH_CUDA
+    // or if cfg selects sqfree / hierarchical (not yet supported on GPU).
+    static std::unique_ptr<KvCache> create_gpu(int n_layer, int n_head_kv,
+                                                int head_dim, int max_seq,
+                                                const Config& cfg,
+                                                void* stream);
+
     ~KvCache();
     KvCache(const KvCache&) = delete;
     KvCache& operator=(const KvCache&) = delete;
@@ -54,6 +64,23 @@ public:
     bool read(int layer, int kv_len,
               std::vector<float>& K_out,
               std::vector<float>& V_out) const;
+
+    // GPU-native write: d_K_flat / d_V_flat are DEVICE pointers in the
+    // same [head_dim, n_head_kv, n_tokens] layout as write(). Compress
+    // kernels run on GPU; no host round-trip. Only valid on caches
+    // created via create_gpu(). Returns false otherwise.
+    bool write_gpu(int layer, int pos_offset, int n_tokens,
+                   const float* d_K_flat, const float* d_V_flat);
+
+    // GPU-native read: d_K_out / d_V_out are DEVICE pointers with the
+    // same [head_dim, n_head_kv, kv_len] layout as read(). Decompress
+    // kernels run on GPU; caller-provided device buffers are written
+    // in place. Only valid on caches created via create_gpu().
+    bool read_gpu(int layer, int kv_len,
+                  float* d_K_out, float* d_V_out) const;
+
+    // Query whether this cache is GPU-resident.
+    bool is_gpu() const;
 
     // --- adaptive calibration ---
     //

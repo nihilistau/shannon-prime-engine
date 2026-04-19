@@ -67,6 +67,29 @@ else()
 endif()
 
 # --------------------------------------------------------------------
+# CUDA backend: GPU-resident KV cache (step-3 goal)
+# Built only when SP_ENGINE_WITH_CUDA is ON. Provides sp_cuda_cache_*
+# and the VHT2 / Möbius / band-quant kernels that make SHIP-path
+# compress/decompress run on GPU without a host round-trip.
+# --------------------------------------------------------------------
+if(SP_ENGINE_WITH_CUDA)
+    enable_language(CUDA)
+    if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+        set(CMAKE_CUDA_ARCHITECTURES 75)
+    endif()
+    add_library(shannon_prime_cuda_backend STATIC
+        ${SP_CORE_DIR}/backends/cuda/shannon_prime_cuda.cu
+        ${SP_CORE_DIR}/backends/cuda/shannon_prime_sqfree.cu)
+    target_include_directories(shannon_prime_cuda_backend PUBLIC
+        ${SP_CORE_DIR}/backends/cuda
+        ${SP_CORE_DIR}/core)
+    target_link_libraries(shannon_prime_cuda_backend PUBLIC shannon_prime_core)
+    set_target_properties(shannon_prime_cuda_backend PROPERTIES
+        CUDA_SEPARABLE_COMPILATION ON
+        POSITION_INDEPENDENT_CODE ON)
+endif()
+
+# --------------------------------------------------------------------
 # ggml (submodule) — MIT-licensed compute graph + GGUF loader + matmul
 # Disable the bits we don't need so the engine binary stays lean.
 # --------------------------------------------------------------------
@@ -97,6 +120,16 @@ target_include_directories(sp_engine PUBLIC src)
 target_link_libraries(sp_engine PUBLIC
     shannon_prime_core
     ggml)
+if(SP_ENGINE_WITH_CUDA)
+    target_link_libraries(sp_engine PUBLIC shannon_prime_cuda_backend)
+    target_compile_definitions(sp_engine PUBLIC SP_ENGINE_WITH_CUDA=1)
+    # Host-side C++ sources in sp_engine include cuda_runtime.h (for
+    # cudaMalloc, cudaMemcpyAsync, etc.) so they need the CUDA Toolkit
+    # headers. Nvcc-compiled .cu files pick these up automatically; the
+    # .cpp files do not.
+    find_package(CUDAToolkit REQUIRED)
+    target_link_libraries(sp_engine PUBLIC CUDA::cudart)
+endif()
 target_compile_features(sp_engine PUBLIC cxx_std_17)
 if(MSVC)
     target_compile_options(sp_engine PRIVATE /W3)

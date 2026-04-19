@@ -11,6 +11,10 @@
 #include "ggml-backend.h"
 #include "ggml.h"
 
+#ifdef SP_ENGINE_WITH_CUDA
+#include <cuda_runtime.h>
+#endif
+
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -77,6 +81,13 @@ int ForwardContext::n_layer() const { return impl_->n_layer; }
 void ForwardContext::bind_cache(KvCache* cache) {
     impl_->cache  = cache;
     impl_->kv_pos = 0;
+    if (cache) {
+        std::fprintf(stderr,
+            "[sp-engine:diag] bind_cache: is_gpu=%d n_layer=%d n_head_kv=%d "
+            "head_dim=%d max_seq=%d\n",
+            (int)cache->is_gpu(), cache->n_layer(),
+            cache->n_head_kv(), cache->head_dim(), cache->max_seq());
+    }
 }
 
 int ForwardContext::kv_pos() const { return impl_->kv_pos; }
@@ -880,11 +891,26 @@ bool ForwardContext::decode(int32_t token_id,
     const int n_kv    = impl_->n_head_kv;
     out_n_vocab       = impl_->n_vocab;
 
+    // GPU-resident cache path: skip the host readback entirely. Past
+    // K/V come straight out of VRAM via read_gpu into the per-layer
+    // views of past_K_big once it's allocated by the gallocr.
+    const bool gpu_cache = impl_->cache->is_gpu();
+    {
+        static bool logged_once = false;
+        if (!logged_once) {
+            std::fprintf(stderr,
+                "[sp-engine:diag] decode() first call: gpu_cache=%d past_n=%d\n",
+                (int)gpu_cache, past_n);
+            logged_once = true;
+        }
+    }
+
     // Pull past K/V for every layer out of the cache up-front, into
     // host buffers we'll upload as input tensors. Index 0 = layer 0.
+    // Skipped when cache is GPU-resident.
     std::vector<std::vector<float>> past_K_all(impl_->n_layer);
     std::vector<std::vector<float>> past_V_all(impl_->n_layer);
-    if (past_n > 0) {
+    if (!gpu_cache && past_n > 0) {
         for (int L = 0; L < impl_->n_layer; ++L) {
             if (!impl_->cache->read(L, past_n, past_K_all[(size_t)L], past_V_all[(size_t)L])) {
                 std::fprintf(stderr, "[sp-engine] decode: cache read layer %d failed\n", L);
@@ -915,16 +941,40 @@ bool ForwardContext::decode(int32_t token_id,
     }
 
     // Per-layer past K/V inputs (only when past_n > 0).
+    //
+    // Step-2 batching: allocate ONE contiguous [hd, n_kv, past_n, n_layer]
+    // tensor for all layers' past K (same for V), expose per-layer
+    // [hd, n_kv, past_n] views into it. The upload then uses 2
+    // ggml_backend_tensor_set calls per decode step instead of
+    // 2 * n_layer. On Qwen3-8B (32 layers) that's 64 -> 2 cudaMemcpys.
+    ggml_tensor* past_K_big = nullptr;
+    ggml_tensor* past_V_big = nullptr;
     std::vector<ggml_tensor*> past_K_tens(impl_->n_layer, nullptr);
     std::vector<ggml_tensor*> past_V_tens(impl_->n_layer, nullptr);
     if (past_n > 0) {
+        past_K_big = ggml_new_tensor_4d(gctx, GGML_TYPE_F32, hd, n_kv, past_n, impl_->n_layer);
+        past_V_big = ggml_new_tensor_4d(gctx, GGML_TYPE_F32, hd, n_kv, past_n, impl_->n_layer);
+        ggml_set_input(past_K_big);
+        ggml_set_input(past_V_big);
+        const size_t layer_stride = (size_t)hd * n_kv * past_n * sizeof(float);
         for (int L = 0; L < impl_->n_layer; ++L) {
-            past_K_tens[(size_t)L] = ggml_new_tensor_3d(gctx, GGML_TYPE_F32, hd, n_kv, past_n);
-            past_V_tens[(size_t)L] = ggml_new_tensor_3d(gctx, GGML_TYPE_F32, hd, n_kv, past_n);
-            ggml_set_input(past_K_tens[(size_t)L]);
-            ggml_set_input(past_V_tens[(size_t)L]);
+            past_K_tens[(size_t)L] = ggml_view_3d(gctx, past_K_big, hd, n_kv, past_n,
+                                                   past_K_big->nb[1], past_K_big->nb[2],
+                                                   (size_t)L * layer_stride);
+            past_V_tens[(size_t)L] = ggml_view_3d(gctx, past_V_big, hd, n_kv, past_n,
+                                                   past_V_big->nb[1], past_V_big->nb[2],
+                                                   (size_t)L * layer_stride);
         }
     }
+
+    // Step-2 batching (output side): allocate ONE contiguous
+    // [hd, n_kv, 1, n_layer] tensor for all layers' new K (same for V),
+    // ggml_cpy each layer's k_cap/v_cap into its slice, mark only the
+    // big tensors as outputs. Download is then 2 ggml_backend_tensor_get
+    // calls instead of 2 * n_layer.
+    ggml_tensor* new_K_big = ggml_new_tensor_4d(gctx, GGML_TYPE_F32, hd, n_kv, 1, impl_->n_layer);
+    ggml_tensor* new_V_big = ggml_new_tensor_4d(gctx, GGML_TYPE_F32, hd, n_kv, 1, impl_->n_layer);
+    const size_t new_layer_stride = (size_t)hd * n_kv * 1 * sizeof(float);
 
     // Causal mask: 1 query × kv_total keys. Always present so the
     // graph topology is identical between Standard and ALiBi PE
@@ -935,8 +985,10 @@ bool ForwardContext::decode(int32_t token_id,
 
     ggml_tensor* x = ggml_get_rows(gctx, W->tok_embd, ids);
 
-    std::vector<ggml_tensor*> new_K(impl_->n_layer, nullptr);
-    std::vector<ggml_tensor*> new_V(impl_->n_layer, nullptr);
+    // Per-layer ggml_cpy results (kept so build_forward_expand reaches
+    // them — the graph needs the cpy ops as live nodes).
+    std::vector<ggml_tensor*> cpy_K(impl_->n_layer, nullptr);
+    std::vector<ggml_tensor*> cpy_V(impl_->n_layer, nullptr);
 
     ggml_tensor* x_layer0 = nullptr;
     for (int L = 0; L < impl_->n_layer; ++L) {
@@ -952,15 +1004,23 @@ bool ForwardContext::decode(int32_t token_id,
                                impl_->rope_freq_base, impl_->rope_freq_scale,
                                impl_->rms_norm_eps, impl_->rope_mode,
                                &k_cap, &v_cap);
-        ggml_set_output(k_cap);
-        ggml_set_output(v_cap);
-        new_K[(size_t)L] = k_cap;
-        new_V[(size_t)L] = v_cap;
+        // Copy this layer's capture into its slice of the batched
+        // output tensors. ggml_cpy returns the destination view.
+        ggml_tensor* dst_k = ggml_view_3d(gctx, new_K_big, hd, n_kv, 1,
+                                           new_K_big->nb[1], new_K_big->nb[2],
+                                           (size_t)L * new_layer_stride);
+        ggml_tensor* dst_v = ggml_view_3d(gctx, new_V_big, hd, n_kv, 1,
+                                           new_V_big->nb[1], new_V_big->nb[2],
+                                           (size_t)L * new_layer_stride);
+        cpy_K[(size_t)L] = ggml_cpy(gctx, k_cap, dst_k);
+        cpy_V[(size_t)L] = ggml_cpy(gctx, v_cap, dst_v);
         if (L == 0 && dbg_X_layer0) {
             x_layer0 = x;
             ggml_set_output(x_layer0);
         }
     }
+    ggml_set_output(new_K_big);
+    ggml_set_output(new_V_big);
 
     ggml_tensor* h = ggml_rms_norm(gctx, x, impl_->rms_norm_eps);
     h = ggml_mul(gctx, h, W->output_norm);
@@ -969,6 +1029,13 @@ bool ForwardContext::decode(int32_t token_id,
 
     ggml_cgraph* graph = ggml_new_graph(gctx);
     ggml_build_forward_expand(graph, logits_t);
+    // Wire every per-layer cpy into the graph so the backend actually
+    // executes the K/V write-into-slice (otherwise build_forward_expand
+    // on logits_t won't reach them — they're a side-effect path).
+    for (int L = 0; L < impl_->n_layer; ++L) {
+        ggml_build_forward_expand(graph, cpy_K[(size_t)L]);
+        ggml_build_forward_expand(graph, cpy_V[(size_t)L]);
+    }
     if (!ggml_gallocr_alloc_graph(impl_->allocr, graph)) {
         std::fprintf(stderr, "[sp-engine] decode: gallocr failed (past_n=%d)\n", past_n);
         ggml_free(gctx); return false;
@@ -983,13 +1050,56 @@ bool ForwardContext::decode(int32_t token_id,
         ggml_backend_tensor_set(freq_factors, impl_->freq_factors_vec.data(), 0,
                                 impl_->freq_factors_vec.size() * sizeof(float));
     }
+    // Past K/V upload. Two paths:
+    //   - gpu_cache: past_K_big / past_V_big were allocated by the
+    //     gallocr on the CUDA backend. Their ->data fields are device
+    //     pointers; we call KvCache::read_gpu per layer and have the
+    //     decompress kernels write directly into the ggml tensors'
+    //     VRAM slices — ZERO host↔device transfer. This is the step-3
+    //     payoff.
+    //   - host cache (step-2 fallback): pack n_layer host buffers into
+    //     one contiguous region and do 2 ggml_backend_tensor_set calls.
+    std::vector<float> packed_K, packed_V;
     if (past_n > 0) {
-        const size_t nbytes = (size_t)hd * n_kv * past_n * sizeof(float);
-        for (int L = 0; L < impl_->n_layer; ++L) {
-            ggml_backend_tensor_set(past_K_tens[(size_t)L],
-                                    past_K_all[(size_t)L].data(), 0, nbytes);
-            ggml_backend_tensor_set(past_V_tens[(size_t)L],
-                                    past_V_all[(size_t)L].data(), 0, nbytes);
+        if (gpu_cache) {
+            const size_t layer_stride = (size_t)hd * n_kv * past_n;
+            float* d_past_K = (float*)past_K_big->data;
+            float* d_past_V = (float*)past_V_big->data;
+            if (!d_past_K || !d_past_V) {
+                std::fprintf(stderr, "[sp-engine] decode(gpu): past_K_big has no device ptr\n");
+                ggml_free(gctx); return false;
+            }
+            for (int L = 0; L < impl_->n_layer; ++L) {
+                if (!impl_->cache->read_gpu(L, past_n,
+                                            d_past_K + (size_t)L * layer_stride,
+                                            d_past_V + (size_t)L * layer_stride)) {
+                    std::fprintf(stderr, "[sp-engine] decode(gpu): read_gpu layer %d failed\n", L);
+                    ggml_free(gctx); return false;
+                }
+            }
+#ifdef SP_ENGINE_WITH_CUDA
+            // Cache kernels ran on their own stream (sp_cuda_cache's
+            // stream). ggml's CUDA backend uses a different stream for
+            // graph compute. A device-wide sync here is the simplest
+            // way to guarantee the reads are visible to the graph.
+            cudaDeviceSynchronize();
+#endif
+        } else {
+            const size_t elems_per_layer = (size_t)hd * n_kv * past_n;
+            packed_K.resize(elems_per_layer * impl_->n_layer);
+            packed_V.resize(elems_per_layer * impl_->n_layer);
+            for (int L = 0; L < impl_->n_layer; ++L) {
+                std::memcpy(packed_K.data() + (size_t)L * elems_per_layer,
+                            past_K_all[(size_t)L].data(),
+                            elems_per_layer * sizeof(float));
+                std::memcpy(packed_V.data() + (size_t)L * elems_per_layer,
+                            past_V_all[(size_t)L].data(),
+                            elems_per_layer * sizeof(float));
+            }
+            ggml_backend_tensor_set(past_K_big, packed_K.data(), 0,
+                                    packed_K.size() * sizeof(float));
+            ggml_backend_tensor_set(past_V_big, packed_V.data(), 0,
+                                    packed_V.size() * sizeof(float));
         }
     }
     {
@@ -1005,16 +1115,52 @@ bool ForwardContext::decode(int32_t token_id,
         ggml_free(gctx); return false;
     }
 
-    // Pull new K/V from each layer and write to cache.
+    // New K/V write-back. Two paths:
+    //   - gpu_cache: skip the host download. new_K_big/new_V_big hold
+    //     the fresh single-token K/V in VRAM at stride kv_elems per
+    //     layer. Call KvCache::write_gpu for each layer directly off
+    //     the ggml tensor's device pointer — compress kernels run on
+    //     GPU without a host round-trip.
+    //   - host cache: batched download into 2 contiguous host buffers,
+    //     then per-layer host-side compress.
     const size_t kv_elems = (size_t)hd * n_kv;
-    std::vector<float> K_one(kv_elems), V_one(kv_elems);
-    for (int L = 0; L < impl_->n_layer; ++L) {
-        ggml_backend_tensor_get(new_K[(size_t)L], K_one.data(), 0, kv_elems * sizeof(float));
-        ggml_backend_tensor_get(new_V[(size_t)L], V_one.data(), 0, kv_elems * sizeof(float));
-        if (L == 0 && dbg_K_layer0) *dbg_K_layer0 = K_one;
-        if (!impl_->cache->write(L, past_n, 1, K_one.data(), V_one.data())) {
-            std::fprintf(stderr, "[sp-engine] decode: cache write layer %d failed\n", L);
+    if (gpu_cache) {
+        const float* d_new_K = (const float*)new_K_big->data;
+        const float* d_new_V = (const float*)new_V_big->data;
+        if (!d_new_K || !d_new_V) {
+            std::fprintf(stderr, "[sp-engine] decode(gpu): new_K_big has no device ptr\n");
             ggml_free(gctx); return false;
+        }
+        for (int L = 0; L < impl_->n_layer; ++L) {
+            if (!impl_->cache->write_gpu(L, past_n, 1,
+                                          d_new_K + (size_t)L * kv_elems,
+                                          d_new_V + (size_t)L * kv_elems)) {
+                std::fprintf(stderr, "[sp-engine] decode(gpu): write_gpu L=%d failed\n", L);
+                ggml_free(gctx); return false;
+            }
+        }
+        if (dbg_K_layer0) {
+            dbg_K_layer0->assign(kv_elems, 0.0f);
+            ggml_backend_tensor_get(new_K_big, dbg_K_layer0->data(), 0,
+                                    kv_elems * sizeof(float));
+        }
+    } else {
+        std::vector<float> packed_new_K(kv_elems * impl_->n_layer);
+        std::vector<float> packed_new_V(kv_elems * impl_->n_layer);
+        ggml_backend_tensor_get(new_K_big, packed_new_K.data(), 0,
+                                packed_new_K.size() * sizeof(float));
+        ggml_backend_tensor_get(new_V_big, packed_new_V.data(), 0,
+                                packed_new_V.size() * sizeof(float));
+        for (int L = 0; L < impl_->n_layer; ++L) {
+            const float* K_one = packed_new_K.data() + (size_t)L * kv_elems;
+            const float* V_one = packed_new_V.data() + (size_t)L * kv_elems;
+            if (L == 0 && dbg_K_layer0) {
+                dbg_K_layer0->assign(K_one, K_one + kv_elems);
+            }
+            if (!impl_->cache->write(L, past_n, 1, K_one, V_one)) {
+                std::fprintf(stderr, "[sp-engine] decode: cache write layer %d failed\n", L);
+                ggml_free(gctx); return false;
+            }
         }
     }
 
