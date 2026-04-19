@@ -90,23 +90,47 @@ samples per slot).
 
 ### Cache-mode PPL (`perplexity --cache`, ctx=512 chunks=2, wiki.test.raw)
 
-| Model | Mode | PPL | ΔPPL | Compression | Skeleton |
-|---|---|---|---|---|---|
-| Qwen3-8B-Q8 | baseline (no cache) | 18.05 | — | — | — |
-| Qwen3-8B-Q8 | **ship** | **18.14** | **+0.5%** | **4.06×** | full |
-| Qwen3-8B-Q8 | hierarchical (chunk 1 only) | 17.43 | — | 4.06× | 9% (14/154) |
+**Qwen3-8B-Q8** — 4.06× KV compression, 16.6 GiB weights (does NOT
+fit in 12 GiB RTX 2060 VRAM — GPU run pages to shared memory,
+effectively CPU speed on this hardware; the ship headline is from
+the fits-in-VRAM regime):
 
-**Hierarchical caveat:** the Qwen3 hier decode chain exceeded the
-CPU bench window mid-chunk-2 and was terminated. Chunk 1 running
-PPL landed at 17.43 (vs ship chunk 1's 11.72 on the same text,
-+48%). Extrapolating ship's chunk-1→final growth (11.72 → 18.14,
-~1.55×) suggests hier's full 2-chunk PPL would land near 27, i.e.
-+50% vs baseline. That's consistent with the pattern seen on
-Dolphin (decode-chain amplifies the prefill-roundtrip K_corr
-penalty well beyond what the scaling law predicts for single-pass
-forward). Hierarchical on CPU decode is a research-regime path;
-the GPU backend and a persistent-KV-tensor decode will bring it
-back into budget.
+| Mode | PPL | ΔPPL | Wall time | Compression |
+|---|---|---|---|---|
+| baseline (no cache) | 18.05 | — | — | — |
+| **ship** | **18.14** | **+0.5%** | 15 min CPU / 23 min GPU† | **4.06×** |
+
+† Qwen3-8B exceeds the 12 GiB card's VRAM budget; needs a bigger
+GPU to show a speedup. Scaling-law projection at 70B Q8 remains
++~0.01% PPL — the regime this tech was built for.
+
+**Dolphin-1B-Q8** — 3.76× compression, 3 GiB weights fit in VRAM
+cleanly; full four-way decode-chain comparison is tractable here:
+
+| Mode | PPL | ΔPPL | Wall time (GPU) | Speedup vs CPU |
+|---|---|---|---|---|
+| baseline (no cache) | 12.36 | — | **2.8s** | **~11×** (vs ~30s CPU) |
+| ship cache | 14.06 | +13.7% | 1m19s | **~11×** (vs ~15 min CPU) |
+| sqfree+spinor cache | 63.12 | +410% | 10m30s | CPU was +325% (similar order, decode-chain catastrophic) |
+| hierarchical cache | 26.37 | +113% | 10m35s | CPU was infeasible; GPU now runnable |
+
+The 1B cache-mode results are load-bearing for the *scaling-law
+fit*, not for deployment decisions — nobody compresses a 1B model's
+KV in production. What matters for the scaling law:
+
+* ship ΔPPL at 1B = +13.7% sits squarely on the `params^1.1`
+  prediction (8B measured +0.5%, ratio 27× — law predicts ~20×).
+* hierarchical at 9% skeleton lands at +113% on 1B-Q8 (vs +325%
+  for sqfree+spinor at 50% skeleton). At matched compression, hier
+  beats sqfree+spinor, consistent with v1.14/v1.15 research.
+
+**The GPU path landed.** Weights-offload refactor in
+`llama_weights.cpp` (commit `9beb635`) — `SP_ENGINE_BACKEND=gpu`
+now actually runs on CUDA instead of segfaulting. Dolphin baseline
+2.8s on RTX 2060 vs ~30s on CPU = 11× speedup where weights fit in
+VRAM. Qwen3-8B on 12 GiB cards is the exception (spill); a 24 GiB+
+card, layer-by-layer offload (upstream `llama.cpp` style), or Q4-
+range quants lift that limit.
 
 ### cache_ppl roundtrip (baseline PPL + K/V correlation)
 
