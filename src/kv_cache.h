@@ -114,10 +114,11 @@ public:
 
     // --- Cauchy reset system (decode-chain causal stability) ---
     //
-    // Three-layer navigation stack:
+    // Layers:
     //   Layer 1: Zeta Schedule  (pre-computed at init_cauchy)
-    //   Layer 2: Mertens Oracle (proactive, per-position)
-    //   Layer 3: Ricci Sentinel (reactive, fed per-write via head-0/layer-0)
+    //   Layer 2: Mertens Oracle (proactive, arithmetic per-position)
+    //   Layer 3: Ricci Sentinel (reactive drift, opt-in — measured
+    //            contribution is 0 incremental PPL on Qwen3-8B-Q8)
     //
     // init_cauchy() sets up the stack. cauchy_check(pos) is called per decode
     // step; it returns 0 = no reset, 1 = full reset needed, 2 = partial reset
@@ -125,9 +126,16 @@ public:
     // cauchy_record_reset(pos) to update the scheduler state.
     //
     // mode: 0=off, 1=fixed-N (reset every fixed_n tokens), 2=dynamic
-    // (Ricci+Mertens). params_b is the model size in billions, used to
-    // size the Ricci threshold (small models need tighter detection).
-    bool init_cauchy(int mode, int fixed_n, float params_b);
+    // (Mertens schedule). use_ricci: add the reactive drift sentinel
+    // alongside. params_b sizes the Ricci threshold (params_b^0.45); only
+    // relevant when use_ricci=true.
+    //
+    // Default use_ricci=false because the measured contribution of Ricci
+    // is 0 incremental PPL over Mertens-only on Qwen3-8B-Q8 ctx=1024
+    // (full system 11.92, Mertens-only 11.92, Ricci-only 12.02). Keep
+    // Ricci as an opt-in for research / drift diagnostics.
+    bool init_cauchy(int mode, int fixed_n, float params_b,
+                     bool use_ricci = false);
 
     // Check whether a reset should fire at this decode position.
     int  cauchy_check(int pos);
@@ -136,6 +144,15 @@ public:
     // values let the controller fire more often — useful with partial
     // reset, risky with full reset. Default is 64.
     void cauchy_set_cooldown(int n);
+
+    // Ablation hook: free the Mertens oracle and null its pointer in
+    // the controller, so mode 2 behaves as Ricci-only. Call after
+    // init_cauchy. No-op if Mertens was never allocated.
+    void cauchy_disable_mertens();
+
+    // Symmetric ablation: free the Ricci sentinel so mode 2 behaves
+    // as Mertens-only. Call after init_cauchy.
+    void cauchy_disable_ricci();
 
     // Manual feed path for the Ricci sentinel (when the caller wants to
     // feed a VHT2-domain K vector from some place other than the normal

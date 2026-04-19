@@ -74,6 +74,18 @@ struct Config {
     // ctx=1024: warmup=64 (best PPL recovery), warmup=128 (same PPL,
     // fewer resets). warmup=256 starves the mechanism.
     int         cauchy_warmup   = 64;
+    // Opt-in the Ricci drift sentinel. Default off — measured to
+    // contribute 0 incremental PPL on Qwen3-8B-Q8 ctx=1024
+    // (full system 11.92 ≡ Mertens-only 11.92; Ricci-only 12.02).
+    // Enable for drift-diagnostic research.
+    bool        cauchy_use_ricci = false;
+    // Ablation: when true, Cauchy mode 2 skips the Mertens
+    // (proactive zeta-schedule) layer and runs Ricci-only. Implies
+    // cauchy_use_ricci. Useful for isolating the reactive layer.
+    bool        cauchy_ricci_only = false;
+    // Ablation flag kept for backward compat — this is now the
+    // default behavior (no Ricci, Mertens only).
+    bool        cauchy_mertens_only = false;
     float       params_b        = 0.0f;
 };
 

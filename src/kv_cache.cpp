@@ -819,31 +819,34 @@ bool KvCache::read_gpu(int, int, float*, float*) const {
 
 // ── Cauchy reset system (decode-chain causal stability) ─────────────
 
-bool KvCache::init_cauchy(int mode, int fixed_n, float params_b) {
+bool KvCache::init_cauchy(int mode, int fixed_n, float params_b, bool use_ricci) {
     if (mode < 0 || mode > 2) return false;
     if (mode == 0) return true;  // off is a legal no-op
 
-    // Mode 2 needs both Ricci (reactive) and Mertens (proactive) layers.
+    // Mode 2 (dynamic): Mertens schedule is always allocated; Ricci is
+    // opt-in (default off — empirically contributes 0 incremental PPL on
+    // Qwen3-8B-Q8 ctx=1024 ablations).
     // Mode 1 (fixed-N) needs neither — just a counter.
     if (mode == 2) {
-        impl_->ricci = new sp_ricci_sentinel_t{};
-        // Ricci monitors the p=3 band of whichever compress path is active.
-        // For hier, use the skeleton's band config (that's what's actually
-        // quantised on-path); for sqfree use the skeleton K bands; for ship
-        // use the full K bands.
-        const sp_band_config_t* bc = nullptr;
-        if (impl_->hier_inited) {
-            bc = &impl_->hier.predictors[0].skel_bands;
-        } else if (impl_->sqfree) {
-            bc = &impl_->sq.k_bands;
-        } else {
-            bc = &impl_->shadow.k_bands;
-        }
-        if (sp_ricci_init(impl_->ricci, bc, params_b) != 0) {
-            delete impl_->ricci;
-            impl_->ricci = nullptr;
-            std::fprintf(stderr, "[sp-engine] Cauchy: ricci_init failed\n");
-            return false;
+        if (use_ricci) {
+            impl_->ricci = new sp_ricci_sentinel_t{};
+            // Ricci monitors the p=3 band of whichever compress path is
+            // active. For hier use the skeleton's band config; for sqfree
+            // use the skeleton K bands; for ship use the full K bands.
+            const sp_band_config_t* bc = nullptr;
+            if (impl_->hier_inited) {
+                bc = &impl_->hier.predictors[0].skel_bands;
+            } else if (impl_->sqfree) {
+                bc = &impl_->sq.k_bands;
+            } else {
+                bc = &impl_->shadow.k_bands;
+            }
+            if (sp_ricci_init(impl_->ricci, bc, params_b) != 0) {
+                delete impl_->ricci;
+                impl_->ricci = nullptr;
+                std::fprintf(stderr, "[sp-engine] Cauchy: ricci_init failed\n");
+                return false;
+            }
         }
 
         impl_->mertens = new sp_mertens_oracle_t{};
@@ -851,7 +854,7 @@ bool KvCache::init_cauchy(int mode, int fixed_n, float params_b) {
             delete impl_->mertens;
             impl_->mertens = nullptr;
             std::fprintf(stderr, "[sp-engine] Cauchy: mertens_init failed "
-                         "(continuing with Ricci only)\n");
+                         "(mode 2 degrades to fixed-N fallback)\n");
         }
     }
 
@@ -881,6 +884,28 @@ void KvCache::cauchy_set_cooldown(int n) {
     if (!impl_->cauchy_inited) return;
     if (n < 1) n = 1;
     impl_->cauchy.partial_window = n;
+}
+
+void KvCache::cauchy_disable_mertens() {
+    if (!impl_->cauchy_inited) return;
+    if (impl_->mertens) {
+        delete impl_->mertens;
+        impl_->mertens = nullptr;
+        impl_->cauchy.mertens = nullptr;
+        std::fprintf(stderr, "[sp-engine] Cauchy: Mertens oracle disabled "
+                     "(Ricci-only ablation)\n");
+    }
+}
+
+void KvCache::cauchy_disable_ricci() {
+    if (!impl_->cauchy_inited) return;
+    if (impl_->ricci) {
+        delete impl_->ricci;
+        impl_->ricci = nullptr;
+        impl_->cauchy.ricci = nullptr;
+        std::fprintf(stderr, "[sp-engine] Cauchy: Ricci sentinel disabled "
+                     "(Mertens-only ablation)\n");
+    }
 }
 
 void KvCache::ricci_feed(const float* vht2_coeffs, int hd) {

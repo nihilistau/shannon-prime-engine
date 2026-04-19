@@ -120,7 +120,11 @@ static void usage(const char* prog) {
         "  --cauchy-mode <n>     0=off, 1=fixed-N, 2=dynamic (Ricci+Mertens)\n"
         "  --cauchy-fixed-n <n>  reset every N tokens (mode 1, default 512)\n"
         "  --cauchy-cooldown <n> min positions between resets (default 64)\n"
-        "  --cauchy-warmup <n>   suppress resets for first N decode positions (default 0)\n"
+        "  --cauchy-warmup <n>   suppress resets for first N decode positions (default 64)\n"
+        "  --cauchy-use-ricci    also enable reactive Ricci drift sentinel\n"
+        "                        (default off — empirically contributes 0 extra PPL)\n"
+        "  --cauchy-ricci-only   mode 2 without Mertens schedule (Ricci drift only, ablation)\n"
+        "  --cauchy-mertens-only mode 2 without Ricci sentinel (now the default)\n"
         "  --params-b <f>        model size in billions (tunes Ricci threshold)\n"
         "\n", prog);
 }
@@ -174,6 +178,7 @@ int main(int argc, char** argv) {
             else if (a == "--cauchy-mode"     && i + 1 < argc) cc.cauchy_mode     = std::atoi(argv[++i]);
             else if (a == "--cauchy-fixed-n"  && i + 1 < argc) cc.cauchy_fixed_n  = std::atoi(argv[++i]);
             else if (a == "--cauchy-cooldown" && i + 1 < argc) cc.cauchy_cooldown = std::atoi(argv[++i]);
+            else if (a == "--cauchy-use-ricci")                cc.cauchy_use_ricci = true;
             else if (a == "--params-b"        && i + 1 < argc) cc.params_b        = (float)std::atof(argv[++i]);
             else if (a.size() >= 2 && a[0] == '-' && a[1] == '-') {
                 std::fprintf(stderr, "cache_ppl: unknown flag %s\n", a.c_str()); return 2;
@@ -236,7 +241,8 @@ int main(int argc, char** argv) {
         // Ricci sentinel can learn its p=3 baseline from the same vectors
         // used to calibrate the main cache. A no-op when cauchy_mode=0.
         if (cc.cauchy_mode > 0) {
-            kv->init_cauchy(cc.cauchy_mode, cc.cauchy_fixed_n, cc.params_b);
+            kv->init_cauchy(cc.cauchy_mode, cc.cauchy_fixed_n, cc.params_b,
+                             cc.cauchy_use_ricci);
             kv->cauchy_set_cooldown(cc.cauchy_cooldown);
         }
 
@@ -398,8 +404,11 @@ int main(int argc, char** argv) {
             else if (a == "--cauchy-mode"     && i + 1 < argc) pc.cauchy_mode     = std::atoi(argv[++i]);
             else if (a == "--cauchy-fixed-n"  && i + 1 < argc) pc.cauchy_fixed_n  = std::atoi(argv[++i]);
             else if (a == "--cauchy-cooldown" && i + 1 < argc) pc.cauchy_cooldown = std::atoi(argv[++i]);
-            else if (a == "--cauchy-warmup"   && i + 1 < argc) pc.cauchy_warmup   = std::atoi(argv[++i]);
-            else if (a == "--params-b"        && i + 1 < argc) pc.params_b        = (float)std::atof(argv[++i]);
+            else if (a == "--cauchy-warmup"     && i + 1 < argc) pc.cauchy_warmup   = std::atoi(argv[++i]);
+            else if (a == "--cauchy-use-ricci")                  pc.cauchy_use_ricci    = true;
+            else if (a == "--cauchy-ricci-only")                 pc.cauchy_ricci_only   = true;
+            else if (a == "--cauchy-mertens-only")               pc.cauchy_mertens_only = true;
+            else if (a == "--params-b"          && i + 1 < argc) pc.params_b        = (float)std::atof(argv[++i]);
             else if (a.size() >= 2 && a[0] == '-' && a[1] == '-') {
                 std::fprintf(stderr, "perplexity: unknown flag %s\n", a.c_str()); return 2;
             }
@@ -501,8 +510,17 @@ int main(int argc, char** argv) {
             // prefill so the Ricci sentinel gets calibrated on the same
             // vectors that build the cache's masks.
             if (pc.cauchy_mode > 0) {
-                kv->init_cauchy(pc.cauchy_mode, pc.cauchy_fixed_n, pc.params_b);
+                // Ricci sentinel is opt-in now (measured 0 incremental
+                // PPL contribution over Mertens-only). Enable when the
+                // user explicitly asks for it or for the Ricci-only
+                // ablation path.
+                const bool use_ricci = pc.cauchy_use_ricci || pc.cauchy_ricci_only;
+                kv->init_cauchy(pc.cauchy_mode, pc.cauchy_fixed_n,
+                                 pc.params_b, use_ricci);
                 kv->cauchy_set_cooldown(pc.cauchy_cooldown);
+                if (pc.cauchy_ricci_only)   kv->cauchy_disable_mertens();
+                // cauchy_mertens_only is now the default — still accept
+                // the flag for script compatibility.
             }
         }
 
