@@ -391,6 +391,9 @@ int main(int argc, char** argv) {
             else if (a == "--hier-level"    && i + 1 < argc) pc.hier_level    = std::atoi(argv[++i]);
             else if (a == "--hier-res-bits" && i + 1 < argc) pc.hier_res_bits = std::atoi(argv[++i]);
             else if (a == "--hier-skel-bits"&& i + 1 < argc) pc.hier_skel_bits= argv[++i];
+            else if (a == "--cauchy-mode"   && i + 1 < argc) pc.cauchy_mode    = std::atoi(argv[++i]);
+            else if (a == "--cauchy-fixed-n"&& i + 1 < argc) pc.cauchy_fixed_n = std::atoi(argv[++i]);
+            else if (a == "--params-b"      && i + 1 < argc) pc.params_b       = (float)std::atof(argv[++i]);
             else if (a.size() >= 2 && a[0] == '-' && a[1] == '-') {
                 std::fprintf(stderr, "perplexity: unknown flag %s\n", a.c_str()); return 2;
             }
@@ -486,6 +489,14 @@ int main(int argc, char** argv) {
             if (!kv) { std::fprintf(stderr, "KvCache::create failed\n"); return 5; }
             std::fprintf(stderr, "[sp-engine] %s%s\n", kv->describe().c_str(),
                          kv->is_gpu() ? " [GPU-resident]" : "");
+
+            // Cauchy reset system. Enables `cauchy_check(pos)` polling in
+            // the decode loop below. Must be initialised BEFORE the first
+            // prefill so the Ricci sentinel gets calibrated on the same
+            // vectors that build the cache's masks.
+            if (pc.cauchy_mode > 0) {
+                kv->init_cauchy(pc.cauchy_mode, pc.cauchy_fixed_n, pc.params_b);
+            }
         }
 
         std::fprintf(stderr,
@@ -529,6 +540,7 @@ int main(int argc, char** argv) {
                     total_evalled += 1;
                 };
                 score(last_logits.data(), chunk[(size_t)(first_eval + 1)]);
+                int chunk_resets = 0;
                 for (int i = first_eval + 1; i < n_ctx - 1; ++i) {
                     std::vector<float> dlogits;
                     if (!fc->decode(chunk[(size_t)i], dlogits, n_vocab_out)) {
@@ -536,10 +548,51 @@ int main(int argc, char** argv) {
                         return 7;
                     }
                     score(dlogits.data(), chunk[(size_t)(i + 1)]);
+
+                    // Cauchy reset: at this position, does the controller
+                    // recommend refreshing the cache? 1=full, 2=partial
+                    // (partial is ship-path downgrades to full for now —
+                    // hierarchical partial-reset needs the shadow drop).
+                    //
+                    // Full reset: rebind cache (zeroes kv_pos, keeps
+                    // calibrated masks), re-prefill tokens [0..i+1] from
+                    // the original token stream. This pays a full
+                    // forward_full but gives us a clean ground-truth
+                    // cache for all subsequent decode steps.
+                    if (pc.cauchy_mode > 0) {
+                        int r = kv->cauchy_check(i);
+                        if (r > 0) {
+                            // After decode(chunk[i]): kv_pos = i+1, cache
+                            // holds positions [0..i]. Refill `i+1` tokens
+                            // (chunk[0..i+1)) so prefill leaves kv_pos at
+                            // i+1 exactly — matching what the next iteration
+                            // expects. Off-by-one here corrupts the cache
+                            // layout and inverts the intended benefit.
+                            std::vector<int32_t> refill(chunk.begin(),
+                                                         chunk.begin() + i + 1);
+                            fc->bind_cache(kv.get());
+                            std::vector<float> refill_logits;
+                            int nv = 0;
+                            if (!fc->prefill(refill, refill_logits, nv)) {
+                                std::fprintf(stderr,
+                                    "cauchy reset: re-prefill failed c=%d pos=%d\n",
+                                    c, i);
+                                return 7;
+                            }
+                            kv->cauchy_record_reset(i);
+                            chunk_resets++;
+                        }
+                    }
                 }
                 const double running_ppl = std::exp(total_nll / (double)total_evalled);
-                std::fprintf(stderr, "  chunk %3d/%d  PPL_running=%.4f  (cache)\n",
-                             c + 1, eval_chunks, running_ppl);
+                if (pc.cauchy_mode > 0) {
+                    std::fprintf(stderr,
+                        "  chunk %3d/%d  PPL_running=%.4f  (cache)  cauchy_resets=%d\n",
+                        c + 1, eval_chunks, running_ppl, chunk_resets);
+                } else {
+                    std::fprintf(stderr, "  chunk %3d/%d  PPL_running=%.4f  (cache)\n",
+                                 c + 1, eval_chunks, running_ppl);
+                }
                 continue;
             }
 
@@ -568,6 +621,10 @@ int main(int argc, char** argv) {
         const double ppl      = std::exp(mean_nll);
         std::printf("PPL = %.4f  (over %lld tokens, %d chunks at ctx=%d)\n",
                     ppl, total_evalled, eval_chunks, n_ctx);
+        if (use_cache && pc.cauchy_mode > 0 && kv) {
+            kv->cauchy_print_stats();
+            std::printf("Ricci drift (final) = %.6f\n", kv->ricci_drift());
+        }
         return 0;
     }
 
