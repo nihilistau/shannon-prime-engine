@@ -115,6 +115,11 @@ static void usage(const char* prog) {
         "  --pe-mode <name>     standard|primepe|primepe_alibi|alibi (default: standard)\n"
         "  --pe-alpha <f>       blend factor 0..1 (default: 0.0 = identity)\n"
         "  --pe-tier  <n>       0 = composite lattice, 1 = prime generators\n"
+        "\n"
+        "Cauchy reset system (decode-chain causal stability, cache_ppl):\n"
+        "  --cauchy-mode <n>    0=off, 1=fixed-N, 2=dynamic (Ricci+Mertens)\n"
+        "  --cauchy-fixed-n <n> reset every N tokens (mode 1, default 512)\n"
+        "  --params-b <f>       model size in billions (tunes Ricci threshold)\n"
         "\n", prog);
 }
 
@@ -164,6 +169,9 @@ int main(int argc, char** argv) {
             }
             else if (a == "--pe-alpha"       && i + 1 < argc) cc.pe_alpha = (float)std::atof(argv[++i]);
             else if (a == "--pe-tier"        && i + 1 < argc) cc.pe_tier  = std::atoi(argv[++i]);
+            else if (a == "--cauchy-mode"    && i + 1 < argc) cc.cauchy_mode    = std::atoi(argv[++i]);
+            else if (a == "--cauchy-fixed-n" && i + 1 < argc) cc.cauchy_fixed_n = std::atoi(argv[++i]);
+            else if (a == "--params-b"       && i + 1 < argc) cc.params_b       = (float)std::atof(argv[++i]);
             else if (a.size() >= 2 && a[0] == '-' && a[1] == '-') {
                 std::fprintf(stderr, "cache_ppl: unknown flag %s\n", a.c_str()); return 2;
             }
@@ -220,6 +228,13 @@ int main(int argc, char** argv) {
         auto kv = sp::engine::KvCache::create(n_layer, n_head_kv, head_dim, n_ctx, cc);
         if (!kv) { std::fprintf(stderr, "KvCache::create failed\n"); return 7; }
         std::fprintf(stderr, "[sp-engine] %s\n", kv->describe().c_str());
+
+        // Init the Cauchy reset system BEFORE the calibration pass so the
+        // Ricci sentinel can learn its p=3 baseline from the same vectors
+        // used to calibrate the main cache. A no-op when cauchy_mode=0.
+        if (cc.cauchy_mode > 0) {
+            kv->init_cauchy(cc.cauchy_mode, cc.cauchy_fixed_n, cc.params_b);
+        }
 
         auto corr = [](const float* a, const float* b, int len) {
             double ma = 0, mb = 0;
@@ -337,6 +352,10 @@ int main(int argc, char** argv) {
         std::printf("Baseline PPL = %.4f  (over %lld tokens, %d chunks at ctx=%d)\n",
                     ppl, total_evalled, eval_chunks, n_ctx);
         std::printf("Cache K_corr = %.6f  V_corr = %.6f\n", mean_kc, mean_vc);
+        if (cc.cauchy_mode > 0) {
+            kv->cauchy_print_stats();
+            std::printf("Ricci drift  = %.6f\n", kv->ricci_drift());
+        }
         std::printf("Compression  = %.2fx\n", kv->compression_ratio());
 
         // Predicted PPL delta via the scaling law:

@@ -52,6 +52,17 @@ struct Config {
     PeMode      pe_mode  = PeMode::Standard;
     float       pe_alpha = 0.17f;   // blend factor 0..1; paper's sweet spot 0.15–0.22
     int         pe_tier  = 0;       // 0 = composite lattice, 1 = prime generators
+
+    // Cauchy reset system — decode-chain causal stability.
+    //   mode 0 = off (default)
+    //   mode 1 = fixed-N resets every `cauchy_fixed_n` tokens
+    //   mode 2 = dynamic: Ricci sentinel (p=3 band energy drift) + Mertens
+    //           oracle (zeta-zero-scheduled proactive reset points)
+    // params_b is the model size in billions — used to tune Ricci threshold
+    // (small models need tighter detection).
+    int         cauchy_mode    = 0;
+    int         cauchy_fixed_n = 512;
+    float       params_b       = 0.0f;
 };
 
 class Engine {

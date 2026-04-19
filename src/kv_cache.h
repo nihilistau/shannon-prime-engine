@@ -112,6 +112,41 @@ public:
     float compression_ratio() const;
     std::string describe()    const;
 
+    // --- Cauchy reset system (decode-chain causal stability) ---
+    //
+    // Three-layer navigation stack:
+    //   Layer 1: Zeta Schedule  (pre-computed at init_cauchy)
+    //   Layer 2: Mertens Oracle (proactive, per-position)
+    //   Layer 3: Ricci Sentinel (reactive, fed per-write via head-0/layer-0)
+    //
+    // init_cauchy() sets up the stack. cauchy_check(pos) is called per decode
+    // step; it returns 0 = no reset, 1 = full reset needed, 2 = partial reset
+    // OK (hierarchical only). After performing a reset, call
+    // cauchy_record_reset(pos) to update the scheduler state.
+    //
+    // mode: 0=off, 1=fixed-N (reset every fixed_n tokens), 2=dynamic
+    // (Ricci+Mertens). params_b is the model size in billions, used to
+    // size the Ricci threshold (small models need tighter detection).
+    bool init_cauchy(int mode, int fixed_n, float params_b);
+
+    // Check whether a reset should fire at this decode position.
+    int  cauchy_check(int pos);
+
+    // Manual feed path for the Ricci sentinel (when the caller wants to
+    // feed a VHT2-domain K vector from some place other than the normal
+    // write() call — e.g. per-token during decode without going through
+    // the cache). Safe to call when Cauchy is off (no-op).
+    void ricci_feed(const float* vht2_coeffs, int hd);
+
+    // Record that a reset was performed at `pos`.
+    void cauchy_record_reset(int pos);
+
+    // Current Ricci drift |1 - p3_ema|; 0 if not initialized.
+    double ricci_drift() const;
+
+    // Print Cauchy system stats to stderr.
+    void cauchy_print_stats() const;
+
 private:
     KvCache();
     struct Impl;

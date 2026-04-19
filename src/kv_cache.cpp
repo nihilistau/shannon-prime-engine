@@ -87,6 +87,14 @@ struct KvCache::Impl {
     bool                   cuda_sqfree_inited = false;
 #endif
 
+    // Cauchy reset system (decode-chain causal stability). Non-null when
+    // init_cauchy() was called with mode > 0.
+    sp_ricci_sentinel_t  *ricci   = nullptr;
+    sp_mertens_oracle_t  *mertens = nullptr;
+    sp_cauchy_ctrl_t      cauchy{};
+    bool                  cauchy_inited = false;
+    std::vector<float>    vht2_scratch;   // head_dim-sized scratch for Ricci feed
+
     ~Impl() {
         if (shadow_inited) {
             // We allocated k_cache/v_cache slot pointers + per-slot buffers.
@@ -119,6 +127,11 @@ struct KvCache::Impl {
             sp_cuda_sqfree_cache_free(&cuda_sqfree_cache);
         }
 #endif
+        // Cauchy system components.
+        delete ricci;
+        delete mertens;
+        ricci   = nullptr;
+        mertens = nullptr;
     }
 };
 
@@ -256,6 +269,23 @@ bool KvCache::write(int layer, int pos_offset, int n_tokens,
     const int H  = impl_->n_head_kv;
     const int hd = impl_->head_dim;
 
+    // Ricci sentinel feed. We sample head-0 / layer-0 once per position —
+    // p=3 band energy is structurally consistent across heads, so one
+    // probe is enough and keeps this off the GPU hot path. Fires only
+    // when the sentinel has been calibrated (mode 2, post-calibration).
+    if (impl_->ricci && impl_->ricci->calibrated && layer == 0) {
+        if ((int)impl_->vht2_scratch.size() < hd) {
+            impl_->vht2_scratch.assign((size_t)hd, 0.0f);
+        }
+        for (int q = 0; q < n_tokens; ++q) {
+            const float* k_vec = K_flat + (size_t)(q * H + 0) * hd;
+            std::memcpy(impl_->vht2_scratch.data(), k_vec,
+                        (size_t)hd * sizeof(float));
+            sp_vht2_forward_f32(impl_->vht2_scratch.data(), hd);
+            sp_ricci_check(impl_->ricci, impl_->vht2_scratch.data(), hd);
+        }
+    }
+
 #ifdef SP_ENGINE_WITH_CUDA
     // GPU-resident cache (ship or sqfree): stage host vectors to device
     // once, then call write_gpu which loops per-slot compress on GPU.
@@ -382,6 +412,22 @@ bool KvCache::calibrate_begin() {
 }
 
 void KvCache::calibrate_feed(const float* vec) {
+    // Ricci sentinel also needs calibration to learn its p=3 baseline.
+    // Fed from the same raw vectors used for cache calibration — works
+    // when init_cauchy was called BEFORE the calibration pass (otherwise
+    // ricci stays uncalibrated and sp_ricci_check returns false).
+    if (impl_->ricci && !impl_->ricci->calibrated) {
+        const int hd = impl_->head_dim;
+        if ((int)impl_->vht2_scratch.size() < hd) {
+            impl_->vht2_scratch.assign((size_t)hd, 0.0f);
+        }
+        std::memcpy(impl_->vht2_scratch.data(), vec,
+                    (size_t)hd * sizeof(float));
+        sp_vht2_forward_f32(impl_->vht2_scratch.data(), hd);
+        sp_ricci_calibrate_feed(impl_->ricci,
+                                 impl_->vht2_scratch.data(), hd);
+    }
+
     // Shared-mask feed: sqfree and shadow accumulate globally.
     // NOT valid for hierarchical — use the per-slot overload instead.
     if (impl_->sqfree) {
@@ -448,6 +494,15 @@ bool KvCache::calibrate_end() {
     }
     if (rc == 0) {
         impl_->calibrated = true;
+        // Finalize Ricci sentinel calibration if it was fed.
+        if (impl_->ricci && !impl_->ricci->calibrated &&
+            impl_->ricci->calib_n > 0) {
+            sp_ricci_calibrate_end(impl_->ricci);
+            std::fprintf(stderr, "[sp-engine] Ricci sentinel calibrated: "
+                         "p3_energy=%.6f threshold=%.4f\n",
+                         impl_->ricci->p3_energy_calibrated,
+                         impl_->ricci->metric_criticality);
+        }
 #ifdef SP_ENGINE_WITH_CUDA
         // GPU-domain calibration produces a correct variance-ranked
         // order (K_corr parity with CPU on synthetic data: 0.9925
@@ -761,5 +816,92 @@ bool KvCache::read_gpu(int, int, float*, float*) const {
     return false;
 }
 #endif
+
+// ── Cauchy reset system (decode-chain causal stability) ─────────────
+
+bool KvCache::init_cauchy(int mode, int fixed_n, float params_b) {
+    if (mode < 0 || mode > 2) return false;
+    if (mode == 0) return true;  // off is a legal no-op
+
+    // Mode 2 needs both Ricci (reactive) and Mertens (proactive) layers.
+    // Mode 1 (fixed-N) needs neither — just a counter.
+    if (mode == 2) {
+        impl_->ricci = new sp_ricci_sentinel_t{};
+        // Ricci monitors the p=3 band of whichever compress path is active.
+        // For hier, use the skeleton's band config (that's what's actually
+        // quantised on-path); for sqfree use the skeleton K bands; for ship
+        // use the full K bands.
+        const sp_band_config_t* bc = nullptr;
+        if (impl_->hier_inited) {
+            bc = &impl_->hier.predictors[0].skel_bands;
+        } else if (impl_->sqfree) {
+            bc = &impl_->sq.k_bands;
+        } else {
+            bc = &impl_->shadow.k_bands;
+        }
+        if (sp_ricci_init(impl_->ricci, bc, params_b) != 0) {
+            delete impl_->ricci;
+            impl_->ricci = nullptr;
+            std::fprintf(stderr, "[sp-engine] Cauchy: ricci_init failed\n");
+            return false;
+        }
+
+        impl_->mertens = new sp_mertens_oracle_t{};
+        if (sp_mertens_init(impl_->mertens, impl_->max_seq) != 0) {
+            delete impl_->mertens;
+            impl_->mertens = nullptr;
+            std::fprintf(stderr, "[sp-engine] Cauchy: mertens_init failed "
+                         "(continuing with Ricci only)\n");
+        }
+    }
+
+    sp_cauchy_init(&impl_->cauchy, mode, fixed_n, impl_->ricci, impl_->mertens);
+    impl_->cauchy_inited = true;
+
+    // Pre-size the VHT2 scratch used by the ricci-feed path in write().
+    if (impl_->ricci) {
+        impl_->vht2_scratch.assign((size_t)impl_->head_dim, 0.0f);
+    }
+
+    std::fprintf(stderr, "[sp-engine] Cauchy system initialized: mode=%d "
+                 "fixed_n=%d ricci=%s mertens=%s params_b=%.2f\n",
+                 mode, fixed_n,
+                 impl_->ricci ? "yes" : "no",
+                 impl_->mertens ? "yes" : "no",
+                 (double)params_b);
+    return true;
+}
+
+int KvCache::cauchy_check(int pos) {
+    if (!impl_->cauchy_inited) return 0;
+    return sp_cauchy_check(&impl_->cauchy, pos);
+}
+
+void KvCache::ricci_feed(const float* vht2_coeffs, int hd) {
+    if (!impl_->ricci) return;
+    sp_ricci_check(impl_->ricci, vht2_coeffs, hd);
+}
+
+void KvCache::cauchy_record_reset(int pos) {
+    if (!impl_->cauchy_inited) return;
+    sp_cauchy_record_reset(&impl_->cauchy, pos);
+}
+
+double KvCache::ricci_drift() const {
+    if (!impl_->ricci) return 0.0;
+    return sp_ricci_drift(impl_->ricci);
+}
+
+void KvCache::cauchy_print_stats() const {
+    if (!impl_->cauchy_inited) return;
+    sp_cauchy_print_stats(&impl_->cauchy);
+    if (impl_->ricci) {
+        std::fprintf(stderr, "[sp-engine] Ricci drift: %.6f  "
+                     "threshold: %.4f  samples: %d\n",
+                     sp_ricci_drift(impl_->ricci),
+                     impl_->ricci->metric_criticality,
+                     impl_->ricci->n_samples);
+    }
+}
 
 } // namespace sp::engine
