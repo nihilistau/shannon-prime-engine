@@ -646,15 +646,15 @@ std::unique_ptr<KvCache> KvCache::create_gpu(int n_layer, int n_head_kv,
                              "path is not yet GPU-resident (still CPU)\n");
         return nullptr;
     }
-    // sqfree MVP: GPU-resident compress/decompress, no spinor yet.
-    const bool is_sqfree = cfg.sqfree;
-    if (cfg.spinor) {
-        // spinor implies sqfree. Full-scope, not MVP — fall back so caller
-        // can retry with the host cache path.
-        std::fprintf(stderr, "[sp-engine] KvCache::create_gpu: sqfree+spinor "
-                             "not yet GPU-resident (MVP lands sqfree only; "
-                             "spinor is the next-session follow-up)\n");
-        return nullptr;
+    // sqfree is GPU-resident; spinor lands as a use_spinor flag into
+    // sp_cuda_sqfree_cache_init (wired through kernel_spinor_extract/
+    // kernel_spinor_reconstruct on the device side).
+    const bool is_sqfree = cfg.sqfree || cfg.spinor;
+    if (cfg.spinor && !cfg.sqfree) {
+        // spinor implies sqfree in the compression stack; document the
+        // coercion instead of silently fixing the config.
+        std::fprintf(stderr, "[sp-engine] KvCache::create_gpu: --spinor "
+                             "implies --path=sqfree; enabling sqfree path\n");
     }
     if (n_layer <= 0 || n_head_kv <= 0 || head_dim <= 0 || max_seq <= 0) {
         std::fprintf(stderr, "[sp-engine] KvCache::create_gpu: bad dims\n");
@@ -689,7 +689,8 @@ std::unique_ptr<KvCache> KvCache::create_gpu(int n_layer, int n_head_kv,
         const int rbits = (cfg.residual_bits >= 1 && cfg.residual_bits <= 4)
                           ? cfg.residual_bits : 3;
         if (sp_cuda_sqfree_cache_init(&kv->impl_->cuda_sqfree_cache, sc,
-                                       max_seq, rbits, /*use_spinor=*/0,
+                                       max_seq, rbits,
+                                       /*use_spinor=*/cfg.spinor ? 1 : 0,
                                        stream) != 0) {
             std::fprintf(stderr, "[sp-engine] KvCache::create_gpu: "
                          "sp_cuda_sqfree_cache_init failed\n");
