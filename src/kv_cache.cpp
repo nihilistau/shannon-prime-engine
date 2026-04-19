@@ -536,6 +536,75 @@ bool KvCache::calibrate_end() {
                          "%d-entry variance-ranked (GPU-domain) order to "
                          "GPU d_mobius_order\n", hd);
         }
+
+        // Sqfree calibration sync to GPU.
+        //
+        // sp_sqfree_calibrate_end rebuilds impl_->sq.mask with a new
+        // variance-ranked Knight mask (new skeleton_idx, residual_idx,
+        // csr_offsets, csr_skel_slot, csr_mu_sign — and potentially a
+        // different n_terms). The GPU-resident sqfree cache's mask arrays
+        // were uploaded at init with the static squarefree-first ordering
+        // and are now out of date. Re-upload from impl_->sq.mask.
+        //
+        // Sqfree calibration feeds raw K vectors through the CPU pad +
+        // Vilenkin pipeline to accumulate variance. Since the sqfree pad
+        // + staged Vilenkin transform is computed on the pad_dim basis
+        // (not the p=2 butterfly), CPU and GPU versions of this particular
+        // transform are closer to bit-identical than the hd=128 Hadamard
+        // butterfly was. No asymmetric-calibration regression expected here.
+        if (impl_->cuda_sqfree_inited && impl_->sq_inited) {
+            cudaStream_t ss = (cudaStream_t)impl_->cuda_sqfree_cache.stream;
+            const sp_knight_mask_t* m = &impl_->sq.mask;
+
+            // sk_k / n_res assumed stable (always pad_dim/2 / pad_dim-sk_k).
+            // n_terms may shift — handle by reallocating d_csr_* when it does.
+            if (m->n_terms != impl_->cuda_sqfree_cache.n_terms) {
+                if (impl_->cuda_sqfree_cache.d_csr_skel_slot)
+                    cudaFree(impl_->cuda_sqfree_cache.d_csr_skel_slot);
+                if (impl_->cuda_sqfree_cache.d_csr_mu_sign)
+                    cudaFree(impl_->cuda_sqfree_cache.d_csr_mu_sign);
+                cudaMalloc((void**)&impl_->cuda_sqfree_cache.d_csr_skel_slot,
+                           (size_t)m->n_terms * sizeof(int));
+                cudaMalloc((void**)&impl_->cuda_sqfree_cache.d_csr_mu_sign,
+                           (size_t)m->n_terms * sizeof(int));
+                impl_->cuda_sqfree_cache.n_terms = m->n_terms;
+            }
+
+            cudaMemcpyAsync(impl_->cuda_sqfree_cache.d_skeleton_idx,
+                            m->skeleton_idx,
+                            (size_t)m->sk_k * sizeof(int),
+                            cudaMemcpyHostToDevice, ss);
+            cudaMemcpyAsync(impl_->cuda_sqfree_cache.d_residual_idx,
+                            m->residual_idx,
+                            (size_t)m->n_res * sizeof(int),
+                            cudaMemcpyHostToDevice, ss);
+            cudaMemcpyAsync(impl_->cuda_sqfree_cache.d_csr_offsets,
+                            m->csr_offsets,
+                            (size_t)(m->n_res + 1) * sizeof(int),
+                            cudaMemcpyHostToDevice, ss);
+            cudaMemcpyAsync(impl_->cuda_sqfree_cache.d_csr_skel_slot,
+                            m->csr_skel_slot,
+                            (size_t)m->n_terms * sizeof(int),
+                            cudaMemcpyHostToDevice, ss);
+            // Host stores mu_sign as int8_t; GPU kernel reads int32 via
+            // the kernel_mobius_predict signature. Convert on upload.
+            {
+                std::vector<int> signs_i32((size_t)m->n_terms);
+                for (int i = 0; i < m->n_terms; ++i) {
+                    signs_i32[(size_t)i] = (int)m->csr_mu_sign[i];
+                }
+                cudaMemcpyAsync(impl_->cuda_sqfree_cache.d_csr_mu_sign,
+                                signs_i32.data(),
+                                (size_t)m->n_terms * sizeof(int),
+                                cudaMemcpyHostToDevice, ss);
+                cudaStreamSynchronize(ss);
+            }
+
+            std::fprintf(stderr,
+                "[sp-engine:diag] calibrate_end: synced sqfree Knight mask "
+                "to GPU (sk_k=%d n_res=%d n_terms=%d)\n",
+                m->sk_k, m->n_res, m->n_terms);
+        }
 #endif
         return true;
     }
@@ -761,19 +830,52 @@ bool KvCache::read_gpu(int layer, int kv_len,
     const int H  = impl_->n_head_kv;
     const int hd = impl_->head_dim;
 
-    // Sqfree GPU cache doesn't have a batch read; loop per (pos, head)
-    // and write into the strided [hd, n_kv, kv_len] d_K_out / d_V_out
-    // layout directly. Each sp_cuda_sqfree_read_* writes an hd-long vec.
+    // Sqfree GPU cache: batched read processes all kv_len positions
+    // per (layer, head) in one kernel-dispatch series (~9 launches vs
+    // 9*kv_len for the per-vec path). Output from the batch call is
+    // [n_pos * head_dim] vec-major; we then 2D-memcpy into the
+    // caller's expected strided [hd, n_kv, kv_len] layout (same
+    // pattern as the ship-path scatter).
     if (impl_->cuda_sqfree_inited) {
-        for (int pos = 0; pos < kv_len; ++pos) {
-            for (int h = 0; h < H; ++h) {
-                const size_t off_elems = (size_t)pos * H * hd + (size_t)h * hd;
-                sp_cuda_sqfree_read_k(&impl_->cuda_sqfree_cache, layer, h, pos,
-                                       d_K_out + off_elems);
-                sp_cuda_sqfree_read_v(&impl_->cuda_sqfree_cache, layer, h, pos,
-                                       d_V_out + off_elems);
+        cudaStream_t s = (cudaStream_t)impl_->cuda_sqfree_cache.stream;
+        const size_t row_bytes = (size_t)hd * sizeof(float);
+        const size_t dst_pitch = (size_t)H * hd * sizeof(float);
+
+        // We need a temporary that's [kv_len * hd] fp32. Reuse nothing
+        // is simplest — allocate once on the cache's stream. For Qwen3
+        // at ctx=1024 that's 1024*128*4 = 512 KB.
+        float* d_tmp = nullptr;
+        if (cudaMalloc((void**)&d_tmp,
+                       (size_t)kv_len * hd * sizeof(float)) != cudaSuccess) {
+            std::fprintf(stderr, "[sp-engine] read_gpu(sqfree): tmp alloc failed\n");
+            return false;
+        }
+        for (int h = 0; h < H; ++h) {
+            // K
+            sp_cuda_sqfree_read_k_batch(&impl_->cuda_sqfree_cache,
+                                         layer, h, 0, kv_len, d_tmp);
+            if (cudaMemcpy2DAsync(d_K_out + (size_t)h * hd, dst_pitch,
+                                   d_tmp, row_bytes,
+                                   row_bytes, (size_t)kv_len,
+                                   cudaMemcpyDeviceToDevice, s) != cudaSuccess) {
+                std::fprintf(stderr, "[sp-engine] read_gpu(sqfree): K scatter failed (L=%d h=%d)\n", layer, h);
+                cudaFree(d_tmp);
+                return false;
+            }
+            // V
+            sp_cuda_sqfree_read_v_batch(&impl_->cuda_sqfree_cache,
+                                         layer, h, 0, kv_len, d_tmp);
+            if (cudaMemcpy2DAsync(d_V_out + (size_t)h * hd, dst_pitch,
+                                   d_tmp, row_bytes,
+                                   row_bytes, (size_t)kv_len,
+                                   cudaMemcpyDeviceToDevice, s) != cudaSuccess) {
+                std::fprintf(stderr, "[sp-engine] read_gpu(sqfree): V scatter failed (L=%d h=%d)\n", layer, h);
+                cudaFree(d_tmp);
+                return false;
             }
         }
+        cudaStreamSynchronize(s);
+        cudaFree(d_tmp);
         return true;
     }
 

@@ -695,6 +695,15 @@ int main(int argc, char** argv) {
             }
             else if (a == "--pe-alpha"  && i + 1 < argc) cc.pe_alpha = (float)std::atof(argv[++i]);
             else if (a == "--pe-tier"   && i + 1 < argc) cc.pe_tier  = std::atoi(argv[++i]);
+            // Cauchy reset system — decode-chain causal stability during
+            // generation. Same semantics as perplexity --cache: on reset,
+            // re-prefill the token sequence so far.
+            else if (a == "--cauchy-mode"     && i + 1 < argc) cc.cauchy_mode     = std::atoi(argv[++i]);
+            else if (a == "--cauchy-fixed-n"  && i + 1 < argc) cc.cauchy_fixed_n  = std::atoi(argv[++i]);
+            else if (a == "--cauchy-cooldown" && i + 1 < argc) cc.cauchy_cooldown = std::atoi(argv[++i]);
+            else if (a == "--cauchy-warmup"   && i + 1 < argc) cc.cauchy_warmup   = std::atoi(argv[++i]);
+            else if (a == "--cauchy-use-ricci")                cc.cauchy_use_ricci    = true;
+            else if (a == "--params-b"        && i + 1 < argc) cc.params_b        = (float)std::atof(argv[++i]);
             else if (a.size() >= 2 && a[0] == '-' && a[1] == '-') {
                 std::fprintf(stderr, "chat: unknown flag %s\n", a.c_str()); return 2;
             }
@@ -765,9 +774,19 @@ int main(int argc, char** argv) {
 
         fc->bind_cache(kv.get());
 
+        // Cauchy reset system: same semantics as perplexity --cache.
+        // On a recommended reset during generation, we re-prefill the
+        // full token sequence so far (prompt + generated) to refresh
+        // the cache against ground truth. No-op when cauchy_mode=0.
+        if (cc.cauchy_mode > 0) {
+            kv->init_cauchy(cc.cauchy_mode, cc.cauchy_fixed_n, cc.params_b,
+                             cc.cauchy_use_ricci);
+            kv->cauchy_set_cooldown(cc.cauchy_cooldown);
+        }
+
         std::vector<float> last_logits;
         int n_vocab = 0;
-        std::vector<int32_t> running = ids;  // for --naive path
+        std::vector<int32_t> running = ids;  // for --naive path and cauchy refill
         if (naive) {
             std::vector<float> all;
             if (!fc->forward_full(running, all, n_vocab)) {
@@ -811,8 +830,36 @@ int main(int argc, char** argv) {
                 if (!fc->decode(arg, last_logits, n_vocab, dbg_K_ptr, dbg_X_ptr)) {
                     std::fprintf(stderr, "\ndecode failed at step %d\n", step); return 7;
                 }
+                // Track running so Cauchy reset (and debug_decode below)
+                // have the full token sequence. Cost is a single push_back.
+                running.push_back(arg);
+
+                // Cauchy reset: same pattern as perplexity --cache. On
+                // recommended reset, rebind and re-prefill `running` from
+                // ground-truth tokens. Warmup gate suppresses early-chunk
+                // resets when the cache is still fresh.
+                if (cc.cauchy_mode > 0) {
+                    const int decode_start = n_prompt;
+                    const int pos          = (int)running.size() - 1;
+                    if (pos >= decode_start + cc.cauchy_warmup) {
+                        int r = kv->cauchy_check(pos);
+                        if (r > 0) {
+                            fc->bind_cache(kv.get());
+                            std::vector<float> refill_logits;
+                            int nv = 0;
+                            if (!fc->prefill(running, refill_logits, nv)) {
+                                std::fprintf(stderr,
+                                    "\ncauchy reset: re-prefill failed step %d pos %d\n",
+                                    step, pos);
+                                return 7;
+                            }
+                            last_logits = std::move(refill_logits);
+                            n_vocab     = nv;
+                            kv->cauchy_record_reset(pos);
+                        }
+                    }
+                }
                 if (debug_decode) {
-                    running.push_back(arg);
                     std::vector<float> ref_logits, ref_X;
                     int rn = 0;
                     std::vector<std::vector<float>> ref_K, ref_V;
@@ -866,6 +913,9 @@ int main(int argc, char** argv) {
         std::printf("\n");
         std::fprintf(stderr, "[sp-engine] kv_pos=%d  (prompt=%d, generated=%d)\n",
                      fc->kv_pos(), n_prompt, n_predict);
+        if (cc.cauchy_mode > 0 && kv) {
+            kv->cauchy_print_stats();
+        }
         return 0;
     }
 
