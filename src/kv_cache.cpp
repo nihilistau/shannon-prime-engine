@@ -400,6 +400,41 @@ bool KvCache::calibrate_end() {
     }
     if (rc == 0) {
         impl_->calibrated = true;
+#ifdef SP_ENGINE_WITH_CUDA
+        // Gated sync of CPU-calibrated variance order to GPU
+        // d_mobius_order. Empirically this REGRESSES Qwen3-8B decode-
+        // chain PPL (19.29 → 19.50 at ctx=512 chunks=2) because the
+        // variance is computed on CPU VHT2 output, but applied to GPU
+        // VHT2 output — CPU and GPU VHT2 produce numerically close but
+        // not bit-identical coefficients (different accumulation order
+        // across 7 butterfly stages), so the rank-by-variance ordering
+        // can flip on positions whose variance differs by less than
+        // the numerical gap between backends. Default-off until we
+        // implement GPU-domain calibration; opt in via
+        // SHANNON_PRIME_SYNC_CALIB_TO_GPU=1 for experimental runs.
+        const char* env_sync = std::getenv("SHANNON_PRIME_SYNC_CALIB_TO_GPU");
+        const bool want_sync = env_sync && std::atoi(env_sync) != 0;
+        if (want_sync && impl_->cuda_inited && impl_->shadow_inited &&
+            impl_->shadow.use_var_reorder && impl_->shadow.var_order &&
+            impl_->cuda_cache.d_mobius_order) {
+            const int hd = impl_->head_dim;
+            cudaStream_t s = (cudaStream_t)impl_->cuda_cache.stream;
+            cudaError_t err = cudaMemcpyAsync(impl_->cuda_cache.d_mobius_order,
+                                               impl_->shadow.var_order,
+                                               (size_t)hd * sizeof(int),
+                                               cudaMemcpyHostToDevice, s);
+            if (err != cudaSuccess) {
+                std::fprintf(stderr, "[sp-engine] calibrate_end: "
+                             "failed to sync var_order to GPU: %s\n",
+                             cudaGetErrorString(err));
+                return false;
+            }
+            cudaStreamSynchronize(s);
+            std::fprintf(stderr, "[sp-engine:diag] calibrate_end: synced "
+                         "%d-entry variance-ranked order to GPU d_mobius_order "
+                         "(SHANNON_PRIME_SYNC_CALIB_TO_GPU=1)\n", hd);
+        }
+#endif
         return true;
     }
     return false;
@@ -472,6 +507,25 @@ std::unique_ptr<KvCache> KvCache::create_gpu(int n_layer, int n_head_kv,
         return nullptr;
     }
     kv->impl_->cuda_inited = true;
+
+    // Also init a lightweight shadow cache to handle calibration. The
+    // GPU cache kernels read from a single int[hd] d_mobius_order table;
+    // post-calibration we copy the shadow's variance-ranked var_order
+    // into that GPU buffer so the GPU cache reorder matches the CPU's
+    // calibrated behavior. sp_shadow_cache_init only allocates the
+    // per-cache scratch buffers — no per-slot storage — so the cost is
+    // a few head_dim-sized float arrays.
+    if (sp_shadow_cache_init(&kv->impl_->shadow, sc) != 0) {
+        std::fprintf(stderr, "[sp-engine] KvCache::create_gpu: companion "
+                     "shadow_cache_init failed (calibration will be a no-op)\n");
+    } else {
+        kv->impl_->shadow_inited = true;
+        // Shadow's k_cache/v_cache slot pointers are not needed — we route
+        // writes/reads to the CUDA cache. Ensure they're nullptr so the
+        // destructor's free() loops are safe.
+        kv->impl_->shadow.k_cache = nullptr;
+        kv->impl_->shadow.v_cache = nullptr;
+    }
 
     // Pre-allocate staging and scratch buffers up front so the write/read
     // hot paths don't call cudaMalloc per step.

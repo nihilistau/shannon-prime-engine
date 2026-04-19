@@ -780,9 +780,29 @@ int main(int argc, char** argv) {
             else { std::fprintf(stderr, "kv_smoke: unknown arg %s\n", a.c_str()); return 2; }
         }
 
-        auto kv = sp::engine::KvCache::create(n_layer, n_head_kv, hd, n_tokens, kvc);
+        // When SP_ENGINE_BACKEND=gpu is set, route kv_smoke through the
+        // GPU-resident cache so we can directly compare K_corr/V_corr
+        // between CPU cache and GPU cache paths on identical input.
+        SpBackendGuard kv_bk(sp_select_backend());
+        std::unique_ptr<sp::engine::KvCache> kv;
+        if ((ggml_backend_t)kv_bk) {
+            ggml_backend_dev_t dev = ggml_backend_get_device((ggml_backend_t)kv_bk);
+            const bool backend_is_gpu = dev && ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU;
+            const bool ship_path = !kvc.sqfree && !kvc.hierarchical;
+            if (backend_is_gpu && ship_path) {
+                kv = sp::engine::KvCache::create_gpu(n_layer, n_head_kv, hd, n_tokens, kvc,
+                                                      /*stream=*/nullptr);
+                if (!kv) {
+                    std::fprintf(stderr, "[sp-engine] create_gpu failed; falling back to host cache\n");
+                }
+            }
+        }
+        if (!kv) {
+            kv = sp::engine::KvCache::create(n_layer, n_head_kv, hd, n_tokens, kvc);
+        }
         if (!kv) { std::fprintf(stderr, "KvCache::create failed\n"); return 2; }
-        std::fprintf(stderr, "[sp-engine] %s\n", kv->describe().c_str());
+        std::fprintf(stderr, "[sp-engine] %s%s\n", kv->describe().c_str(),
+                     kv->is_gpu() ? " [GPU-resident]" : "");
 
         const size_t n_elems = (size_t)n_tokens * n_head_kv * hd;
         std::vector<float> K(n_elems), V(n_elems);
