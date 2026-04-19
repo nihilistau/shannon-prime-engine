@@ -544,15 +544,16 @@ bool KvCache::calibrate_end() {
         // csr_offsets, csr_skel_slot, csr_mu_sign — and potentially a
         // different n_terms). The GPU-resident sqfree cache's mask arrays
         // were uploaded at init with the static squarefree-first ordering
-        // and are now out of date. Re-upload from impl_->sq.mask.
+        // and are now out of date.
         //
-        // Sqfree calibration feeds raw K vectors through the CPU pad +
-        // Vilenkin pipeline to accumulate variance. Since the sqfree pad
-        // + staged Vilenkin transform is computed on the pad_dim basis
-        // (not the p=2 butterfly), CPU and GPU versions of this particular
-        // transform are closer to bit-identical than the hd=128 Hadamard
-        // butterfly was. No asymmetric-calibration regression expected here.
-        if (impl_->cuda_sqfree_inited && impl_->sq_inited) {
+        // But: on real Qwen3-8B sqfree GPU path, unconditional sync
+        // blows PPL from ~12 to ~74 on ctx=512 chunks=1. Same asymmetric
+        // effect the ship path documented (`gpu_cache_ppl_drift.md`) —
+        // CPU-domain variance ranking doesn't transfer cleanly to the GPU
+        // kernels. Gated behind SHANNON_PRIME_SYNC_CALIB_TO_GPU=1 for now;
+        // still needs per-stage root-cause (issue #55).
+        const bool sync_sqfree = sync_enabled;
+        if (sync_sqfree && impl_->cuda_sqfree_inited && impl_->sq_inited) {
             cudaStream_t ss = (cudaStream_t)impl_->cuda_sqfree_cache.stream;
             const sp_knight_mask_t* m = &impl_->sq.mask;
 
@@ -840,6 +841,25 @@ bool KvCache::read_gpu(int layer, int kv_len,
         cudaStream_t s = (cudaStream_t)impl_->cuda_sqfree_cache.stream;
         const size_t row_bytes = (size_t)hd * sizeof(float);
         const size_t dst_pitch = (size_t)H * hd * sizeof(float);
+
+        // Env escape: fall back to per-vec read (pre-batching behaviour)
+        // for bisecting numerical regressions on real K vectors. Slow but
+        // the exact same kernel path kv_smoke synthetic-data uses
+        // historically.
+        const char* env_nobatch = std::getenv("SHANNON_PRIME_SQFREE_NO_BATCH");
+        const bool no_batch = env_nobatch && std::atoi(env_nobatch) != 0;
+        if (no_batch) {
+            for (int pos = 0; pos < kv_len; ++pos) {
+                for (int h = 0; h < H; ++h) {
+                    const size_t off_elems = (size_t)pos * H * hd + (size_t)h * hd;
+                    sp_cuda_sqfree_read_k(&impl_->cuda_sqfree_cache, layer, h, pos,
+                                           d_K_out + off_elems);
+                    sp_cuda_sqfree_read_v(&impl_->cuda_sqfree_cache, layer, h, pos,
+                                           d_V_out + off_elems);
+                }
+            }
+            return true;
+        }
 
         // We need a temporary that's [kv_len * hd] fp32. Reuse nothing
         // is simplest — allocate once on the cache's stream. For Qwen3

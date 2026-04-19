@@ -84,7 +84,11 @@ samples per slot).
 | 6a    | `perplexity` (baseline + `--cache` decode-chain) | ✓ |
 | 6b    | `cache_ppl` — baseline PPL + K/V correlation + scaling-law term | ✓ |
 | 6c    | Sidecar auto-load (`<model>.sp_freq_factors.bin`) | ✓ |
-| 7     | CUDA / Vulkan backend selection; release packaging | planned |
+| 6d    | Cauchy decode-chain reset (Mertens-only shipping default) | ✓ |
+| 7a    | CUDA backend selection + weight offload (`SP_ENGINE_BACKEND=gpu`) | ✓ |
+| 7b    | GPU-resident ship cache (`create_gpu`, `read_gpu`, `write_gpu`) | ✓ |
+| 7c    | GPU-resident sqfree cache + batched read + calibration sync | infrastructure ✓ / real-model PPL validating |
+| 7d    | Vulkan backend selection; release packaging | planned |
 
 ## Measured numbers
 
@@ -245,6 +249,41 @@ regenerating the GGUF each time.
 | `--hier-res-bits N` | Hierarchical residual bits (default 2). |
 | `--hier-skel-bits CSV` | Hierarchical skeleton band bits (default `5,5`). |
 
+### Cauchy decode-chain reset (optional)
+
+The compressed cache accumulates per-step reconstruction error across long
+decode chains. The Cauchy system is a lightweight supervisor that detects
+this drift and refreshes the cache with a re-prefill from ground-truth
+tokens — recovering chain coherence without dropping compression.
+
+**Shipping default:** Mertens-only (zeta-zero-derived arithmetic schedule).
+An earlier Ricci drift sentinel was architecturally complete but measured
+0 incremental PPL benefit, so it's opt-in now.
+
+Measured on Qwen3-8B-Q8 `perplexity --cache`:
+
+| ctx | chunks | Baseline | Cauchy mode=2 | Δ | Wall (baseline) | Wall (Cauchy) | Resets |
+|---|---|---|---|---|---|---|---|
+| 1024 | 2 | 12.23 | **11.92** | −0.31 | 3m04s | 4m53s | 4 |
+| 2048 | 2 | 13.09 | **12.98** | −0.11 | 7m50s | 14m00s | 7 |
+
+All resets land in the late tail of the chain (last_reset_pos 991 at
+ctx=1024, 1847 at ctx=2048) — exactly where the Mertens schedule is designed
+to fire. Cauchy flags across all three verbs (`perplexity --cache`,
+`cache_ppl`, `chat`):
+
+| Flag | Default | Effect |
+|---|---|---|
+| `--cauchy-mode N` | 0 | 0 = off, 1 = fixed-N, 2 = dynamic (zeta schedule) |
+| `--cauchy-fixed-n N` | 512 | Reset period for mode 1 |
+| `--cauchy-cooldown N` | 64 | Minimum positions between resets |
+| `--cauchy-warmup N` | 64 | Suppress resets for first N positions per chunk |
+| `--cauchy-use-ricci` | off | Enable reactive Ricci drift sentinel (research only) |
+| `--params-b F` | 0 | Model size in billions (only used when Ricci is enabled) |
+
+Detailed design + ablation notes in
+[shannon-prime/docs/CAUCHY-RESET.md](https://github.com/nihilistau/shannon-prime/blob/main/docs/CAUCHY-RESET.md).
+
 ### Cache-system deep dive
 
 **Ship path (`sp_shadow_cache_t`)** — the validated default, straight from the CLAUDE.md invariants. On write: raw K → VHT2 → Möbius reorder (K only; V stays in its natural basis) → band-quantise using (5,5,4,3) for K and flat 3 bits for V. On read: dequantise → Möbius unreorder → VHT2 forward (self-inverse, no 1/N on the reverse). K_corr ≥ 0.993 on real RoPE'd K. Typical compression 3.8–4.1×.
@@ -294,11 +333,16 @@ Override: `SP_CALIBRATE=1` on the `prefill` CLI verb forces explicit calibration
 
 ### Environment variables
 
-| Variable | Effect |
-|---|---|
-| `SP_CALIBRATE=1` | Force `prefill` CLI to calibrate before writing to cache. Default is no-calibrate for diagnostic use; `ForwardContext::prefill` always auto-calibrates regardless. |
-| `SP_DEBUG_DECODE=1` | Print layer-0 K / X correlation diff between decode and a reference `forward_full` at each step. Diagnostic for decode-graph bugs. |
-| `SP_SKIP_CAPTURE=1` | Disable K/V capture in decode (and thus cache writes). Was a debug harness during the V-capture-view regression hunt; leave off. |
+| Variable | Default | Effect |
+|---|---|---|
+| `SP_ENGINE_BACKEND` | — | `gpu` / `cuda` / `vulkan` switches forward + weight-offload to the chosen GPU backend. Unset = CPU (mmap weights). |
+| `SHANNON_PRIME_GPU_CACHE` | 1 | When the backend is GPU, route KvCache to the GPU-resident path (`create_gpu`). Set to 0 to force the host cache (A/B diagnostic). |
+| `SHANNON_PRIME_SYNC_CALIB_TO_GPU` | 0 | After `calibrate_end`, upload the variance-ranked mask (ship `d_mobius_order` + sqfree Knight CSR) to the GPU cache. Default off: the ship path documents a +0.21 PPL asymmetric regression with calibration sync, and the sqfree path regresses similarly on real Qwen3 data (~+19 PPL). Opt in for investigation. |
+| `SHANNON_PRIME_SQFREE_NO_BATCH` | 0 | Fall back to the per-vec sqfree GPU read path. Diagnostic-only — the batched path is correct on kv_smoke (K_corr 0.943, matches CPU) but real-model PPL validation is still open. |
+| `SP_CALIBRATE` | 0 | Force the `prefill` CLI verb to calibrate before writing. Normally `ForwardContext::prefill` auto-calibrates on first call regardless. |
+| `SP_DEBUG_DECODE` | 0 | Print layer-0 K / X correlation diff between decode and a reference `forward_full` at each step. Diagnostic for decode-graph bugs. |
+| `SP_SKIP_CAPTURE` | 0 | Disable K/V capture in decode (and thus cache writes). Debug harness from the V-capture-view regression hunt; leave off. |
+| `SHANNON_PRIME_NO_CALIBRATE` | 0 | Skip the auto-calibration pass — used when A/B-testing the calibrated vs static mask on the same run. |
 
 ### Sidecar auto-load (`.sp_freq_factors.bin`)
 
@@ -320,10 +364,28 @@ Requires:
 git clone --recursive https://github.com/nihilistau/shannon-prime-engine
 cd shannon-prime-engine
 
+# CPU build (default)
 cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build build
 ./build/bin/sp-engine --help
 ```
+
+### CUDA build
+
+```bash
+cmake -B build-cuda -G Ninja \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DSP_ENGINE_WITH_CUDA=ON -DGGML_CUDA=ON \
+      -DCMAKE_CUDA_ARCHITECTURES=75
+cmake --build build-cuda
+
+# Route forward + weights + cache through CUDA
+SP_ENGINE_BACKEND=gpu ./build-cuda/bin/sp-engine logits \
+    --model model.gguf "The quick brown fox"
+```
+
+Compute-capability hint: `75` = RTX 2060 / T4. Pick the right arch for
+your GPU (`86` for 30-series, `89` for 40-series, `90` for H100).
 
 If you already cloned without `--recursive`:
 

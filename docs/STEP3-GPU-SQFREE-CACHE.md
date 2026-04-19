@@ -386,13 +386,34 @@ matches. Remaining 0.01 is attributable to the calibration-sync gap
 
    Target: Qwen3-8B sqfree in the 2–5 min range.
 
+   **Status (2026-04-20):** batched-read infrastructure landed in
+   shannon-prime `22639fb` + engine `c34740a`. Five new batched
+   kernels (`scatter_batch`, `reconstruct_residual_batch`,
+   `dequantize_residual_batch`, `unpack_levels_batch`,
+   `gather_mag_batch`), scratch sized to `max_seq_len × per-vec`,
+   public `sp_cuda_sqfree_read_k_batch` / `_v_batch` launchers.
+   Subtlety: `sp_cuda_band_dequantize` assumes contiguous
+   `total_bytes` stride per vec, but sqfree slot layout is
+   `[total_bytes][4 mag][res_bytes]` — stride `bytes_per_pos`. A
+   `cudaMemcpy2DAsync` repack into `d_pad_scratch` (reused as a byte
+   buffer) fixes this. Verified K_corr 0.943 on kv_smoke random data
+   (matches CPU). Real-model PPL on Qwen3-8B still regresses (+43
+   PPL at ctx=512/chunks=1 vs CPU sqfree 11.82) — pending root cause.
+   Per-vec fallback via `SHANNON_PRIME_SQFREE_NO_BATCH=1`.
+
 2. **Calibration sync for the GPU Knight mask.** CPU companion
    `sp_sqfree_cache_t` rebuilds its mask with variance ranking on
    `calibrate_end`, but the GPU cache's `d_skeleton_idx` /
    `d_residual_idx` / `d_csr_*` stay on the initial squarefree-first
-   ordering. Re-upload after `calibrate_end`, gated behind
-   `SHANNON_PRIME_SYNC_CALIB_TO_GPU=1` same as the ship path.
-   Expected synthetic-K_corr improvement: ~0.01.
+   ordering. Re-upload after `calibrate_end`.
+
+   **Status (2026-04-20):** landed in engine `c34740a`. Handles
+   `n_terms` changes via realloc, converts `int8_t csr_mu_sign` to
+   int32 for the GPU kernel. Gated behind
+   `SHANNON_PRIME_SYNC_CALIB_TO_GPU=1` — unconditional sync added
+   +19 PPL on the same Qwen3-8B ctx=512 chunks=1 bench (74 vs 55
+   without sync). Same asymmetric calibration effect the ship path
+   already documented; tracked alongside the shared PPL drift work.
 
 3. **Spinor sheet bit (full scope).**
    * `sp_cuda_sqfree_cache_init(use_spinor=1)` — allocate sheet bit
