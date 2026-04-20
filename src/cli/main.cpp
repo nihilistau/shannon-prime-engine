@@ -152,6 +152,7 @@ int main(int argc, char** argv) {
     // ──────────────────────────────────────────────────────────────────
     if (cmd == "cache_ppl") {
         sp::engine::Config cc;
+        sp::engine::seed_config_from_env(cc);
         int  n_ctx    = 512;
         int  n_chunks = 0;
         std::string textfile;
@@ -387,6 +388,7 @@ int main(int argc, char** argv) {
     // so the strict --flag pass doesn't reject the textfile path.
     if (cmd == "perplexity") {
         sp::engine::Config pc;
+        sp::engine::seed_config_from_env(pc);
         int  n_ctx    = 512;
         int  n_chunks = 0;     // 0 = all
         bool use_cache = false;
@@ -674,6 +676,7 @@ int main(int argc, char** argv) {
     // reason kv_smoke is.
     if (cmd == "chat") {
         sp::engine::Config cc;
+        sp::engine::seed_config_from_env(cc);
         int  n_predict = 32;
         bool naive     = false;
         bool debug_decode = false;
@@ -1072,6 +1075,7 @@ int main(int argc, char** argv) {
     // Flag parser — extracts known flags and stashes positional args in `rest`.
     // Per-command handlers below can consume those positionals however they like.
     sp::engine::Config cfg;
+    sp::engine::seed_config_from_env(cfg);
     std::vector<std::string> rest;
     for (int i = 2; i < argc; ++i) {
         std::string a = argv[i];

@@ -7,6 +7,7 @@
 #pragma once
 
 #include <cstdint>
+#include <cstdlib>
 #include <memory>
 #include <string>
 
@@ -99,6 +100,21 @@ struct Config {
     bool        cauchy_mertens_only = false;
     float       params_b        = 0.0f;
 };
+
+// Seed Config fields from environment variables. Called by each CLI verb
+// immediately after Config construction, so the precedence ordering stays:
+//   Config default → env var → CLI flag.
+// Only fills fields the env var owns; never clobbers a value already set
+// by the caller (so tests that construct a Config programmatically aren't
+// affected). Keep this header-inline so every call site picks it up
+// without a link dependency.
+inline void seed_config_from_env(Config& cfg) {
+    if (cfg.model_preset.empty()) {
+        if (const char* s = std::getenv("SHANNON_PRIME_MODEL_PRESET")) {
+            cfg.model_preset = s;
+        }
+    }
+}
 
 class Engine {
 public:

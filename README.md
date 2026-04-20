@@ -360,6 +360,7 @@ Override: `SP_CALIBRATE=1` on the `prefill` CLI verb forces explicit calibration
 | `SP_DEBUG_DECODE` | 0 | Print layer-0 K / X correlation diff between decode and a reference `forward_full` at each step. Diagnostic for decode-graph bugs. |
 | `SP_SKIP_CAPTURE` | 0 | Disable K/V capture in decode (and thus cache writes). Debug harness from the V-capture-view regression hunt; leave off. |
 | `SHANNON_PRIME_NO_CALIBRATE` | 0 | Skip the auto-calibration pass — used when A/B-testing the calibrated vs static mask on the same run. |
+| `SHANNON_PRIME_MODEL_PRESET` | — | Seed the model-pack overlay default: `auto`, `off`, or an arch name (e.g. `qwen3moe`). Equivalent to passing `--model-preset <value>` on the CLI, but picked up by every verb that accepts a Config. An explicit CLI flag always wins. |
 
 ### Sidecar auto-load (`.sp_freq_factors.bin`)
 
