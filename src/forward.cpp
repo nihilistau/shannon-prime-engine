@@ -631,12 +631,35 @@ static ggml_tensor* build_block(ggml_context* gctx,
     ggml_tensor* xa = ggml_rms_norm(gctx, x, rms_eps);
     xa = ggml_mul(gctx, xa, L.attn_norm);
 
-    ggml_tensor* Q = ggml_mul_mat(gctx, L.wq, xa);
-    if (L.bq) Q = ggml_add(gctx, Q, L.bq);
-    ggml_tensor* K = ggml_mul_mat(gctx, L.wk, xa);
-    if (L.bk) K = ggml_add(gctx, K, L.bk);
-    ggml_tensor* V = ggml_mul_mat(gctx, L.wv, xa);
-    if (L.bv) V = ggml_add(gctx, V, L.bv);
+    // QKV projection. Two paths:
+    //   * Classic (llama / qwen / mistral / gemma / granite): three separate
+    //     matmuls against Wq / Wk / Wv plus optional biases.
+    //   * Phi3 fused: one matmul against attn_qkv produces a packed
+    //     [Q | K | V] row-slab which we view-split. nb[1] is the full
+    //     fused-row stride; each subset view has nb[0]=elem_size and the
+    //     same row stride, so the views are non-contiguous and must be
+    //     materialised via ggml_cont before reshape_3d.
+    ggml_tensor* Q;
+    ggml_tensor* K;
+    ggml_tensor* V;
+    if (L.attn_qkv) {
+        ggml_tensor* qkv = ggml_mul_mat(gctx, L.attn_qkv, xa);   // [q+kv+kv, n]
+        const size_t row_stride = qkv->nb[1];
+        const size_t elem_size  = ggml_element_size(qkv);
+        const int64_t n_embd_kv = (int64_t)n_head_kv * head_dim;
+        const size_t q_bytes    = (size_t)n_embd_q  * elem_size;
+        const size_t kv_bytes   = (size_t)n_embd_kv * elem_size;
+        Q = ggml_cont(gctx, ggml_view_2d(gctx, qkv, n_embd_q,  n, row_stride, 0));
+        K = ggml_cont(gctx, ggml_view_2d(gctx, qkv, n_embd_kv, n, row_stride, q_bytes));
+        V = ggml_cont(gctx, ggml_view_2d(gctx, qkv, n_embd_kv, n, row_stride, q_bytes + kv_bytes));
+    } else {
+        Q = ggml_mul_mat(gctx, L.wq, xa);
+        if (L.bq) Q = ggml_add(gctx, Q, L.bq);
+        K = ggml_mul_mat(gctx, L.wk, xa);
+        if (L.bk) K = ggml_add(gctx, K, L.bk);
+        V = ggml_mul_mat(gctx, L.wv, xa);
+        if (L.bv) V = ggml_add(gctx, V, L.bv);
+    }
 
     Q = ggml_reshape_3d(gctx, Q, head_dim, n_head,    n);
     K = ggml_reshape_3d(gctx, K, head_dim, n_head_kv, n);
@@ -700,12 +723,30 @@ static ggml_tensor* build_block(ggml_context* gctx,
 
     x = ggml_add(gctx, x, y1);
 
-    // FFN.
+    // FFN. Two paths:
+    //   * Classic (llama / qwen / gemma / ...): separate ffn_gate and ffn_up
+    //     matmuls, SiLU/GELU on gate, elementwise mul, then ffn_down.
+    //   * Phi3 packed SwiGLU: the GGUF's ffn_up tensor is 2*n_ff wide and
+    //     encodes [gate | up] along the output-row axis. One matmul plus
+    //     a view-split (mirroring the fused-QKV pattern above) reconstructs
+    //     gate and up. phi3 never has ffn_gate bound, so that signals the
+    //     packed layout.
     ggml_tensor* xb = ggml_rms_norm(gctx, x, rms_eps);
     xb = ggml_mul(gctx, xb, L.ffn_norm);
 
-    ggml_tensor* gate = ggml_mul_mat(gctx, L.ffn_gate, xb);
-    ggml_tensor* up   = ggml_mul_mat(gctx, L.ffn_up,   xb);
+    ggml_tensor* gate;
+    ggml_tensor* up;
+    if (L.ffn_gate) {
+        gate = ggml_mul_mat(gctx, L.ffn_gate, xb);
+        up   = ggml_mul_mat(gctx, L.ffn_up,   xb);
+    } else {
+        ggml_tensor* gu = ggml_mul_mat(gctx, L.ffn_up, xb);   // [2*n_ff, n]
+        const int64_t n_ff       = gu->ne[0] / 2;
+        const size_t  row_stride = gu->nb[1];
+        const size_t  gate_bytes = (size_t)n_ff * ggml_element_size(gu);
+        gate = ggml_cont(gctx, ggml_view_2d(gctx, gu, n_ff, n, row_stride, 0));
+        up   = ggml_cont(gctx, ggml_view_2d(gctx, gu, n_ff, n, row_stride, gate_bytes));
+    }
     gate = ffn_gelu ? ggml_gelu(gctx, gate) : ggml_silu(gctx, gate);
     ggml_tensor* ffn  = ggml_mul(gctx, gate, up);
     ffn  = ggml_mul_mat(gctx, L.ffn_down, ffn);
@@ -1625,12 +1666,30 @@ static ggml_tensor* build_block_decode(ggml_context* gctx,
     ggml_tensor* xa = ggml_rms_norm(gctx, x, rms_eps);
     xa = ggml_mul(gctx, xa, L.attn_norm);
 
-    ggml_tensor* Q = ggml_mul_mat(gctx, L.wq, xa);
-    if (L.bq) Q = ggml_add(gctx, Q, L.bq);
-    ggml_tensor* K = ggml_mul_mat(gctx, L.wk, xa);
-    if (L.bk) K = ggml_add(gctx, K, L.bk);
-    ggml_tensor* V = ggml_mul_mat(gctx, L.wv, xa);
-    if (L.bv) V = ggml_add(gctx, V, L.bv);
+    // QKV projection. Classic (separate Wq/Wk/Wv) or phi3 fused (one
+    // matmul + view-split). See build_block for detail on the fused
+    // layout and why each subset view needs a ggml_cont before reshape.
+    ggml_tensor* Q;
+    ggml_tensor* K;
+    ggml_tensor* V;
+    if (L.attn_qkv) {
+        ggml_tensor* qkv = ggml_mul_mat(gctx, L.attn_qkv, xa);
+        const size_t row_stride = qkv->nb[1];
+        const size_t elem_size  = ggml_element_size(qkv);
+        const int64_t n_embd_kv = (int64_t)n_head_kv * head_dim;
+        const size_t q_bytes    = (size_t)n_embd_q  * elem_size;
+        const size_t kv_bytes   = (size_t)n_embd_kv * elem_size;
+        Q = ggml_cont(gctx, ggml_view_2d(gctx, qkv, n_embd_q,  n, row_stride, 0));
+        K = ggml_cont(gctx, ggml_view_2d(gctx, qkv, n_embd_kv, n, row_stride, q_bytes));
+        V = ggml_cont(gctx, ggml_view_2d(gctx, qkv, n_embd_kv, n, row_stride, q_bytes + kv_bytes));
+    } else {
+        Q = ggml_mul_mat(gctx, L.wq, xa);
+        if (L.bq) Q = ggml_add(gctx, Q, L.bq);
+        K = ggml_mul_mat(gctx, L.wk, xa);
+        if (L.bk) K = ggml_add(gctx, K, L.bk);
+        V = ggml_mul_mat(gctx, L.wv, xa);
+        if (L.bv) V = ggml_add(gctx, V, L.bv);
+    }
 
     Q = ggml_reshape_3d(gctx, Q, head_dim, n_head,    n);
     K = ggml_reshape_3d(gctx, K, head_dim, n_head_kv, n);
@@ -1701,8 +1760,24 @@ static ggml_tensor* build_block_decode(ggml_context* gctx,
 
     ggml_tensor* xb = ggml_rms_norm(gctx, x, rms_eps);
     xb = ggml_mul(gctx, xb, L.ffn_norm);
-    ggml_tensor* gate = ggml_mul_mat(gctx, L.ffn_gate, xb);
-    ggml_tensor* up   = ggml_mul_mat(gctx, L.ffn_up,   xb);
+    // FFN dispatch — same logic as build_block:
+    //   * Classic: separate L.ffn_gate and L.ffn_up matmuls.
+    //   * Phi3 packed SwiGLU: L.ffn_gate is nullptr; L.ffn_up is 2*n_ff wide
+    //     and the two halves are split into gate and up along output-rows.
+    ggml_tensor* gate;
+    ggml_tensor* up;
+    if (L.ffn_gate) {
+        gate = ggml_mul_mat(gctx, L.ffn_gate, xb);
+        up   = ggml_mul_mat(gctx, L.ffn_up,   xb);
+    } else {
+        ggml_tensor* gu = ggml_mul_mat(gctx, L.ffn_up, xb);  // [2*n_ff, n]
+        const int64_t n_ff       = gu->ne[0] / 2;
+        const int64_t n_tok      = gu->ne[1];
+        const size_t  row_stride = gu->nb[1];
+        const size_t  gate_bytes = (size_t)n_ff * ggml_element_size(gu);
+        gate = ggml_cont(gctx, ggml_view_2d(gctx, gu, n_ff, n_tok, row_stride, 0));
+        up   = ggml_cont(gctx, ggml_view_2d(gctx, gu, n_ff, n_tok, row_stride, gate_bytes));
+    }
     gate = ggml_silu(gctx, gate);
     ggml_tensor* ffn  = ggml_mul(gctx, gate, up);
     ffn  = ggml_mul_mat(gctx, L.ffn_down, ffn);

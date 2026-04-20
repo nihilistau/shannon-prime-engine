@@ -542,17 +542,21 @@ std::unique_ptr<Tokenizer> Tokenizer::create(const Vocab& vocab) {
         return std::make_unique<SpmTokenizer>(vocab, pre);
     }
 
-    // GPT-2 byte-level BPE: llama-3 / qwen2 / qwen3 / qwen35 / gpt2 and
-    // anything else that ships merges. qwen35 (Qwen3.6-MoE) uses the
+    // GPT-2 byte-level BPE: llama-3 / qwen2 / qwen3 / qwen35 / gpt2 / dbrx
+    // and anything else that ships merges. qwen35 (Qwen3.6-MoE) uses the
     // same byte-level BPE + pretok regex as qwen2 — the `pre` field
-    // just rev-tags the merge table version.
+    // just rev-tags the merge table version. dbrx (phi-4 GGUFs) uses the
+    // standard GPT-2 byte-level BPE + regex; calibration purposes only
+    // need tokenizer self-consistency (baseline and candidate runs
+    // tokenise the corpus identically), not bit-for-bit agreement with
+    // llama.cpp's reference tokenizer.
     if (pre == "llama-bpe" || pre == "qwen2" || pre == "qwen35" ||
-        pre == "default"   || pre == "gpt2") {
+        pre == "default"   || pre == "gpt2"  || pre == "dbrx") {
         return std::make_unique<BpeTokenizer>(vocab, pre);
     }
     std::fprintf(stderr,
         "[sp-engine] unsupported tokenizer model='%s' pre='%s' "
-        "(BPE llama-bpe/qwen2/qwen35/default/gpt2 and SPM llama supported)\n",
+        "(BPE llama-bpe/qwen2/qwen35/default/gpt2/dbrx and SPM llama supported)\n",
         model.c_str(), pre.c_str());
     return nullptr;
 }

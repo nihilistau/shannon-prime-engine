@@ -11,6 +11,13 @@
 // a single struct covers them all:
 //
 //   • gemma3 adds sandwich norms (post_attention_norm, post_ffw_norm).
+//   • phi3 (covers Phi-3 / Phi-3.1 / Phi-4) ships a FUSED QKV projection
+//     as "blk.N.attn_qkv.weight" and a SwiGLU-PACKED up projection as
+//     "blk.N.ffn_up.weight" (shape 2*n_ff, split into [gate | up] along
+//     the output dim). No separate Wq/Wk/Wv or ffn_gate tensors exist.
+//     The fused weight is bound to `attn_qkv`; the packed ffn_up is
+//     bound to `ffn_up` with `ffn_gate` left nullptr (the builder
+//     detects the packed layout by that).
 //   • qwen35moe is a HYBRID model — every `full_attention_interval` layer
 //     is standard attention (with multi-section RoPE); the rest are Gated
 //     DeltaNet (linear attention with conv + stateful recurrence, its input
@@ -54,6 +61,11 @@ struct LlamaLayer {
     ggml_tensor* wk          = nullptr;
     ggml_tensor* wv          = nullptr;
     ggml_tensor* wo          = nullptr;
+    // phi3 fused QKV projection (alternative to separate wq/wk/wv).
+    // When non-null, wq/wk/wv are nullptr and the builder does a single
+    // matmul + view-split into Q/K/V along the output-row axis.
+    // Output-row layout: [Q rows (n_head*head_dim) | K rows (n_head_kv*head_dim) | V rows (n_head_kv*head_dim)]
+    ggml_tensor* attn_qkv    = nullptr;  // "blk.N.attn_qkv.weight" (phi3 only)
     // Optional per-head attention norms (qwen3, qwen35moe full-attn)
     ggml_tensor* attn_q_norm = nullptr;
     ggml_tensor* attn_k_norm = nullptr;

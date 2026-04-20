@@ -109,9 +109,11 @@ bool LlamaWeights::bind_tensors_(LlamaWeights& w, ggml_context* tctx,
 
     // Arch-specific dispatch. qwen35moe has two layer types within the
     // same model, both of which replace the dense FFN with an MoE bank;
-    // other archs are uniform standard layers.
+    // phi3 has STANDARD layers but with fused QKV + packed SwiGLU FFN;
+    // other archs are uniform classic standard layers.
     const std::string& arch = model.architecture();
     const bool is_qwen_moe  = (arch == "qwen35moe");
+    const bool is_phi3      = (arch == "phi3");
     int full_attn_interval = 1;
     if (is_qwen_moe) {
         full_attn_interval =
@@ -178,6 +180,37 @@ bool LlamaWeights::bind_tensors_(LlamaWeights& w, ggml_context* tctx,
                 std::fprintf(stderr,
                     "[sp-engine] LlamaWeights: qwen35moe layer %d (%s) missing required tensor(s)\n",
                     i, attn_layer ? "attn" : "gdn");
+                return false;
+            }
+            continue;
+        }
+
+        // --- phi3 path: fused QKV + packed SwiGLU FFN ------------------
+        // Tensor layout (verified on phi-4-Q4_K_M and Phi-3.1-mini):
+        //   blk.N.attn_norm.weight
+        //   blk.N.attn_qkv.weight     — fused [Q|K|V] along the output-row axis
+        //   blk.N.attn_output.weight
+        //   blk.N.ffn_norm.weight
+        //   blk.N.ffn_up.weight       — packed [gate|up] along the output-row axis
+        //   blk.N.ffn_down.weight
+        // No separate attn_q / attn_k / attn_v / ffn_gate. Biases are
+        // absent on phi3 (GQA-lite, no bias variants). The layer kind
+        // stays STANDARD so the forward dispatch goes through build_block;
+        // build_block checks `attn_qkv != nullptr` / `ffn_gate == nullptr`
+        // to switch to the fused paths.
+        if (is_phi3) {
+            L.kind       = LlamaLayerKind::STANDARD;
+            L.attn_qkv   = bind_req(layer_name(i, "attn_qkv.weight"));
+            L.wo         = bind_req(layer_name(i, "attn_output.weight"));
+            L.ffn_norm   = bind_req(layer_name(i, "ffn_norm.weight"));
+            L.ffn_up     = bind_req(layer_name(i, "ffn_up.weight"));
+            L.ffn_down   = bind_req(layer_name(i, "ffn_down.weight"));
+            // Optional bias terms (absent on stock phi3 but allowed by GGUF spec).
+            L.bo         = bind_opt(layer_name(i, "attn_output.bias"));
+            if (!L.attn_norm || !L.attn_qkv || !L.wo
+                || !L.ffn_norm || !L.ffn_up || !L.ffn_down) {
+                std::fprintf(stderr,
+                    "[sp-engine] LlamaWeights: phi3 layer %d missing required tensor(s)\n", i);
                 return false;
             }
             continue;
