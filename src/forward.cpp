@@ -41,6 +41,21 @@ struct ForwardContext::Impl {
     // sqrt(n_embd) before the first block; other archs leave embeddings
     // untouched (scale = 1.0).
     float embd_scale      = 1.0f;
+    // Gemma3 sliding-window attention. When `swa_window > 0`, layers
+    // where (layer_idx + 1) % 6 != 0 ("local" layers) attend only to
+    // the last `swa_window` positions AND use `swa_rope_freq_base`
+    // (10000) for RoPE, while the 1-in-6 "global" layers keep the
+    // GGUF-provided `rope_freq_base` (typically 1e6) and the standard
+    // causal mask. The 5-local : 1-global pattern is hardcoded —
+    // gemma3 doesn't parameterise it per-layer in the GGUF.
+    int   swa_window         = 0;
+    float swa_rope_freq_base = 10000.0f;
+
+    // FFN activation. Llama/qwen/mistral/phi/granite use SwiGLU
+    // (silu(gate) * up); gemma (1/2/3) uses GeGLU with the tanh
+    // approximation of GELU (gelu_pytorch_tanh). ggml_gelu is the
+    // tanh variant, matching gemma's act_fn exactly.
+    bool  ffn_gelu           = false;
 
     // PrimePE-RoPE-ALiBi precomputed values. `freq_factors_vec` is
     // empty when PE is Standard/AlibiOnly (ggml_rope_ext gets nullptr);
@@ -157,6 +172,21 @@ std::unique_ptr<ForwardContext> ForwardContext::create(const Model& model,
         if (a == "gemma" || a == "gemma2" || a == "gemma3") {
             fc->impl_->embd_scale = sqrtf((float)fc->impl_->n_embd);
         }
+    }
+
+    // Gemma3 sliding-window attention. Reads the `sliding_window`
+    // hparam — 1024 on gemma3-12B, 512 on smaller variants. Non-
+    // gemma3 archs leave swa_window=0 (SWA off).
+    if (model.architecture() == "gemma3") {
+        const int64_t w = model.get_i64("gemma3.attention.sliding_window", 0);
+        if (w > 0) fc->impl_->swa_window = (int)w;
+    }
+
+    // FFN activation flavor. Gemma family uses GELU (tanh approx)
+    // instead of SiLU in the gated MLP.
+    {
+        const std::string& a = model.architecture();
+        fc->impl_->ffn_gelu = (a == "gemma" || a == "gemma2" || a == "gemma3");
     }
 
     // PrimePE precompute. One allocation per ForwardContext; re-uploaded
@@ -333,6 +363,17 @@ bool ForwardContext::embed(const std::vector<int32_t>& token_ids,
 // a no-op here (soft_max_ext's bias arg is also nullptr).
 // ------------------------------------------------------------------
 // ------------------------------------------------------------------
+// Gemma3 SWA pattern: 5 sliding-window layers for every global layer,
+// globals every 6th layer starting at index 5 (5, 11, 17, ...). A
+// layer is SWA iff (layer_idx + 1) % 6 != 0. When swa_window == 0
+// the caller has SWA disabled entirely (all non-gemma3 archs and any
+// gemma3 variant that ships without the sliding_window hparam).
+// ------------------------------------------------------------------
+static inline bool sp_is_gemma3_swa_layer(int layer_idx, int swa_window) {
+    return swa_window > 0 && ((layer_idx + 1) % 6 != 0);
+}
+
+// ------------------------------------------------------------------
 // Shared per-block graph builder. Given an already-embedded hidden
 // state `x` and the current RoPE position tensor `pos`, builds the
 // attention + FFN block from `L` and returns the updated hidden state.
@@ -354,6 +395,7 @@ static ggml_tensor* build_block(ggml_context* gctx,
                                  float freq_scale,
                                  float rms_eps,
                                  int   rope_mode,
+                                 bool  ffn_gelu,             // gemma* → GELU, else SiLU
                                  // Optional captures: if non-null, the
                                  // post-RoPE pre-GQA-broadcast K and V
                                  // tensors are returned through these.
@@ -443,7 +485,7 @@ static ggml_tensor* build_block(ggml_context* gctx,
 
     ggml_tensor* gate = ggml_mul_mat(gctx, L.ffn_gate, xb);
     ggml_tensor* up   = ggml_mul_mat(gctx, L.ffn_up,   xb);
-    gate = ggml_silu(gctx, gate);
+    gate = ffn_gelu ? ggml_gelu(gctx, gate) : ggml_silu(gctx, gate);
     ggml_tensor* ffn  = ggml_mul(gctx, gate, up);
     ffn  = ggml_mul_mat(gctx, L.ffn_down, ffn);
 
@@ -496,6 +538,13 @@ bool ForwardContext::forward_one_block(const std::vector<int32_t>& token_ids,
     ggml_tensor* kq_mask = ggml_new_tensor_2d(gctx, GGML_TYPE_F32, n, n);
     ggml_set_input(kq_mask);
 
+    // Gemma3 SWA: layer 0 is always a "local" layer (since (0+1)%6 != 0),
+    // so when SWA is active we use the window-bound mask + base 10000
+    // for this single-layer graph.
+    const bool layer0_is_swa = sp_is_gemma3_swa_layer(0, impl_->swa_window);
+    const float block0_freq_base =
+        layer0_is_swa ? impl_->swa_rope_freq_base : impl_->rope_freq_base;
+
     ggml_tensor* x = ggml_get_rows(gctx, W->tok_embd, ids);
     if (impl_->embd_scale != 1.0f) {
         x = ggml_scale(gctx, x, impl_->embd_scale);
@@ -503,8 +552,8 @@ bool ForwardContext::forward_one_block(const std::vector<int32_t>& token_ids,
     x = build_block(gctx, x, pos, kq_mask, freq_factors, impl_->alibi_max_bias,
                      W->layers()[0], n,
                      impl_->head_dim, impl_->n_head, impl_->n_head_kv,
-                     impl_->n_rot, impl_->rope_freq_base, impl_->rope_freq_scale,
-                     impl_->rms_norm_eps, impl_->rope_mode);
+                     impl_->n_rot, block0_freq_base, impl_->rope_freq_scale,
+                     impl_->rms_norm_eps, impl_->rope_mode, impl_->ffn_gelu);
     ggml_set_output(x);
 
     ggml_cgraph* graph = ggml_new_graph(gctx);
@@ -525,15 +574,19 @@ bool ForwardContext::forward_one_block(const std::vector<int32_t>& token_ids,
     // -INF if kv > q, else the ALiBi distance (-(q-kv)) when ALiBi is
     // on, else 0. With max_bias=0 ggml uses slope=1 on the mask, so
     // the 0/−INF convention degenerates to the usual causal mask.
+    // Gemma3 SWA: when layer 0 is a local layer, additionally -INF
+    // any kv farther than (swa_window - 1) positions back.
     {
         std::vector<float> mask((size_t)n * (size_t)n);
         const bool alibi = (impl_->alibi_max_bias > 0.0f);
+        const int w = layer0_is_swa ? impl_->swa_window : 0;
         for (int q = 0; q < n; ++q) {
             for (int kv = 0; kv < n; ++kv) {
                 float v;
-                if (kv > q)      v = -INFINITY;
-                else if (alibi)  v = -(float)(q - kv);
-                else             v = 0.0f;
+                if (kv > q)                 v = -INFINITY;
+                else if (w > 0 && q - kv >= w) v = -INFINITY;
+                else if (alibi)             v = -(float)(q - kv);
+                else                        v = 0.0f;
                 mask[(size_t)q * n + kv] = v;
             }
         }
@@ -598,6 +651,13 @@ bool ForwardContext::forward_full(const std::vector<int32_t>& token_ids,
     }
     ggml_tensor* kq_mask = ggml_new_tensor_2d(gctx, GGML_TYPE_F32, n, n);
     ggml_set_input(kq_mask);
+    // Gemma3 SWA: second mask tensor only allocated when SWA is active.
+    // Global layers (1-in-6) use kq_mask; local layers use kq_mask_swa.
+    ggml_tensor* kq_mask_swa = nullptr;
+    if (impl_->swa_window > 0) {
+        kq_mask_swa = ggml_new_tensor_2d(gctx, GGML_TYPE_F32, n, n);
+        ggml_set_input(kq_mask_swa);
+    }
 
     ggml_tensor* x = ggml_get_rows(gctx, W->tok_embd, ids);
     if (impl_->embd_scale != 1.0f) {
@@ -614,11 +674,16 @@ bool ForwardContext::forward_full(const std::vector<int32_t>& token_ids,
     for (int i = 0; i < impl_->n_layer; ++i) {
         ggml_tensor* k_cap = nullptr;
         ggml_tensor* v_cap = nullptr;
-        x = build_block(gctx, x, pos, kq_mask, freq_factors, impl_->alibi_max_bias,
+        // Per-layer SWA dispatch: local gemma3 layers swap mask + rope base.
+        const bool local = sp_is_gemma3_swa_layer(i, impl_->swa_window);
+        ggml_tensor* layer_mask = local ? kq_mask_swa : kq_mask;
+        const float layer_freq_base = local ? impl_->swa_rope_freq_base
+                                             : impl_->rope_freq_base;
+        x = build_block(gctx, x, pos, layer_mask, freq_factors, impl_->alibi_max_bias,
                          W->layers()[(size_t)i], n,
                          impl_->head_dim, impl_->n_head, impl_->n_head_kv,
-                         impl_->n_rot, impl_->rope_freq_base, impl_->rope_freq_scale,
-                         impl_->rms_norm_eps, impl_->rope_mode,
+                         impl_->n_rot, layer_freq_base, impl_->rope_freq_scale,
+                         impl_->rms_norm_eps, impl_->rope_mode, impl_->ffn_gelu,
                          capture ? &k_cap : nullptr,
                          capture ? &v_cap : nullptr);
         if (capture) {
@@ -667,6 +732,24 @@ bool ForwardContext::forward_full(const std::vector<int32_t>& token_ids,
             }
         }
         ggml_backend_tensor_set(kq_mask, mask.data(), 0, mask.size() * sizeof(float));
+
+        // Gemma3 SWA mask — identical to the causal mask above but with
+        // the additional constraint that (q - kv) < swa_window. Keys
+        // older than the window are -INF. ggml_backend_tensor_set is
+        // synchronous on the CUDA backend so reusing `mask` in place
+        // after the first upload is safe.
+        if (kq_mask_swa) {
+            const int w = impl_->swa_window;
+            for (int q = 0; q < n; ++q) {
+                for (int kv = 0; kv < n; ++kv) {
+                    if (kv <= q && q - kv >= w) {
+                        mask[(size_t)q * n + kv] = -INFINITY;
+                    }
+                }
+            }
+            ggml_backend_tensor_set(kq_mask_swa, mask.data(), 0,
+                                    mask.size() * sizeof(float));
+        }
     }
 
     if (ggml_backend_graph_compute(impl_->backend, graph) != GGML_STATUS_SUCCESS) {
@@ -1027,6 +1110,13 @@ bool ForwardContext::decode(int32_t token_id,
     // the mask values as additive offsets with slope=1).
     ggml_tensor* mask = ggml_new_tensor_2d(gctx, GGML_TYPE_F32, kv_tot, 1);
     ggml_set_input(mask);
+    // Gemma3 SWA: parallel mask for local layers. Only allocated when
+    // SWA is active; otherwise nullptr and every layer uses `mask`.
+    ggml_tensor* mask_swa = nullptr;
+    if (impl_->swa_window > 0) {
+        mask_swa = ggml_new_tensor_2d(gctx, GGML_TYPE_F32, kv_tot, 1);
+        ggml_set_input(mask_swa);
+    }
 
     ggml_tensor* x = ggml_get_rows(gctx, W->tok_embd, ids);
     if (impl_->embd_scale != 1.0f) {
@@ -1042,14 +1132,19 @@ bool ForwardContext::decode(int32_t token_id,
     for (int L = 0; L < impl_->n_layer; ++L) {
         ggml_tensor* k_cap = nullptr;
         ggml_tensor* v_cap = nullptr;
+        // Per-layer SWA dispatch: local gemma3 layers swap mask + rope base.
+        const bool local = sp_is_gemma3_swa_layer(L, impl_->swa_window);
+        ggml_tensor* layer_mask = local ? mask_swa : mask;
+        const float layer_freq_base = local ? impl_->swa_rope_freq_base
+                                             : impl_->rope_freq_base;
         x = build_block_decode(gctx, x, pos,
                                past_n > 0 ? past_K_tens[(size_t)L] : nullptr,
                                past_n > 0 ? past_V_tens[(size_t)L] : nullptr,
-                               mask, freq_factors, impl_->alibi_max_bias,
+                               layer_mask, freq_factors, impl_->alibi_max_bias,
                                W->layers()[(size_t)L],
                                past_n, hd, impl_->n_head, n_kv,
                                impl_->n_rot,
-                               impl_->rope_freq_base, impl_->rope_freq_scale,
+                               layer_freq_base, impl_->rope_freq_scale,
                                impl_->rms_norm_eps, impl_->rope_mode,
                                &k_cap, &v_cap);
         // Copy this layer's capture into its slice of the batched
@@ -1156,6 +1251,23 @@ bool ForwardContext::decode(int32_t token_id,
             for (int kv = 0; kv < kv_tot; ++kv) mvals[(size_t)kv] = -(float)(past_n - kv);
         }
         ggml_backend_tensor_set(mask, mvals.data(), 0, mvals.size() * sizeof(float));
+
+        // Gemma3 SWA mask for the 1-query decode row. Keys at kv=0..past_n-1
+        // are past positions 0..past_n-1; kv=past_n is the new token at
+        // position past_n. SWA windows out any key whose position is more
+        // than (swa_window - 1) behind the new token. Position of kv index
+        // k is simply k, and the query position is past_n, so the mask is
+        // -INF when (past_n - k) >= swa_window.
+        if (mask_swa) {
+            const int w = impl_->swa_window;
+            for (int kv = 0; kv < kv_tot; ++kv) {
+                if (past_n - kv >= w) {
+                    mvals[(size_t)kv] = -INFINITY;
+                }
+            }
+            ggml_backend_tensor_set(mask_swa, mvals.data(), 0,
+                                    mvals.size() * sizeof(float));
+        }
     }
 
     if (ggml_backend_graph_compute(impl_->backend, graph) != GGML_STATUS_SUCCESS) {
