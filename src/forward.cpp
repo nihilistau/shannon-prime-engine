@@ -51,7 +51,9 @@ struct ForwardContext::Impl {
     // this tensor straight to ggml_rope_ext as freq_factors.
     ggml_tensor*       model_rope_freqs = nullptr;
 
-    ggml_backend_t        backend = nullptr;   // CPU only at this stage
+    ggml_backend_t        backend = nullptr;   // CPU by default; set via
+                                                // external_backend param or
+                                                // SP_ENGINE_BACKEND=gpu|cuda|vulkan
     bool                  owns_backend = false; // true if created here, false if
                                                 // passed in from outside
     ggml_backend_buffer_t compute_buf = nullptr;
