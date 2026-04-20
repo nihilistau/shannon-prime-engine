@@ -19,6 +19,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <utility>
 #include <vector>
 
 namespace sp::engine {
@@ -91,6 +92,44 @@ struct ForwardContext::Impl {
     // archs. Phase 3 reads/writes this alongside `cache` inside the
     // forward builder, dispatched on LlamaLayer::kind.
     class GdnStateCache* gdn_state = nullptr;
+
+    // ---- qwen35moe MoE + mRoPE hparams (zero/empty for other archs) --
+    // When `is_moe` is true, forward_full dispatches per-layer based on
+    // LlamaLayer::kind: standard-attention layers take the MOE_ATTN
+    // path (mRoPE + build_moe_ffn), the rest take the GDN scaffold
+    // (MOE_GDN). `rope_sections` is the 4-entry [t, h, w, extra] split
+    // used by ggml_rope_multi; for a text-only model the caller writes
+    // the same token position into all 4 per-token slots of pos_mrope,
+    // reducing mRoPE to standard RoPE. `rope_mode_mrope` =
+    // GGML_ROPE_TYPE_MROPE (8) for qwen35moe — mRoPE already implies
+    // NeoX-style interleaving internally; ORing in NEOX yields mode=10
+    // which the ggml CPU rope kernel rejects as an unknown type.
+    bool  is_moe              = false;
+    int   rope_sections[GGML_MROPE_SECTIONS] = {0, 0, 0, 0};
+    int   rope_mode_mrope     = GGML_ROPE_TYPE_MROPE;
+    int   n_expert            = 0;
+    int   n_expert_used       = 0;
+    bool  norm_topk_prob      = false;
+    float expert_weights_scale = 1.0f;
+
+    // ---- qwen35moe Gated DeltaNet hparams (MOE_GDN layers) ----------
+    // Mirrors what cli/main.cpp's smoke test reads from the GGUF.
+    //   conv_kernel    = qwen35moe.ssm.conv_kernel      (4)
+    //   d_state        = qwen35moe.ssm.state_size       (128) — per-head Q/K dim
+    //   n_group        = qwen35moe.ssm.group_count      (16)  — num Q/K heads
+    //   num_v_heads    = qwen35moe.ssm.time_step_rank   (32)
+    //   d_inner        = qwen35moe.ssm.inner_size       (4096) — V output width
+    //   head_v_dim     = d_inner / num_v_heads          (128)
+    //   conv_channels  = d_inner + 2 * n_group * d_state (8192)
+    //   head_qk_dim    = d_state                         (128)
+    // v_repeat = num_v_heads / n_group (= 2) encodes the K broadcast.
+    int gdn_conv_kernel   = 0;
+    int gdn_conv_channels = 0;
+    int gdn_num_v_heads   = 0;
+    int gdn_head_v_dim    = 0;
+    int gdn_num_qk_heads  = 0;
+    int gdn_head_qk_dim   = 0;
+    int gdn_d_inner       = 0;
 
     ~Impl() {
         if (compute_buf) ggml_backend_buffer_free(compute_buf);
@@ -205,6 +244,62 @@ std::unique_ptr<ForwardContext> ForwardContext::create(const Model& model,
     {
         const std::string& a = model.architecture();
         fc->impl_->ffn_gelu = (a == "gemma" || a == "gemma2" || a == "gemma3");
+    }
+
+    // qwen35moe MoE + mRoPE hparams. These stay zero/default for any
+    // arch that isn't qwen35moe, and `is_moe` gates the dispatch.
+    if (model.architecture() == "qwen35moe") {
+        fc->impl_->is_moe             = true;
+        fc->impl_->n_expert           = (int)model.get_i64("qwen35moe.expert_count", 0);
+        fc->impl_->n_expert_used      = (int)model.get_i64("qwen35moe.expert_used_count", 0);
+        fc->impl_->norm_topk_prob     =      model.get_i64("qwen35moe.expert_gating_func.norm_topk_prob",
+                                                           model.get_i64("qwen35moe.norm_topk_prob", 0)) != 0;
+        // expert_weights_scale: default 1.0 if key missing. Qwen families
+        // typically ship 1.0; DeepSeek-style archs scale by a global.
+        fc->impl_->expert_weights_scale = (float)model.get_f64(
+            "qwen35moe.expert_weights_scale", 1.0);
+
+        // mRoPE rotation layout: GGML_ROPE_TYPE_MROPE (=8) is a standalone
+        // rope-type value, not a bitmask — the CPU kernel switches on it
+        // directly and interleaves NeoX-style inside ggml_mrope_cache_init.
+        // Do NOT OR in GGML_ROPE_TYPE_NEOX (=2); the resulting mode=10
+        // matches no case and the kernel aborts with "rope type not
+        // supported".
+        fc->impl_->rope_mode_mrope = GGML_ROPE_TYPE_MROPE;
+
+        // Section split for rope_multi. For a text-only run every entry
+        // in pos_mrope is written with the same value, so the split is
+        // load-bearing only when/if image tokens enter. Still, ggml
+        // requires sum(sections) == n_rot/2; fall back to a single
+        // full-width section if the GGUF key is missing.
+        std::vector<int32_t> secs = model.get_i32_array("qwen35moe.rope.dimension_sections");
+        for (int i = 0; i < GGML_MROPE_SECTIONS; ++i) fc->impl_->rope_sections[i] = 0;
+        if ((int)secs.size() == GGML_MROPE_SECTIONS) {
+            for (int i = 0; i < GGML_MROPE_SECTIONS; ++i) {
+                fc->impl_->rope_sections[i] = secs[i];
+            }
+        } else {
+            // One big section covering the whole rotation; equivalent
+            // to standard RoPE when all per-token pos slots are equal.
+            fc->impl_->rope_sections[0] = fc->impl_->n_rot / 2;
+        }
+
+        // GDN (linear-attention) hparams for MOE_GDN layers. The same
+        // numbers also feed cli/main.cpp's GdnStateCache sizing — we
+        // re-read them here so forward_full doesn't need to reach into
+        // the cache object to build the compute graph.
+        const int conv_kernel   = (int)model.get_i64("qwen35moe.ssm.conv_kernel",    4);
+        const int d_state       = (int)model.get_i64("qwen35moe.ssm.state_size",     128);
+        const int n_group       = (int)model.get_i64("qwen35moe.ssm.group_count",    16);
+        const int num_v_heads   = (int)model.get_i64("qwen35moe.ssm.time_step_rank", 32);
+        const int d_inner       = (int)model.get_i64("qwen35moe.ssm.inner_size",     4096);
+        fc->impl_->gdn_conv_kernel   = conv_kernel;
+        fc->impl_->gdn_conv_channels = d_inner + 2 * n_group * d_state;
+        fc->impl_->gdn_num_v_heads   = num_v_heads;
+        fc->impl_->gdn_head_v_dim    = (num_v_heads > 0) ? (d_inner / num_v_heads) : 0;
+        fc->impl_->gdn_num_qk_heads  = n_group;
+        fc->impl_->gdn_head_qk_dim   = d_state;
+        fc->impl_->gdn_d_inner       = d_inner;
     }
 
     // PrimePE precompute. One allocation per ForwardContext; re-uploaded
@@ -392,6 +487,114 @@ static inline bool sp_is_gemma3_swa_layer(int layer_idx, int swa_window) {
 }
 
 // ------------------------------------------------------------------
+// MoE FFN helper (qwen35moe).
+//
+// Input:
+//   cur [n_embd, n_tokens] — the RMS-normed hidden state entering the
+//                            FFN block. Already residual-streamed by
+//                            the attention / GDN stage.
+// Output:
+//   [n_embd, n_tokens] — MoE + shared-expert contribution. The caller
+//                        is responsible for the residual add.
+//
+// Flow (matches llama.cpp / reference transformers qwen3moe):
+//   1. logits = ffn_gate_inp @ cur           [n_expert, n_tokens]
+//   2. probs  = softmax(logits)              [n_expert, n_tokens]
+//   3. ids    = top_k(probs, k)              [k, n_tokens]   I32
+//   4. w      = gather(probs, ids)           [1, k, n_tokens]
+//      (optional) renormalise w so sum_k == 1, or scale by a global.
+//   5. For each of {gate, up}: ggml_mul_mat_id over the expert bank —
+//      output shape [n_ff, k, n_tokens]. gate → silu; par = gate * up.
+//      down = mul_mat_id(ffn_down_exps, par, ids) → [n_embd, k, n_tokens].
+//   6. Weight each expert output by w and sum over k. Produces the
+//      per-token MoE contribution [n_embd, n_tokens].
+//   7. Shared expert (optional): silu(gate @ cur) * (up @ cur) @ down,
+//      optionally gated by sigmoid(ffn_gate_inp_shexp @ cur). Added to
+//      the MoE contribution.
+// ------------------------------------------------------------------
+static ggml_tensor* build_moe_ffn(ggml_context* gctx,
+                                   ggml_tensor* cur,
+                                   const LlamaLayer& L,
+                                   int   n_expert,
+                                   int   n_expert_used,
+                                   bool  norm_topk_prob,
+                                   float expert_weights_scale) {
+    const int n_tokens = (int)cur->ne[1];
+    const int n_embd   = (int)cur->ne[0];
+
+    // 1-2. Router scores over the expert pool.
+    ggml_tensor* logits = ggml_mul_mat(gctx, L.ffn_gate_inp, cur);   // [n_expert, n]
+    ggml_tensor* probs  = ggml_soft_max(gctx, logits);               // [n_expert, n]
+
+    // 3. Top-k expert indices per token.
+    ggml_tensor* selected = ggml_top_k(gctx, probs, n_expert_used);  // [k, n]   I32
+
+    // 4. Gather probs at the selected slots. ggml_get_rows treats dim 0
+    //    as the data width and indexes along dim 1, carrying the higher
+    //    dims through untouched. Reshape probs to [1, n_expert, n] so
+    //    dim 1 is the row-axis and dim 2 is the token batch; the I32
+    //    index tensor selected[k, n] then yields [1, k, n].
+    ggml_tensor* probs_3d = ggml_reshape_3d(gctx, probs, 1, n_expert, n_tokens);
+    ggml_tensor* weights  = ggml_get_rows(gctx, probs_3d, selected); // [1, k, n]
+
+    if (norm_topk_prob) {
+        // Sum over the k-dim. sum_rows sums dim 0, so permute k to
+        // dim 0, sum, and let broadcasting handle the divide. The
+        // summed tensor is [1, 1, n]; dividing weights [1, k, n] by
+        // it broadcasts along dim 1 (ggml_div uses can_repeat).
+        ggml_tensor* w_kfirst = ggml_cont(gctx,
+            ggml_permute(gctx, weights, 1, 0, 2, 3));                // [k, 1, n]
+        ggml_tensor* w_sum    = ggml_sum_rows(gctx, w_kfirst);       // [1, 1, n]
+        weights = ggml_div(gctx, weights, w_sum);
+    }
+    if (expert_weights_scale != 0.0f && expert_weights_scale != 1.0f) {
+        weights = ggml_scale(gctx, weights, expert_weights_scale);
+    }
+
+    // 5. Expert bank application. cur → [n_embd, 1, n_tokens] for
+    //    mul_mat_id; the k-dim is introduced by the indirect lookup.
+    ggml_tensor* cur_3d = ggml_reshape_3d(gctx, cur, n_embd, 1, n_tokens);
+
+    ggml_tensor* up_e   = ggml_mul_mat_id(gctx, L.ffn_up_exps,   cur_3d, selected);  // [n_ff, k, n]
+    ggml_tensor* gate_e = ggml_mul_mat_id(gctx, L.ffn_gate_exps, cur_3d, selected);  // [n_ff, k, n]
+    gate_e = ggml_silu(gctx, gate_e);
+    ggml_tensor* par = ggml_mul(gctx, gate_e, up_e);                                  // [n_ff, k, n]
+    ggml_tensor* down_e = ggml_mul_mat_id(gctx, L.ffn_down_exps, par, selected);     // [n_embd, k, n]
+
+    // 6. Weight each expert output and sum across k.
+    ggml_tensor* weighted = ggml_mul(gctx, down_e, weights);                          // [n_embd, k, n]
+
+    // Reduce over k (dim 1). sum_rows sums dim 0, so permute k to the
+    // front, sum, and reshape the leading 1 off.
+    ggml_tensor* weighted_kfirst = ggml_cont(gctx,
+        ggml_permute(gctx, weighted, 1, 0, 2, 3));                                    // [k, n_embd, n]
+    ggml_tensor* summed = ggml_sum_rows(gctx, weighted_kfirst);                       // [1, n_embd, n]
+    ggml_tensor* moe_out = ggml_reshape_2d(gctx, summed, n_embd, n_tokens);           // [n_embd, n]
+
+    // 7. Shared expert (qwen35moe: sigmoid-gated, runs for every token).
+    if (L.ffn_gate_shexp && L.ffn_up_shexp && L.ffn_down_shexp) {
+        ggml_tensor* s_gate = ggml_mul_mat(gctx, L.ffn_gate_shexp, cur);   // [n_ff_shexp, n]
+        ggml_tensor* s_up   = ggml_mul_mat(gctx, L.ffn_up_shexp,   cur);   // [n_ff_shexp, n]
+        s_gate = ggml_silu(gctx, s_gate);
+        ggml_tensor* s_par  = ggml_mul(gctx, s_gate, s_up);
+        ggml_tensor* s_out  = ggml_mul_mat(gctx, L.ffn_down_shexp, s_par); // [n_embd, n]
+
+        if (L.ffn_gate_inp_shexp) {
+            // Per-token gating scalar — ffn_gate_inp_shexp is (n_embd, 1),
+            // so mul_mat yields [1, n]. sigmoid keeps it in [0, 1]; the
+            // broadcast-multiply with s_out [n_embd, n] repeats along
+            // dim 0.
+            ggml_tensor* g = ggml_mul_mat(gctx, L.ffn_gate_inp_shexp, cur); // [1, n]
+            g = ggml_sigmoid(gctx, g);
+            s_out = ggml_mul(gctx, s_out, g);
+        }
+        moe_out = ggml_add(gctx, moe_out, s_out);
+    }
+
+    return moe_out;
+}
+
+// ------------------------------------------------------------------
 // Shared per-block graph builder. Given an already-embedded hidden
 // state `x` and the current RoPE position tensor `pos`, builds the
 // attention + FFN block from `L` and returns the updated hidden state.
@@ -514,6 +717,342 @@ static ggml_tensor* build_block(ggml_context* gctx,
     }
 
     x = ggml_add(gctx, x, ffn);
+    return x;
+}
+
+// ------------------------------------------------------------------
+// qwen35moe full-attention layer builder.
+//
+// Mirrors build_block's attention section but with three swaps:
+//   1. ggml_rope_multi (multi-section mRoPE) instead of ggml_rope_ext.
+//      The pos tensor carries 4 * n_tokens I32 values (one per section
+//      per token; for text-only models the four per-token values are
+//      identical to the token position).
+//   2. attn_post_norm plays the role of FFN pre-norm here — the GGUF
+//      binds `blk.N.post_attention_norm.weight` as `attn_post_norm`,
+//      and for qwen35moe this sits between the attention residual
+//      and the MoE block (not as a gemma3-style sandwich norm on the
+//      attention output).
+//   3. Dense FFN replaced by the MoE bank (build_moe_ffn).
+// ------------------------------------------------------------------
+static ggml_tensor* build_block_moe_attn(ggml_context* gctx,
+                                          ggml_tensor* x,
+                                          ggml_tensor* pos_mrope,   // I32[4*n]
+                                          ggml_tensor* kq_mask,
+                                          ggml_tensor* freq_factors,
+                                          const LlamaLayer& L,
+                                          int n,
+                                          int head_dim,
+                                          int n_head,
+                                          int n_head_kv,
+                                          int n_rot,
+                                          int rope_sections[GGML_MROPE_SECTIONS],
+                                          int rope_mode_mrope,   // NEOX | MROPE
+                                          float freq_base,
+                                          float freq_scale,
+                                          float rms_eps,
+                                          int   n_expert,
+                                          int   n_expert_used,
+                                          bool  norm_topk_prob,
+                                          float expert_weights_scale,
+                                          ggml_tensor** k_capture = nullptr,
+                                          ggml_tensor** v_capture = nullptr) {
+    // Qwen3-Next gated attention.
+    //
+    // The wq projection is 2× wider than a standard attention head
+    // stack: wq->ne[1] == n_head * head_dim * 2. Each head's slab
+    // splits into two head_dim halves along the innermost axis:
+    //
+    //     [head_dim (Q) | head_dim (gate)] × n_head
+    //
+    // The first half is the actual Q tensor that attends against K
+    // (subject to q_norm and RoPE); the second half is a linear "gate"
+    // that is passed through sigmoid and multiplied element-wise into
+    // the flash-attention output before wo. This is the pattern that
+    // makes wo's input dim (n_head * head_dim = 4096) match the scored
+    // output rather than 2 * n_head * head_dim.
+    //
+    // K / V are ordinary GQA projections (n_head_kv heads of head_dim);
+    // the residual stream width (n_embd) is decoupled from
+    // n_head * head_dim, with wo bringing the attention output back to
+    // the 2048-wide residual.
+    const int n_embd_q = n_head * head_dim;                    // 4096
+    const size_t ele_q = ggml_type_size(GGML_TYPE_F32);         // Q/K/V are f32 after mul_mat
+
+    // --- Attention -------------------------------------------------
+    ggml_tensor* xa = ggml_rms_norm(gctx, x, rms_eps);
+    xa = ggml_mul(gctx, xa, L.attn_norm);
+
+    ggml_tensor* Q_full = ggml_mul_mat(gctx, L.wq, xa);   // [2*head_dim*n_head, n]
+    if (L.bq) Q_full = ggml_add(gctx, Q_full, L.bq);
+    ggml_tensor* K = ggml_mul_mat(gctx, L.wk, xa);
+    if (L.bk) K = ggml_add(gctx, K, L.bk);
+    ggml_tensor* V = ggml_mul_mat(gctx, L.wv, xa);
+    if (L.bv) V = ggml_add(gctx, V, L.bv);
+
+    // Reshape Q_full to [2*head_dim, n_head, n], then split the
+    // innermost axis into the Q half (offset 0) and the gate half
+    // (offset head_dim). The views are non-contiguous along dim 0 so
+    // we cont() them before further ops; rms_norm and rope_multi both
+    // require contiguous input along the rotated axis.
+    Q_full = ggml_reshape_3d(gctx, Q_full, 2 * head_dim, n_head, n);
+    ggml_tensor* Q = ggml_view_3d(gctx, Q_full,
+                                  head_dim, n_head, n,
+                                  Q_full->nb[1], Q_full->nb[2],
+                                  0);
+    ggml_tensor* Gate = ggml_view_3d(gctx, Q_full,
+                                     head_dim, n_head, n,
+                                     Q_full->nb[1], Q_full->nb[2],
+                                     (size_t)head_dim * ele_q);
+    Q    = ggml_cont(gctx, Q);
+    Gate = ggml_cont(gctx, Gate);
+
+    K = ggml_reshape_3d(gctx, K, head_dim, n_head_kv, n);
+    V = ggml_reshape_3d(gctx, V, head_dim, n_head_kv, n);
+
+    if (L.attn_q_norm) {
+        Q = ggml_rms_norm(gctx, Q, rms_eps);
+        Q = ggml_mul(gctx, Q, L.attn_q_norm);
+    }
+    if (L.attn_k_norm) {
+        K = ggml_rms_norm(gctx, K, rms_eps);
+        K = ggml_mul(gctx, K, L.attn_k_norm);
+    }
+
+    // Multi-section RoPE. `sections[]` is the [t, h, w, extra] split of
+    // n_rot/2; sum(sections) == n_rot/2. For text-only inputs (our
+    // qwen35moe case) the same token position is written to all four
+    // per-token slots in `pos_mrope` by the caller, so mRoPE collapses
+    // to standard RoPE. Keeping the rope_multi op means a
+    // future image-capable qwen variant could reuse this path unchanged.
+    Q = ggml_rope_multi(gctx, Q, pos_mrope, freq_factors,
+                        n_rot, rope_sections, rope_mode_mrope, 0,
+                        freq_base, freq_scale, 0, 1, 32, 1);
+    K = ggml_rope_multi(gctx, K, pos_mrope, freq_factors,
+                        n_rot, rope_sections, rope_mode_mrope, 0,
+                        freq_base, freq_scale, 0, 1, 32, 1);
+
+    V = ggml_cont(gctx, V);
+    if (k_capture) *k_capture = K;
+    if (v_capture) *v_capture = V;
+
+    ggml_tensor* qp = ggml_permute(gctx, Q, 0, 2, 1, 3);
+    ggml_tensor* kp = ggml_permute(gctx, K, 0, 2, 1, 3);
+    ggml_tensor* vp = ggml_permute(gctx, V, 0, 2, 1, 3);
+    if (kp->type == GGML_TYPE_F32) kp = ggml_cast(gctx, kp, GGML_TYPE_F16);
+    if (vp->type == GGML_TYPE_F32) vp = ggml_cast(gctx, vp, GGML_TYPE_F16);
+    ggml_tensor* mask_f16 = ggml_cast(gctx, kq_mask, GGML_TYPE_F16);
+    ggml_tensor* attn = ggml_flash_attn_ext(gctx, qp, kp, vp, mask_f16,
+                                            1.0f / sqrtf((float)head_dim),
+                                            0.0f, 0.0f);
+    ggml_flash_attn_ext_set_prec(attn, GGML_PREC_F32);
+    // attn comes back as [head_dim, n_head, n]. Apply the sigmoid gate
+    // element-wise before the wo projection.
+    ggml_tensor* gate_sig = ggml_sigmoid(gctx, Gate);
+    attn = ggml_mul(gctx, attn, gate_sig);
+    attn = ggml_reshape_2d(gctx, attn, n_embd_q, n);
+
+    ggml_tensor* y1 = ggml_mul_mat(gctx, L.wo, attn);
+    if (L.bo) y1 = ggml_add(gctx, y1, L.bo);
+
+    x = ggml_add(gctx, x, y1);
+
+    // --- MoE FFN ---------------------------------------------------
+    // In qwen35moe, `attn_post_norm` is the FFN pre-norm (not a
+    // sandwich norm on y1). If it's absent for some reason, skip the
+    // extra norm and feed the residual straight into the MoE block.
+    ggml_tensor* xb = x;
+    if (L.attn_post_norm) {
+        xb = ggml_rms_norm(gctx, x, rms_eps);
+        xb = ggml_mul(gctx, xb, L.attn_post_norm);
+    }
+    ggml_tensor* moe = build_moe_ffn(gctx, xb, L,
+                                      n_expert, n_expert_used,
+                                      norm_topk_prob, expert_weights_scale);
+
+    x = ggml_add(gctx, x, moe);
+    return x;
+}
+
+// ------------------------------------------------------------------
+// qwen35moe Gated-DeltaNet layer builder (Phase 3c-bis).
+//
+// Implements the real Qwen3-Next linear-attention block against the
+// bound weights:
+//
+//   xa = RMSNorm(x) * attn_norm                           [n_embd, n]
+//   qkv_raw = gdn_qkv @ xa                                [conv_channels, n]
+//   z       = gdn_gate @ xa                               [d_inner,      n]
+//   sx = [zero_state (d_conv-1) | qkv_rawᵀ]               [d_conv-1+n, conv_channels]
+//   qkv_c = silu(ssm_conv(sx, ssm_conv1d))                [conv_channels, n]
+//   split qkv_c into (Q, K, V) along channel axis:
+//     Q: [head_qk_dim, num_qk_heads, n]  (16*128=2048 ch)
+//     K: [head_qk_dim, num_qk_heads, n]  (16*128=2048 ch)
+//     V: [head_v_dim,  num_v_heads,  n]  (32*128=4096 ch)
+//   dt    = softplus(ssm_alpha @ xa + ssm_dt)             [num_v_heads, n]
+//   g     = (-exp(ssm_a)) * dt                            [num_v_heads, n]
+//   beta  = sigmoid(ssm_beta @ xa)                        [num_v_heads, n]
+//   attn  = gated_delta_net(Q, K, V, g, beta, zero_state) [head_v_dim, num_v_heads, n]
+//   attn  = silu(z) * (RMSNorm(attn) * ssm_norm)          [head_v_dim, num_v_heads, n]
+//   y     = ssm_out @ flatten(attn)                       [n_embd, n]
+//
+// STAGE 2: per-layer state IO. The caller allocates one (conv_state_in,
+// ssm_state_in) pair per MOE_GDN layer and fills them from a bound
+// GdnStateCache before compute (or zero-fills them for a fresh prefill).
+// We return the NEW state via out-params — the last (d_conv-1) rows of
+// sx for the conv history, and the tail S_v*S_v*H columns of the
+// gated_delta_net output for the SSM state — both materialised via
+// ggml_cont so their bytes are contiguous for ggml_backend_tensor_get.
+// forward_full marks them as graph outputs and writes them back into
+// the cache after compute.
+// ------------------------------------------------------------------
+static ggml_tensor* build_block_gdn(ggml_context* gctx,
+                                     ggml_tensor* x,                 // [n_embd, n]
+                                     ggml_tensor* conv_state_in,     // [d_conv-1, conv_channels, 1]
+                                     ggml_tensor* ssm_state_in,      // [head_v_dim*head_v_dim*num_v_heads, 1]
+                                     ggml_tensor** out_conv_state,   // NEW conv history to persist
+                                     ggml_tensor** out_ssm_state,    // NEW ssm state   to persist
+                                     const LlamaLayer& L,
+                                     int n,
+                                     int conv_kernel,
+                                     int conv_channels,
+                                     int num_v_heads,
+                                     int head_v_dim,
+                                     int num_qk_heads,
+                                     int head_qk_dim,
+                                     float rms_eps,
+                                     int   n_expert,
+                                     int   n_expert_used,
+                                     bool  norm_topk_prob,
+                                     float expert_weights_scale) {
+    const int qk_dim = num_qk_heads * head_qk_dim;  // 2048
+    const int v_dim  = num_v_heads  * head_v_dim;   // 4096
+    const size_t ele = ggml_type_size(GGML_TYPE_F32);
+
+    // --- Pre-norm + input projections -----------------------------
+    ggml_tensor* xa = ggml_rms_norm(gctx, x, rms_eps);
+    xa = ggml_mul(gctx, xa, L.attn_norm);                           // [n_embd, n]
+
+    ggml_tensor* qkv_raw = ggml_mul_mat(gctx, L.gdn_qkv, xa);       // [conv_channels, n]
+    ggml_tensor* z       = ggml_mul_mat(gctx, L.gdn_gate, xa);      // [d_inner,       n]
+
+    // --- Causal depthwise 1D conv over QKV stream -----------------
+    // ssm_conv expects sx with shape [d_conv-1+n_t, d_inner, n_s]
+    // (ne[0]=time axis, ne[1]=channel). qkv_raw is [channel, n] so
+    // transpose to [n, channel] and prepend `d_conv-1` zero rows.
+    ggml_tensor* qkv_t = ggml_cont(gctx, ggml_transpose(gctx, qkv_raw)); // [n, conv_channels]
+
+    // conv_state_in is [d_conv-1, conv_channels, 1]; squeeze to 2D for concat.
+    ggml_tensor* conv_pad = ggml_reshape_2d(gctx, conv_state_in,
+                                            conv_kernel - 1, conv_channels); // [d_conv-1, conv_channels]
+
+    // Concatenate along time axis (dim 0): [d_conv-1+n, conv_channels].
+    ggml_tensor* sx = ggml_concat(gctx, conv_pad, qkv_t, /*dim=*/0);
+    sx = ggml_reshape_3d(gctx, sx, conv_kernel - 1 + n, conv_channels, 1);
+
+    ggml_tensor* qkv_conv = ggml_ssm_conv(gctx, sx, L.ssm_conv1d);  // [conv_channels, n, 1]
+    qkv_conv = ggml_silu(gctx, qkv_conv);
+    qkv_conv = ggml_reshape_2d(gctx, qkv_conv, conv_channels, n);   // [conv_channels, n]
+
+    // --- Split into Q, K, V along channel axis -------------------
+    // Channel layout (HF Qwen3Next in_proj convention): [Q | K | V].
+    ggml_tensor* Qc = ggml_view_2d(gctx, qkv_conv, qk_dim, n,
+                                    qkv_conv->nb[1], 0);
+    ggml_tensor* Kc = ggml_view_2d(gctx, qkv_conv, qk_dim, n,
+                                    qkv_conv->nb[1], (size_t)qk_dim * ele);
+    ggml_tensor* Vc = ggml_view_2d(gctx, qkv_conv, v_dim,  n,
+                                    qkv_conv->nb[1], (size_t)(2 * qk_dim) * ele);
+    Qc = ggml_cont(gctx, Qc);
+    Kc = ggml_cont(gctx, Kc);
+    Vc = ggml_cont(gctx, Vc);
+    Qc = ggml_reshape_4d(gctx, Qc, head_qk_dim, num_qk_heads, n, 1);
+    Kc = ggml_reshape_4d(gctx, Kc, head_qk_dim, num_qk_heads, n, 1);
+    Vc = ggml_reshape_4d(gctx, Vc, head_v_dim,  num_v_heads,  n, 1);
+
+    // --- Input-dependent gates (g, beta) --------------------------
+    // dt = softplus(ssm_alpha @ xa + ssm_dt_bias)     [num_v_heads, n]
+    // g  = -exp(ssm_a) * dt                           [num_v_heads, n]
+    // beta = sigmoid(ssm_beta @ xa)                   [num_v_heads, n]
+    ggml_tensor* alpha_raw = ggml_mul_mat(gctx, L.ssm_alpha, xa);   // [num_v_heads, n]
+    ggml_tensor* dt_raw    = ggml_add(gctx, alpha_raw, L.ssm_dt);   // broadcast [num_v_heads]
+    ggml_tensor* dt_sp     = ggml_softplus(gctx, dt_raw);
+
+    ggml_tensor* neg_exp_a = ggml_scale(gctx, ggml_exp(gctx, L.ssm_a), -1.0f); // [num_v_heads]
+    ggml_tensor* g         = ggml_mul(gctx, dt_sp, neg_exp_a);      // broadcast over n
+    // Reshape to 4D [1, num_v_heads, n, 1] — non-KDA mode (scalar g per head).
+    g = ggml_reshape_4d(gctx, g, 1, num_v_heads, n, 1);
+
+    ggml_tensor* beta_raw = ggml_mul_mat(gctx, L.ssm_beta, xa);     // [num_v_heads, n]
+    ggml_tensor* beta     = ggml_sigmoid(gctx, beta_raw);
+    beta = ggml_reshape_4d(gctx, beta, 1, num_v_heads, n, 1);
+
+    // --- Gated delta-rule recurrence -----------------------------
+    // state: [head_v_dim * head_v_dim * num_v_heads, n_seqs=1].
+    // ggml_gated_delta_net output layout is [S_v*H, n_tokens + S_v]:
+    // the first `n` columns hold the attention scores; the trailing
+    // S_v columns hold the updated per-head S_v*S_v state matrices,
+    // laid out so head h occupies columns [h*S_v/H, (h+1)*S_v/H).
+    ggml_tensor* attn_out = ggml_gated_delta_net(gctx, Qc, Kc, Vc, g, beta, ssm_state_in);
+    ggml_tensor* attn = ggml_view_3d(gctx, attn_out,
+                                     head_v_dim, num_v_heads, n,
+                                     (size_t)head_v_dim * ele,
+                                     (size_t)head_v_dim * num_v_heads * ele,
+                                     0);
+    attn = ggml_cont(gctx, attn);
+
+    // --- Extract new SSM state: tail S_v columns of attn_out -----
+    // Shape [S_v*H, S_v] — S_v*S_v*H floats, same flat byte layout
+    // the kernel expects as state input on the next forward call.
+    if (out_ssm_state) {
+        ggml_tensor* ssm_new_view = ggml_view_2d(gctx, attn_out,
+                                                  (int64_t)head_v_dim * num_v_heads,
+                                                  (int64_t)head_v_dim,
+                                                  attn_out->nb[1],
+                                                  (size_t)n * attn_out->nb[1]);
+        *out_ssm_state = ggml_cont(gctx, ssm_new_view);
+    }
+
+    // --- Extract new conv history: last (d_conv-1) rows of sx ----
+    // sx is [d_conv-1+n, conv_channels, 1]; we want rows [n, n+d_conv-2]
+    // so the next forward_full can feed them back as the left-context
+    // of its ssm_conv. For n=0 (reset case) this degenerates to a
+    // zero tensor; for 0<n<d_conv-1 it still slides correctly because
+    // the offset n*nb[0] keeps the window anchored on the tail.
+    if (out_conv_state) {
+        ggml_tensor* conv_new_view = ggml_view_3d(gctx, sx,
+                                                   (int64_t)(conv_kernel - 1),
+                                                   (int64_t)conv_channels,
+                                                   (int64_t)1,
+                                                   sx->nb[1], sx->nb[2],
+                                                   (size_t)n * sx->nb[0]);
+        *out_conv_state = ggml_cont(gctx, conv_new_view);
+    }
+
+    // --- Gated RMSNorm + output-gate multiply + output proj ------
+    attn = ggml_rms_norm(gctx, attn, rms_eps);
+    attn = ggml_mul(gctx, attn, L.ssm_norm);   // broadcast [head_v_dim]
+
+    // Apply silu(z) gate reshaped to match [head_v_dim, num_v_heads, n].
+    ggml_tensor* z_view = ggml_reshape_3d(gctx, z, head_v_dim, num_v_heads, n);
+    z_view = ggml_silu(gctx, z_view);
+    attn   = ggml_mul(gctx, attn, z_view);
+
+    attn = ggml_reshape_2d(gctx, attn, v_dim, n);                   // [d_inner, n]
+    ggml_tensor* y1 = ggml_mul_mat(gctx, L.ssm_out, attn);          // [n_embd, n]
+
+    x = ggml_add(gctx, x, y1);
+
+    // --- MoE FFN (identical to build_block_moe_attn) -------------
+    ggml_tensor* xb = x;
+    if (L.attn_post_norm) {
+        xb = ggml_rms_norm(gctx, x, rms_eps);
+        xb = ggml_mul(gctx, xb, L.attn_post_norm);
+    }
+    ggml_tensor* moe = build_moe_ffn(gctx, xb, L,
+                                      n_expert, n_expert_used,
+                                      norm_topk_prob, expert_weights_scale);
+
+    x = ggml_add(gctx, x, moe);
     return x;
 }
 
@@ -659,6 +1198,54 @@ bool ForwardContext::forward_full(const std::vector<int32_t>& token_ids,
     ggml_tensor* pos = ggml_new_tensor_1d(gctx, GGML_TYPE_I32, n);
     ggml_set_input(pos);
 
+    // qwen35moe mRoPE pos tensor. ggml_rope_multi expects I32[4 * n]
+    // (one position per section per token). Only allocated for MoE
+    // archs — non-MoE paths never consult it. For text-only inputs we
+    // write the same token position into all four per-token slots, so
+    // mRoPE collapses to standard RoPE.
+    ggml_tensor* pos_mrope = nullptr;
+    if (impl_->is_moe) {
+        pos_mrope = ggml_new_tensor_1d(gctx, GGML_TYPE_I32,
+                                       (int64_t)(GGML_MROPE_SECTIONS * n));
+        ggml_set_input(pos_mrope);
+    }
+
+    // qwen35moe GDN: per-layer recurrent state I/O. Each MOE_GDN layer
+    // owns a (conv_state_in, ssm_state_in) pair the graph reads from
+    // before its delta-rule step, and a (conv_state_out, ssm_state_out)
+    // pair the graph writes its new state to. forward_full round-trips
+    // both pairs through the bound GdnStateCache — or zero-fills them
+    // on every call if no cache is bound (fresh-prefill semantics).
+    // Non-MOE_GDN layer indices leave all four slots null; the dispatch
+    // loop below skips them, and the read/write loops below check for
+    // nullptrs before touching the cache.
+    std::vector<ggml_tensor*> gdn_conv_state_in ((size_t)impl_->n_layer, nullptr);
+    std::vector<ggml_tensor*> gdn_ssm_state_in  ((size_t)impl_->n_layer, nullptr);
+    std::vector<ggml_tensor*> gdn_conv_state_out((size_t)impl_->n_layer, nullptr);
+    std::vector<ggml_tensor*> gdn_ssm_state_out ((size_t)impl_->n_layer, nullptr);
+    const bool have_gdn_shapes =
+        impl_->is_moe && impl_->gdn_conv_channels > 0 &&
+        impl_->gdn_conv_kernel > 1 && impl_->gdn_head_v_dim > 0 &&
+        impl_->gdn_num_v_heads > 0;
+    if (have_gdn_shapes) {
+        for (int il = 0; il < impl_->n_layer; ++il) {
+            if (W->layers()[(size_t)il].kind != LlamaLayerKind::MOE_GDN) continue;
+            gdn_conv_state_in[(size_t)il] = ggml_new_tensor_3d(
+                gctx, GGML_TYPE_F32,
+                impl_->gdn_conv_kernel - 1,
+                impl_->gdn_conv_channels,
+                1);
+            ggml_set_input(gdn_conv_state_in[(size_t)il]);
+            gdn_ssm_state_in[(size_t)il] = ggml_new_tensor_2d(
+                gctx, GGML_TYPE_F32,
+                (int64_t)impl_->gdn_head_v_dim *
+                    impl_->gdn_head_v_dim *
+                    impl_->gdn_num_v_heads,
+                1);
+            ggml_set_input(gdn_ssm_state_in[(size_t)il]);
+        }
+    }
+
     ggml_tensor* freq_factors = nullptr;
     if (!impl_->freq_factors_vec.empty()) {
         freq_factors = ggml_new_tensor_1d(gctx, GGML_TYPE_F32,
@@ -692,19 +1279,74 @@ bool ForwardContext::forward_full(const std::vector<int32_t>& token_ids,
     for (int i = 0; i < impl_->n_layer; ++i) {
         ggml_tensor* k_cap = nullptr;
         ggml_tensor* v_cap = nullptr;
-        // Per-layer SWA dispatch: local gemma3 layers swap mask + rope base.
-        const bool local = sp_is_gemma3_swa_layer(i, impl_->swa_window);
-        ggml_tensor* layer_mask = local ? kq_mask_swa : kq_mask;
-        const float layer_freq_base = local ? impl_->swa_rope_freq_base
-                                             : impl_->rope_freq_base;
-        x = build_block(gctx, x, pos, layer_mask, freq_factors, impl_->alibi_max_bias,
-                         W->layers()[(size_t)i], n,
-                         impl_->head_dim, impl_->n_head, impl_->n_head_kv,
-                         impl_->n_rot, layer_freq_base, impl_->rope_freq_scale,
-                         impl_->rms_norm_eps, impl_->rope_mode, impl_->ffn_gelu,
-                         capture ? &k_cap : nullptr,
-                         capture ? &v_cap : nullptr);
-        if (capture) {
+
+        const LlamaLayer& L = W->layers()[(size_t)i];
+
+        // Dispatch on the layer's kind. STANDARD covers all non-MoE
+        // archs (llama, qwen2/3, mistral, phi3, granite, gemma3); the
+        // MOE_* variants are qwen35moe-specific.
+        switch (L.kind) {
+        case LlamaLayerKind::STANDARD: {
+            // Per-layer SWA dispatch: local gemma3 layers swap mask + rope base.
+            const bool local = sp_is_gemma3_swa_layer(i, impl_->swa_window);
+            ggml_tensor* layer_mask = local ? kq_mask_swa : kq_mask;
+            const float layer_freq_base = local ? impl_->swa_rope_freq_base
+                                                 : impl_->rope_freq_base;
+            x = build_block(gctx, x, pos, layer_mask, freq_factors, impl_->alibi_max_bias,
+                             L, n,
+                             impl_->head_dim, impl_->n_head, impl_->n_head_kv,
+                             impl_->n_rot, layer_freq_base, impl_->rope_freq_scale,
+                             impl_->rms_norm_eps, impl_->rope_mode, impl_->ffn_gelu,
+                             capture ? &k_cap : nullptr,
+                             capture ? &v_cap : nullptr);
+            break;
+        }
+        case LlamaLayerKind::MOE_ATTN: {
+            x = build_block_moe_attn(gctx, x, pos_mrope, kq_mask, freq_factors,
+                                      L, n,
+                                      impl_->head_dim, impl_->n_head, impl_->n_head_kv,
+                                      impl_->n_rot, impl_->rope_sections,
+                                      impl_->rope_mode_mrope,
+                                      impl_->rope_freq_base, impl_->rope_freq_scale,
+                                      impl_->rms_norm_eps,
+                                      impl_->n_expert, impl_->n_expert_used,
+                                      impl_->norm_topk_prob, impl_->expert_weights_scale,
+                                      capture ? &k_cap : nullptr,
+                                      capture ? &v_cap : nullptr);
+            break;
+        }
+        case LlamaLayerKind::MOE_GDN: {
+            // GDN layers: no KV capture (no standard cache contribution).
+            // Per-layer recurrent-state slots come from the bound
+            // GdnStateCache; build_block_gdn writes the new state views
+            // into our two out-vectors so forward_full can mark them as
+            // graph outputs and persist them back to the cache.
+            ggml_tensor* conv_out = nullptr;
+            ggml_tensor* ssm_out  = nullptr;
+            x = build_block_gdn(gctx, x,
+                                 gdn_conv_state_in[(size_t)i],
+                                 gdn_ssm_state_in[(size_t)i],
+                                 &conv_out, &ssm_out,
+                                 L, n,
+                                 impl_->gdn_conv_kernel,
+                                 impl_->gdn_conv_channels,
+                                 impl_->gdn_num_v_heads,
+                                 impl_->gdn_head_v_dim,
+                                 impl_->gdn_num_qk_heads,
+                                 impl_->gdn_head_qk_dim,
+                                 impl_->rms_norm_eps,
+                                 impl_->n_expert, impl_->n_expert_used,
+                                 impl_->norm_topk_prob, impl_->expert_weights_scale);
+            if (conv_out) { ggml_set_output(conv_out); gdn_conv_state_out[(size_t)i] = conv_out; }
+            if (ssm_out)  { ggml_set_output(ssm_out);  gdn_ssm_state_out[(size_t)i]  = ssm_out;  }
+            break;
+        }
+        }
+
+        // K/V capture is only meaningful for attention layers. GDN
+        // layers leave k_cap/v_cap null — downstream readback skips
+        // those slots.
+        if (capture && k_cap && v_cap) {
             ggml_set_output(k_cap);
             ggml_set_output(v_cap);
             cap_K[(size_t)i] = k_cap;
@@ -722,7 +1364,14 @@ bool ForwardContext::forward_full(const std::vector<int32_t>& token_ids,
     ggml_tensor* logits = ggml_mul_mat(gctx, W->output, h);
     ggml_set_output(logits);
 
-    ggml_cgraph* graph = ggml_new_graph(gctx);
+    // GGML_DEFAULT_GRAPH_SIZE (2048) is enough for a dense n_layer=80
+    // attention model, but qwen35moe's MOE_GDN layers contribute ~35
+    // ggml ops each (ssm_conv, delta_net, two proj MLPs, norms,
+    // silu gates, reshapes…) on top of the MoE FFN. With n_layer=40
+    // and 30 of those being GDN, the graph exceeds 2048 nodes. Bump
+    // the capacity to 8192 which is still small (≈256 KiB overhead).
+    const size_t graph_size = (impl_->is_moe) ? 8192u : (size_t)GGML_DEFAULT_GRAPH_SIZE;
+    ggml_cgraph* graph = ggml_new_graph_custom(gctx, graph_size, /*grads=*/false);
     ggml_build_forward_expand(graph, logits);
     if (!ggml_gallocr_alloc_graph(impl_->allocr, graph)) {
         std::fprintf(stderr, "[sp-engine] forward_full: gallocr failed\n");
@@ -732,10 +1381,72 @@ bool ForwardContext::forward_full(const std::vector<int32_t>& token_ids,
     ggml_backend_tensor_set(ids, token_ids.data(), 0, (size_t)n * sizeof(int32_t));
     std::vector<int32_t> positions(n);
     for (int i = 0; i < n; ++i) positions[i] = i;
-    ggml_backend_tensor_set(pos, positions.data(), 0, (size_t)n * sizeof(int32_t));
+    // The `pos` tensor is only consumed by STANDARD-kind layers via
+    // ggml_rope_ext. Architectures like qwen35moe that route every
+    // layer through MOE_ATTN (which uses pos_mrope) or MOE_GDN (which
+    // uses no positional input) leave `pos` unreachable from the
+    // graph, so gallocr skips it and it has no backend buffer.
+    // Checking `pos->buffer` (via the view_src walk that
+    // ggml_backend_tensor_set does internally) keeps this safe.
+    if (pos->buffer || (pos->view_src && pos->view_src->buffer)) {
+        ggml_backend_tensor_set(pos, positions.data(), 0, (size_t)n * sizeof(int32_t));
+    }
+    if (pos_mrope) {
+        // Text-only mRoPE: replicate each token's position across all
+        // four per-section slots. ggml_rope_multi reads four consecutive
+        // I32 values per token — one per (t, h, w, extra) section — so
+        // with identical values mRoPE degenerates to standard RoPE.
+        std::vector<int32_t> positions_mrope((size_t)GGML_MROPE_SECTIONS * (size_t)n);
+        for (int t = 0; t < n; ++t) {
+            const int32_t p = (int32_t)t;
+            for (int s = 0; s < GGML_MROPE_SECTIONS; ++s) {
+                positions_mrope[(size_t)t * GGML_MROPE_SECTIONS + s] = p;
+            }
+        }
+        ggml_backend_tensor_set(pos_mrope, positions_mrope.data(), 0,
+                                positions_mrope.size() * sizeof(int32_t));
+    }
     if (freq_factors) {
         ggml_backend_tensor_set(freq_factors, impl_->freq_factors_vec.data(), 0,
                                 impl_->freq_factors_vec.size() * sizeof(float));
+    }
+    // GDN per-layer state inputs. If a GdnStateCache is bound, pull each
+    // layer's last-persisted (conv_history, ssm_state) into the graph's
+    // input slots; otherwise zero-fill for a fresh prefill. The cache's
+    // read_conv / read_ssm are no-ops for non-GDN layer indices, but we
+    // already skip those via the nullptr check.
+    if (have_gdn_shapes) {
+        const size_t conv_floats =
+            (size_t)(impl_->gdn_conv_kernel - 1) *
+            (size_t)impl_->gdn_conv_channels;
+        const size_t ssm_floats =
+            (size_t)impl_->gdn_head_v_dim *
+            (size_t)impl_->gdn_head_v_dim *
+            (size_t)impl_->gdn_num_v_heads;
+        std::vector<float> conv_buf; conv_buf.reserve(conv_floats);
+        std::vector<float> ssm_buf;  ssm_buf.reserve(ssm_floats);
+        const std::vector<float> zero_conv(conv_floats, 0.0f);
+        const std::vector<float> zero_ssm (ssm_floats,  0.0f);
+        for (int il = 0; il < impl_->n_layer; ++il) {
+            ggml_tensor* tc = gdn_conv_state_in[(size_t)il];
+            ggml_tensor* ts = gdn_ssm_state_in [(size_t)il];
+            if (!tc || !ts) continue;
+            const float* conv_src = zero_conv.data();
+            const float* ssm_src  = zero_ssm.data();
+            if (impl_->gdn_state) {
+                conv_buf.clear(); ssm_buf.clear();
+                if (impl_->gdn_state->read_conv(il, conv_buf) &&
+                    conv_buf.size() == conv_floats) {
+                    conv_src = conv_buf.data();
+                }
+                if (impl_->gdn_state->read_ssm(il, ssm_buf) &&
+                    ssm_buf.size() == ssm_floats) {
+                    ssm_src = ssm_buf.data();
+                }
+            }
+            ggml_backend_tensor_set(tc, conv_src, 0, conv_floats * sizeof(float));
+            ggml_backend_tensor_set(ts, ssm_src,  0, ssm_floats  * sizeof(float));
+        }
     }
     {
         std::vector<float> mask((size_t)n * (size_t)n);
@@ -780,9 +1491,17 @@ bool ForwardContext::forward_full(const std::vector<int32_t>& token_ids,
                             logits_flat.size() * sizeof(float));
 
     // Pull per-layer K/V back to host for the KvCache write (stage 5a).
+    // GDN layers in qwen35moe contribute no K/V (their cap_* slots are
+    // null from the dispatch loop) — leave the corresponding per_layer
+    // slots empty so the caller can skip them cleanly.
     if (capture) {
         const size_t kv_elems = (size_t)n * impl_->n_head_kv * impl_->head_dim;
         for (int i = 0; i < impl_->n_layer; ++i) {
+            if (!cap_K[(size_t)i] || !cap_V[(size_t)i]) {
+                (*per_layer_K)[(size_t)i].clear();
+                (*per_layer_V)[(size_t)i].clear();
+                continue;
+            }
             (*per_layer_K)[(size_t)i].resize(kv_elems);
             (*per_layer_V)[(size_t)i].resize(kv_elems);
             ggml_backend_tensor_get(cap_K[(size_t)i],
@@ -798,6 +1517,38 @@ bool ForwardContext::forward_full(const std::vector<int32_t>& token_ids,
         const size_t nbytes = (size_t)n * impl_->n_embd * sizeof(float);
         dbg_X_layer0->resize((size_t)n * impl_->n_embd);
         ggml_backend_tensor_get(x_layer0, dbg_X_layer0->data(), 0, nbytes);
+    }
+
+    // Persist the post-step GDN state back into the bound cache so the
+    // next forward_full call resumes the delta-rule recurrence from
+    // where we stopped instead of re-zeroing. With no cache bound we
+    // still need the read-back-and-discard: the graph outputs are
+    // allocated by gallocr and their buffers get reused on the next
+    // call; leaving them dangling is harmless, so just skip the copy.
+    if (have_gdn_shapes && impl_->gdn_state) {
+        const size_t conv_floats =
+            (size_t)(impl_->gdn_conv_kernel - 1) *
+            (size_t)impl_->gdn_conv_channels;
+        const size_t ssm_floats =
+            (size_t)impl_->gdn_head_v_dim *
+            (size_t)impl_->gdn_head_v_dim *
+            (size_t)impl_->gdn_num_v_heads;
+        std::vector<float> conv_buf(conv_floats);
+        std::vector<float> ssm_buf (ssm_floats);
+        for (int il = 0; il < impl_->n_layer; ++il) {
+            ggml_tensor* tc = gdn_conv_state_out[(size_t)il];
+            ggml_tensor* ts = gdn_ssm_state_out [(size_t)il];
+            if (tc) {
+                ggml_backend_tensor_get(tc, conv_buf.data(), 0,
+                                        conv_floats * sizeof(float));
+                impl_->gdn_state->write_conv(il, conv_buf.data());
+            }
+            if (ts) {
+                ggml_backend_tensor_get(ts, ssm_buf.data(), 0,
+                                        ssm_floats * sizeof(float));
+                impl_->gdn_state->write_ssm(il, ssm_buf.data());
+            }
+        }
     }
 
     ggml_free(gctx);
@@ -988,6 +1739,9 @@ bool ForwardContext::prefill(const std::vector<int32_t>& token_ids,
             const int H  = impl_->n_head_kv;
             const int hd = impl_->head_dim;
             for (int L = 0; L < impl_->n_layer; ++L) {
+                // Skip layers with no K (qwen35moe GDN layers) — they
+                // don't contribute to the attention KV cache.
+                if (Ks[(size_t)L].empty()) continue;
                 const float* K_data = Ks[(size_t)L].data();
                 // Layout: K_data[(q * H + h) * hd + d]
                 for (int q = 0; q < n; ++q) {
@@ -1006,7 +1760,10 @@ bool ForwardContext::prefill(const std::vector<int32_t>& token_ids,
     }
 
     // Push every layer to the bound cache at offset = current kv_pos.
+    // GDN layers leave Ks[L]/Vs[L] empty — those are fed through the
+    // separate GdnStateCache bound alongside. Skip them here.
     for (int L = 0; L < impl_->n_layer; ++L) {
+        if (Ks[(size_t)L].empty() || Vs[(size_t)L].empty()) continue;
         if (!impl_->cache->write(L, impl_->kv_pos, n,
                                  Ks[(size_t)L].data(), Vs[(size_t)L].data())) {
             std::fprintf(stderr, "[sp-engine] prefill: cache write layer %d failed\n", L);

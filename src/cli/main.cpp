@@ -1349,6 +1349,36 @@ int main(int argc, char** argv) {
                       /*ctx_size_bytes=*/1024 * 1024 * 1024, pe);
         if (!fc) return 4;
 
+        // Hybrid-arch (qwen35moe): allocate and bind a GdnStateCache so
+        // the per-layer delta-rule recurrent state persists across this
+        // forward call. For a single-shot prefill the cache starts
+        // zeroed, so behaviourally this matches Stage 1 — but the wiring
+        // is in place for multi-call decode where the state matters.
+        std::unique_ptr<sp::engine::GdnStateCache> gdn_cache;
+        if (m->architecture() == "qwen35moe") {
+            const int conv_kernel   = (int)m->get_i64("qwen35moe.ssm.conv_kernel",    4);
+            const int d_state       = (int)m->get_i64("qwen35moe.ssm.state_size",     128);
+            const int n_group       = (int)m->get_i64("qwen35moe.ssm.group_count",    16);
+            const int num_v_heads   = (int)m->get_i64("qwen35moe.ssm.time_step_rank", 32);
+            const int d_inner       = (int)m->get_i64("qwen35moe.ssm.inner_size",     4096);
+            const int conv_channels = d_inner + 2 * n_group * d_state;
+            const int head_v_dim    = (num_v_heads > 0) ? (d_inner / num_v_heads) : 0;
+            std::vector<bool> is_gdn; is_gdn.reserve(W->layers().size());
+            for (const auto& L : W->layers()) {
+                is_gdn.push_back(L.kind == sp::engine::LlamaLayerKind::MOE_GDN);
+            }
+            gdn_cache = sp::engine::GdnStateCache::create(
+                is_gdn, conv_kernel, conv_channels, head_v_dim, num_v_heads, /*n_seqs=*/1);
+            if (gdn_cache) {
+                gdn_cache->reset();
+                fc->bind_gdn_state(gdn_cache.get());
+            } else {
+                std::fprintf(stderr,
+                    "[sp-engine] logits: GdnStateCache alloc failed — "
+                    "falling back to per-call zero state.\n");
+            }
+        }
+
         std::vector<float> logits;
         int n_vocab = 0;
         if (!fc->forward_full(ids, logits, n_vocab)) {
