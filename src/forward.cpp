@@ -16,6 +16,7 @@
 #include <cuda_runtime.h>
 #endif
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -1405,13 +1406,18 @@ bool ForwardContext::forward_full(const std::vector<int32_t>& token_ids,
     ggml_tensor* logits = ggml_mul_mat(gctx, W->output, h);
     ggml_set_output(logits);
 
-    // GGML_DEFAULT_GRAPH_SIZE (2048) is enough for a dense n_layer=80
-    // attention model, but qwen35moe's MOE_GDN layers contribute ~35
-    // ggml ops each (ssm_conv, delta_net, two proj MLPs, norms,
-    // silu gates, reshapes…) on top of the MoE FFN. With n_layer=40
-    // and 30 of those being GDN, the graph exceeds 2048 nodes. Bump
-    // the capacity to 8192 which is still small (≈256 KiB overhead).
-    const size_t graph_size = (impl_->is_moe) ? 8192u : (size_t)GGML_DEFAULT_GRAPH_SIZE;
+    // GGML_DEFAULT_GRAPH_SIZE (2048) is enough for shallow dense stacks
+    // but breaks on two workloads we actually ship:
+    //   - deep attention models (gemma3-12b has 48 layers × ~45 decode
+    //     ops = 2160 nodes, over the 2048 cap);
+    //   - qwen35moe MOE_GDN layers, which contribute ~35 extra ggml ops
+    //     each (ssm_conv, delta_net, two proj MLPs, norms, silu gates,
+    //     reshapes) on top of the MoE FFN.
+    // Scale by layer count with a 2048 floor — overhead is ≈ 32 bytes/
+    // node, so even a 16k-node budget is only ~512 KiB.
+    const size_t graph_size = std::max<size_t>(
+        (size_t)GGML_DEFAULT_GRAPH_SIZE,
+        (size_t)impl_->n_layer * 256u);
     ggml_cgraph* graph = ggml_new_graph_custom(gctx, graph_size, /*grads=*/false);
     ggml_build_forward_expand(graph, logits);
     // The GDN per-layer state outputs (conv history + ssm state) are
@@ -2037,7 +2043,14 @@ bool ForwardContext::decode(int32_t token_id,
     ggml_tensor* logits_t = ggml_mul_mat(gctx, W->output, h);
     ggml_set_output(logits_t);
 
-    ggml_cgraph* graph = ggml_new_graph(gctx);
+    // Same graph-size story as forward_full above: the default 2048-node
+    // cap is fine for phi3-mini (32 layers × ~45 ops = 1440) but gemma3-
+    // 12b's 48 layers × ~45 ops + 96 cpy side-paths overruns it. Scale
+    // by layer count with a 2048 floor.
+    const size_t graph_size = std::max<size_t>(
+        (size_t)GGML_DEFAULT_GRAPH_SIZE,
+        (size_t)impl_->n_layer * 256u);
+    ggml_cgraph* graph = ggml_new_graph_custom(gctx, graph_size, /*grads=*/false);
     ggml_build_forward_expand(graph, logits_t);
     // Wire every per-layer cpy into the graph so the backend actually
     // executes the K/V write-into-slice (otherwise build_forward_expand
