@@ -1,17 +1,26 @@
-// Shannon-Prime Engine — BPE tokenizer implementation
+// Shannon-Prime Engine — tokenizer implementations
 // Copyright (C) 2026 Ray Daniels. All Rights Reserved.
 //
-// Covers the llama-bpe / qwen2 / default pre-tokenizers at "close
-// enough for perplexity sanity" fidelity. The canonical llama.cpp
-// uses architecture-specific regexes pulled from the GGUF
-// tokenizer.ggml.pre field — those land in a follow-up when we need
-// byte-for-byte agreement with llama.cpp for cross-validation.
+// Two flavours live in this file:
 //
-// For now the word-splitter only differentiates between letters,
-// digits, punctuation, and whitespace. That's good enough for the
-// scaffolding milestone (round-trip text through vocab → IDs →
-// text) and the bench-parity note will live on any perplexity
-// number we publish through this engine until the regex is wired.
+//   BpeTokenizer  — GPT-2 style byte-level BPE. Dispatched for vocabs
+//                   that carry a `merges` array (llama-bpe, qwen2,
+//                   gpt2, most "default" pre values whose model is
+//                   "gpt2"). Word-splitter differentiates letters,
+//                   digits, punctuation, and whitespace — close enough
+//                   for perplexity sanity; we'll swap in the per-arch
+//                   regex when we need byte-for-byte parity.
+//
+//   SpmTokenizer  — SentencePiece BPE (the Llama / Gemma family). No
+//                   byte-to-unicode remap, no pretokenization. Space
+//                   runs normalize to ▁ (U+2581). Greedy-merge by
+//                   vocab score (higher score = higher priority).
+//                   Unknown codepoints fall through to byte-fallback
+//                   <0xNN> tokens.
+//
+// Dispatch at Tokenizer::create() picks SpmTokenizer when
+// tokenizer.ggml.model == "llama" AND the vocab carries no merges
+// array (i.e. scores-only). Everything else goes to BpeTokenizer.
 
 #include "tokenizer.h"
 #include "vocab.h"
@@ -304,15 +313,244 @@ private:
     std::string  pre_;
 };
 
+// -------------------------------------------------------------------
+// SentencePiece (Llama/Gemma family) tokenizer.
+//
+// Algorithm (matches llama.cpp's llm_tokenizer_spm):
+//   1. Normalise: prepend ▁ and replace every ASCII space with ▁
+//      (U+2581). No GPT-2 byte remap — SPM operates on raw UTF-8.
+//   2. Seed a doubly-linked list of symbols, one UTF-8 codepoint each.
+//   3. Greedy merge loop driven by a max-heap of adjacent pairs. A
+//      pair (A, B) is pushed with priority = vocab.token_score(id(A+B))
+//      IF `A+B` is a known vocab entry; higher score wins. After a
+//      merge, re-queue the new pair's left/right neighbours. Stale
+//      queue entries are skipped via length/offset tracking.
+//   4. Emit: for each surviving symbol, look it up in the vocab. If
+//      present, emit that id. If absent (single unknown codepoint),
+//      emit byte-fallback — one <0xNN> token per UTF-8 byte.
+//
+// Decode: concatenate token strings, translate ▁ → space, translate
+// <0xNN> → raw byte. UTF-8 assembly handled implicitly since bytes
+// come out in order.
+// -------------------------------------------------------------------
+class SpmTokenizer : public Tokenizer {
+public:
+    SpmTokenizer(const Vocab& v, std::string pre) : vocab_(v), pre_(std::move(pre)) {
+        // Precompute byte-fallback token ids: "<0x00>".."<0xFF>" -> id.
+        byte_id_.assign(256, -1);
+        char buf[8];
+        for (int b = 0; b < 256; ++b) {
+            std::snprintf(buf, sizeof(buf), "<0x%02X>", b);
+            byte_id_[b] = vocab_.find(buf);
+        }
+    }
+
+    bool encode(const std::string& text, bool add_bos,
+                std::vector<int32_t>& out) const override {
+        out.clear();
+        if (add_bos && vocab_.bos_id() >= 0) out.push_back(vocab_.bos_id());
+
+        // Normalise: prepend ▁ and replace each space run with a single ▁.
+        // Newlines and tabs are passed through — the byte-fallback path
+        // will handle them if they don't appear as their own tokens.
+        static const std::string META = "\xE2\x96\x81"; // U+2581
+        std::string norm;
+        norm.reserve(text.size() + META.size());
+        norm += META;
+        bool prev_space = false;
+        for (size_t i = 0; i < text.size(); ++i) {
+            char c = text[i];
+            if (c == ' ') {
+                if (!prev_space) norm += META;
+                prev_space = true;
+            } else {
+                norm.push_back(c);
+                prev_space = false;
+            }
+        }
+        if (norm.size() == META.size()) return true;  // empty text
+
+        // Seed symbol list — one UTF-8 codepoint per symbol.
+        struct Sym { size_t off; int len; int prev; int next; };
+        std::vector<Sym> syms;
+        syms.reserve(norm.size());
+        {
+            int idx = 0;
+            size_t i = 0;
+            while (i < norm.size()) {
+                unsigned char c = (unsigned char)norm[i];
+                int cp_len = 1;
+                if      ((c & 0x80) == 0x00) cp_len = 1;
+                else if ((c & 0xE0) == 0xC0) cp_len = 2;
+                else if ((c & 0xF0) == 0xE0) cp_len = 3;
+                else if ((c & 0xF8) == 0xF0) cp_len = 4;
+                Sym s;
+                s.off  = i;
+                s.len  = cp_len;
+                s.prev = idx - 1;
+                s.next = idx + 1;
+                syms.push_back(s);
+                i += cp_len;
+                ++idx;
+            }
+            if (!syms.empty()) syms.back().next = -1;
+        }
+        if (syms.empty()) return true;
+
+        // Queue of candidate merges — priority = vocab score (higher wins).
+        struct QItem {
+            float  score;
+            int    left;      // symbol index (left side of the pair)
+            int    right;     // symbol index (right side of the pair)
+            int    merged_len; // byte length of left+right at enqueue time
+        };
+        struct QCmp {
+            bool operator()(const QItem& a, const QItem& b) const {
+                // Max-heap on score, then on position (earlier wins ties).
+                if (a.score != b.score) return a.score < b.score;
+                return a.left > b.left;
+            }
+        };
+        std::priority_queue<QItem, std::vector<QItem>, QCmp> q;
+
+        auto push_pair = [&](int l) {
+            if (l < 0) return;
+            int r = syms[l].next;
+            if (r < 0) return;
+            size_t off = syms[l].off;
+            int    len = syms[l].len + syms[r].len;
+            std::string piece = norm.substr(off, (size_t)len);
+            int32_t id = vocab_.find(piece);
+            if (id < 0) return;
+            float sc = vocab_.token_score(id);
+            q.push({sc, l, r, len});
+        };
+
+        for (int k = 0; k + 1 < (int)syms.size(); ++k) push_pair(k);
+
+        while (!q.empty()) {
+            QItem top = q.top(); q.pop();
+            int l = top.left;
+            int r = top.right;
+            // Skip stale entries: either side merged elsewhere, or the
+            // chain no longer reflects the pair's byte length.
+            if (syms[l].len == 0 || syms[r].len == 0) continue;
+            if (syms[l].next != r) continue;
+            if (syms[l].len + syms[r].len != top.merged_len) continue;
+
+            // Merge r into l: extend l to cover both codepoints, drop r.
+            syms[l].len += syms[r].len;
+            syms[l].next = syms[r].next;
+            if (syms[r].next >= 0) syms[syms[r].next].prev = l;
+            syms[r].len = 0;
+
+            // Re-queue the pairs touching the merged symbol.
+            push_pair(syms[l].prev);
+            push_pair(l);
+        }
+
+        // Emit surviving symbols.
+        for (int k = 0; k >= 0 && k < (int)syms.size(); k = syms[k].next) {
+            if (syms[k].len == 0) continue;
+            std::string piece = norm.substr(syms[k].off, (size_t)syms[k].len);
+            int32_t id = vocab_.find(piece);
+            if (id >= 0) {
+                out.push_back(id);
+                continue;
+            }
+            // Byte-fallback: emit one <0xNN> per UTF-8 byte.
+            for (int b = 0; b < syms[k].len; ++b) {
+                unsigned char byte = (unsigned char)norm[syms[k].off + b];
+                int32_t bid = byte_id_[byte];
+                if (bid >= 0) {
+                    out.push_back(bid);
+                } else if (vocab_.unk_id() >= 0) {
+                    out.push_back(vocab_.unk_id());
+                }
+            }
+        }
+        return true;
+    }
+
+    std::string decode(const std::vector<int32_t>& ids) const override {
+        std::string out;
+        out.reserve(ids.size() * 4);
+        bool first_emitted_word = true;
+        for (int32_t id : ids) {
+            const std::string& t = vocab_.token(id);
+            if (t.empty()) continue;
+            // Skip control tokens (<bos>, <eos>, <pad>, <unk>, ...).
+            if (vocab_.token_type(id) == TokenType::CONTROL) continue;
+            // Byte-fallback token: "<0xNN>" -> raw byte.
+            if (vocab_.token_type(id) == TokenType::BYTE
+                && t.size() == 6 && t[0] == '<' && t[1] == '0' && t[2] == 'x'
+                && t[5] == '>') {
+                auto hex = [](char c) -> int {
+                    if (c >= '0' && c <= '9') return c - '0';
+                    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+                    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+                    return 0;
+                };
+                int hi = hex(t[3]);
+                int lo = hex(t[4]);
+                out.push_back((char)((hi << 4) | lo));
+                continue;
+            }
+            // Normal piece: translate ▁ to space. The SPM convention is
+            // that the leading ▁ of the first word is emitted as a space
+            // too — matches llama.cpp / HF `SentencePieceBPETokenizer`.
+            // We drop that leading space only if it's the very first
+            // word emitted (so "▁Hello▁World" decodes to "Hello World").
+            size_t i = 0;
+            while (i < t.size()) {
+                // Look for the 3-byte ▁ (U+2581 = E2 96 81).
+                if (i + 2 < t.size()
+                    && (unsigned char)t[i]     == 0xE2
+                    && (unsigned char)t[i + 1] == 0x96
+                    && (unsigned char)t[i + 2] == 0x81) {
+                    if (!first_emitted_word) out.push_back(' ');
+                    first_emitted_word = false;
+                    i += 3;
+                } else {
+                    out.push_back(t[i]);
+                    ++i;
+                    first_emitted_word = false;
+                }
+            }
+        }
+        return out;
+    }
+
+    const std::string& pre() const override { return pre_; }
+
+private:
+    const Vocab&         vocab_;
+    std::string          pre_;
+    std::vector<int32_t> byte_id_;  // byte value -> <0xNN> token id (-1 if absent)
+};
+
 std::unique_ptr<Tokenizer> Tokenizer::create(const Vocab& vocab) {
-    const std::string& pre = vocab.pre();
+    const std::string& pre   = vocab.pre();
+    const std::string& model = vocab.model();
+
+    // SentencePiece: tokenizer.ggml.model == "llama" → greedy-merge by
+    // score. Covers Llama-1/2, Gemma, Mistral (v1), and Gemma-family
+    // finetunes like functiongemma. In GGUF, SPM vocabs never ship a
+    // real merges array (the merge priorities are inherent in the
+    // token scores); if one somehow appears it's ignored here.
+    if (model == "llama") {
+        return std::make_unique<SpmTokenizer>(vocab, pre);
+    }
+
+    // GPT-2 byte-level BPE: llama-3 / qwen2 / qwen3 / gpt2 and anything
+    // else that ships merges.
     if (pre == "llama-bpe" || pre == "qwen2" || pre == "default" || pre == "gpt2") {
         return std::make_unique<BpeTokenizer>(vocab, pre);
     }
     std::fprintf(stderr,
-        "[sp-engine] unsupported tokenizer pre='%s' "
-        "(llama-bpe/qwen2/default/gpt2 supported in this milestone)\n",
-        pre.c_str());
+        "[sp-engine] unsupported tokenizer model='%s' pre='%s' "
+        "(BPE llama-bpe/qwen2/default/gpt2 and SPM llama supported)\n",
+        model.c_str(), pre.c_str());
     return nullptr;
 }
 
