@@ -108,6 +108,14 @@ public:
     // caller must outlive the ForwardContext. Resets kv_pos to 0.
     void bind_cache(class KvCache* cache);
 
+    // Bind a GdnStateCache (hybrid archs — qwen35moe today). Non-owning,
+    // caller-lifetime. Null on non-hybrid archs; the forward builder
+    // dispatches on layer kind, so this is only consulted for MOE_GDN
+    // layers. Independent of bind_cache — both are bound for hybrid runs
+    // so standard attention layers find their KV slots while GDN layers
+    // find their recurrent state.
+    void bind_gdn_state(class GdnStateCache* gdn);
+
     // Run prefill: forward_full(token_ids) → write every layer's K/V
     // into the bound cache → advance kv_pos by token_ids.size().
     // Returns the logits of ONLY the last token (n_vocab floats), which

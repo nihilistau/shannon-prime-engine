@@ -6,6 +6,7 @@
 
 #include "engine.h"
 #include "forward.h"
+#include "gdn_state.h"
 #include "gguf_loader.h"
 #include "kv_cache.h"
 #include "llama_weights.h"
@@ -1149,6 +1150,33 @@ int main(int argc, char** argv) {
             w->print_summary(stdout);
         } else {
             std::printf("Weights: (arch binding failed — unsupported arch or missing tensor)\n");
+        }
+
+        // Hybrid-arch smoke test: for qwen35moe, allocate a GdnStateCache
+        // sized from the GGUF ssm.* keys and print its footprint. This
+        // double-checks the shape math and the layer-kind classification
+        // end-to-end before Phase 3 wires the cache into forward.
+        if (w && m->architecture() == "qwen35moe") {
+            const int conv_kernel   = (int)m->get_i64("qwen35moe.ssm.conv_kernel",    4);
+            const int d_state       = (int)m->get_i64("qwen35moe.ssm.state_size",     128);
+            const int n_group       = (int)m->get_i64("qwen35moe.ssm.group_count",    16);
+            const int num_v_heads   = (int)m->get_i64("qwen35moe.ssm.time_step_rank", 32);
+            const int d_inner       = (int)m->get_i64("qwen35moe.ssm.inner_size",     4096);
+            const int conv_channels = d_inner + 2 * n_group * d_state;
+            const int head_v_dim    = (num_v_heads > 0) ? (d_inner / num_v_heads) : 0;
+
+            std::vector<bool> is_gdn; is_gdn.reserve(w->layers().size());
+            for (const auto& L : w->layers()) {
+                is_gdn.push_back(L.kind == sp::engine::LlamaLayerKind::MOE_GDN);
+            }
+            auto gdn = sp::engine::GdnStateCache::create(
+                is_gdn, conv_kernel, conv_channels, head_v_dim, num_v_heads, /*n_seqs=*/1);
+            std::printf("\n");
+            if (gdn) {
+                gdn->print_summary(stdout);
+            } else {
+                std::printf("GdnStateCache: (allocation failed)\n");
+            }
         }
         return 0;
     }

@@ -111,6 +111,7 @@ add_subdirectory(vendor/ggml EXCLUDE_FROM_ALL)
 add_library(sp_engine STATIC
     src/engine.cpp
     src/kv_cache.cpp
+    src/gdn_state.cpp
     src/model_loader.cpp
     src/gguf_loader.cpp
     src/vocab.cpp

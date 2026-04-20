@@ -2,6 +2,7 @@
 // Copyright (C) 2026 Ray Daniels. All Rights Reserved.
 
 #include "forward.h"
+#include "gdn_state.h"
 #include "gguf_loader.h"
 #include "kv_cache.h"
 #include "llama_weights.h"
@@ -85,6 +86,12 @@ struct ForwardContext::Impl {
     KvCache* cache  = nullptr;
     int      kv_pos = 0;
 
+    // Hybrid-arch companion (qwen35moe): bound GdnStateCache for the
+    // recurrent state of GDN layers. Non-owning; null for pure-attention
+    // archs. Phase 3 reads/writes this alongside `cache` inside the
+    // forward builder, dispatched on LlamaLayer::kind.
+    class GdnStateCache* gdn_state = nullptr;
+
     ~Impl() {
         if (compute_buf) ggml_backend_buffer_free(compute_buf);
         if (allocr)      ggml_gallocr_free(allocr);
@@ -108,6 +115,17 @@ void ForwardContext::bind_cache(KvCache* cache) {
             "head_dim=%d max_seq=%d\n",
             (int)cache->is_gpu(), cache->n_layer(),
             cache->n_head_kv(), cache->head_dim(), cache->max_seq());
+    }
+}
+
+void ForwardContext::bind_gdn_state(GdnStateCache* gdn) {
+    impl_->gdn_state = gdn;
+    if (gdn) {
+        std::fprintf(stderr,
+            "[sp-engine:diag] bind_gdn_state: n_layer=%d n_gdn=%d conv_kernel=%d "
+            "conv_channels=%d head_v_dim=%d num_v_heads=%d\n",
+            gdn->n_layer(), gdn->n_gdn_layers(), gdn->conv_kernel(),
+            gdn->conv_channels(), gdn->head_v_dim(), gdn->num_v_heads());
     }
 }
 
