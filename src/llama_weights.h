@@ -5,12 +5,21 @@
 // Commercial license available — contact raydaniels@gmail.com
 //
 // Materialises the tensors of a llama-family GGUF (arch ∈ {llama, qwen2,
-// qwen3, mistral3, phi3, granite, gemma3}) into a ggml_context and exposes
-// typed per-layer handles. The weight layout is identical across these
-// archs modulo a handful of optional bias / norm tensors; a single struct
-// covers them all. Gemma3 adds sandwich norms (post_attention_norm /
-// post_ffw_norm) — these live on LlamaLayer as optional tensors that stay
-// nullptr for non-gemma archs.
+// qwen3, mistral3, phi3, granite, gemma3, qwen35moe}) into a ggml_context
+// and exposes typed per-layer handles. The layout is nearly identical
+// across these archs modulo a handful of optional bias / norm tensors —
+// a single struct covers them all:
+//
+//   • gemma3 adds sandwich norms (post_attention_norm, post_ffw_norm).
+//   • qwen35moe is a HYBRID model — every `full_attention_interval` layer
+//     is standard attention (with multi-section RoPE); the rest are Gated
+//     DeltaNet (linear attention with conv + stateful recurrence, its input
+//     projections live under "attn_qkv"/"attn_gate" names in the GGUF).
+//     Every layer has MoE FFN (top-k + sigmoid-gated shared expert) instead
+//     of dense FFN. The MoE and GDN tensors stay nullptr for other archs.
+//
+// `LlamaLayer::kind` labels which combination is live so downstream forward
+// builders can dispatch cleanly.
 
 #pragma once
 
@@ -28,14 +37,24 @@ namespace sp::engine {
 
 class Model;
 
+enum class LlamaLayerKind : int {
+    STANDARD     = 0,   // attn (Wq/Wk/Wv/Wo) + dense FFN (gate/up/down). All non-qwen35moe archs.
+    MOE_ATTN     = 1,   // qwen35moe full-attention layers: standard Q/K/V/O + multi-section RoPE,
+                        //                                   MoE FFN instead of dense.
+    MOE_GDN      = 2,   // qwen35moe gated-deltanet layers: ssm_* + attn_qkv/attn_gate input projs,
+                        //                                   MoE FFN instead of dense.
+};
+
 struct LlamaLayer {
-    // Attention
+    LlamaLayerKind kind = LlamaLayerKind::STANDARD;
+
+    // --- Attention (STANDARD / MOE_ATTN layers) -------------------------
     ggml_tensor* attn_norm   = nullptr;  // "blk.N.attn_norm.weight"
     ggml_tensor* wq          = nullptr;
     ggml_tensor* wk          = nullptr;
     ggml_tensor* wv          = nullptr;
     ggml_tensor* wo          = nullptr;
-    // Optional per-head attention norms (qwen3)
+    // Optional per-head attention norms (qwen3, qwen35moe full-attn)
     ggml_tensor* attn_q_norm = nullptr;
     ggml_tensor* attn_k_norm = nullptr;
     // Optional biases (qwen2, granite)
@@ -44,19 +63,55 @@ struct LlamaLayer {
     ggml_tensor* bv          = nullptr;
     ggml_tensor* bo          = nullptr;
 
-    // FFN
+    // --- Dense FFN (STANDARD layers only) ------------------------------
     ggml_tensor* ffn_norm    = nullptr;
     ggml_tensor* ffn_gate    = nullptr;
     ggml_tensor* ffn_up      = nullptr;
     ggml_tensor* ffn_down    = nullptr;
 
-    // Gemma3 sandwich norms (nullptr for other archs). Gemma3 applies an
-    // extra RMSNorm to each block's attention output and FFN output
-    // BEFORE the residual add — the classic pre-norm path has a pre-norm
-    // only. These tensors land as "blk.N.post_attention_norm.weight" and
-    // "blk.N.post_ffw_norm.weight" in the GGUF.
+    // --- Gemma3 sandwich norms (optional) ------------------------------
+    // Gemma3 applies an extra RMSNorm to each block's attention output
+    // and FFN output BEFORE the residual add. Tensor names in GGUF:
+    // "blk.N.post_attention_norm.weight" and "blk.N.post_ffw_norm.weight".
     ggml_tensor* attn_post_norm = nullptr;
     ggml_tensor* ffn_post_norm  = nullptr;
+
+    // --- MoE FFN (MOE_ATTN / MOE_GDN layers) --------------------------
+    // Router gate: (n_embd, n_expert). Softmax over expert scores, top-k
+    // selected, weights renormalised (or scaled by expert_weights_scale).
+    ggml_tensor* ffn_gate_inp       = nullptr;  // "blk.N.ffn_gate_inp.weight"
+    // Expert bank (stacked along the last dim): 3D tensors of shape
+    // (n_ff_expert, n_embd, n_expert) for up; (n_embd, n_ff_expert, n_expert) for down.
+    ggml_tensor* ffn_gate_exps      = nullptr;
+    ggml_tensor* ffn_up_exps        = nullptr;
+    ggml_tensor* ffn_down_exps      = nullptr;
+    // Shared expert (runs for every token, gated by a sigmoid scalar).
+    ggml_tensor* ffn_gate_inp_shexp = nullptr;  // "blk.N.ffn_gate_inp_shexp.weight"  (n_embd,)
+    ggml_tensor* ffn_gate_shexp     = nullptr;
+    ggml_tensor* ffn_up_shexp       = nullptr;
+    ggml_tensor* ffn_down_shexp     = nullptr;
+
+    // --- Gated DeltaNet (MOE_GDN layers only) --------------------------
+    // Input projections (the GGUF re-uses attention tensor names):
+    //   attn_qkv  = "blk.N.attn_qkv.weight"   -> (n_embd, qkv_dim)   fused Q+K+V block (pre-conv)
+    //   attn_gate = "blk.N.attn_gate.weight"  -> (n_embd, d_inner)   z (output gate)
+    ggml_tensor* gdn_qkv          = nullptr;
+    ggml_tensor* gdn_gate         = nullptr;
+    // Stateful recurrence parameters:
+    //   ssm_conv1d = (conv_kernel, conv_channels) — causal 1D conv over qkv
+    //   ssm_a      = (n_v_heads,)                — log-eigenvalue diagonal
+    //   ssm_alpha  = (n_embd,  n_v_heads)         — input-dep alpha projection
+    //   ssm_beta   = (n_embd,  n_v_heads)         — input-dep beta projection
+    //   ssm_dt     = (n_v_heads,)                — delta-t bias
+    //   ssm_norm   = (head_v_dim,)                — gated-norm weight
+    //   ssm_out    = (d_inner, n_embd)            — output projection
+    ggml_tensor* ssm_conv1d       = nullptr;
+    ggml_tensor* ssm_a            = nullptr;
+    ggml_tensor* ssm_alpha        = nullptr;
+    ggml_tensor* ssm_beta         = nullptr;
+    ggml_tensor* ssm_dt           = nullptr;
+    ggml_tensor* ssm_norm         = nullptr;
+    ggml_tensor* ssm_out          = nullptr;
 };
 
 class LlamaWeights {

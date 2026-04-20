@@ -48,9 +48,22 @@ ggml_context* LlamaWeights::ctx() const { return impl_->ctx; }
 // ------------------------------------------------------------------
 static bool supported_arch(const std::string& a) {
     static const std::unordered_set<std::string> ok = {
-        "llama", "qwen2", "qwen3", "mistral3", "phi3", "granite", "gemma3"
+        "llama", "qwen2", "qwen3", "mistral3", "phi3", "granite", "gemma3",
+        "qwen35moe"
     };
     return ok.count(a) != 0;
+}
+
+// Layer-type classification for qwen35moe: every `full_attention_interval`-th
+// layer is full attention (indices full_attn_interval-1, 2*full_attn_interval-1, ...)
+// per the reference llama.cpp hparams check. The rest are Gated DeltaNet.
+//
+// Empirical confirmation on Qwen3.6-35B-A3B (full_attn_interval=4):
+//   blk.0.attn_qkv.weight exists + ssm_* tensors       -> GDN
+//   blk.3.attn_q.weight / attn_k.weight exist          -> ATTN
+static bool is_qwen_moe_attn_layer(int il, int full_attn_interval) {
+    if (full_attn_interval <= 1) return true;   // degenerate: all attn
+    return ((il + 1) % full_attn_interval) == 0;
 }
 
 // ------------------------------------------------------------------
@@ -94,9 +107,84 @@ bool LlamaWeights::bind_tensors_(LlamaWeights& w, ggml_context* tctx,
         return std::string(buf);
     };
 
+    // Arch-specific dispatch. qwen35moe has two layer types within the
+    // same model, both of which replace the dense FFN with an MoE bank;
+    // other archs are uniform standard layers.
+    const std::string& arch = model.architecture();
+    const bool is_qwen_moe  = (arch == "qwen35moe");
+    int full_attn_interval = 1;
+    if (is_qwen_moe) {
+        full_attn_interval =
+            (int)model.get_i64("qwen35moe.full_attention_interval", 4);
+    }
+
     for (int i = 0; i < n_layer; ++i) {
         LlamaLayer& L = w.layers_[(size_t)i];
+
+        // Pre-norm is always present.
         L.attn_norm = bind_req(layer_name(i, "attn_norm.weight"));
+
+        if (is_qwen_moe) {
+            const bool attn_layer = is_qwen_moe_attn_layer(i, full_attn_interval);
+            L.kind = attn_layer ? LlamaLayerKind::MOE_ATTN : LlamaLayerKind::MOE_GDN;
+
+            if (attn_layer) {
+                // Full attention layer: standard Q/K/V/O with Q/K per-head norms.
+                L.wq          = bind_req(layer_name(i, "attn_q.weight"));
+                L.wk          = bind_req(layer_name(i, "attn_k.weight"));
+                L.wv          = bind_req(layer_name(i, "attn_v.weight"));
+                L.wo          = bind_req(layer_name(i, "attn_output.weight"));
+                L.attn_q_norm = bind_opt(layer_name(i, "attn_q_norm.weight"));
+                L.attn_k_norm = bind_opt(layer_name(i, "attn_k_norm.weight"));
+            } else {
+                // Gated DeltaNet layer: re-uses the "attn_qkv" / "attn_gate"
+                // GGUF names for the fused input projection and the output
+                // gate. The tensor sizes are completely different from a
+                // standard attention layer, so we bind them to dedicated
+                // slots (gdn_qkv / gdn_gate) to keep the forward dispatch
+                // unambiguous.
+                L.gdn_qkv     = bind_req(layer_name(i, "attn_qkv.weight"));
+                L.gdn_gate    = bind_req(layer_name(i, "attn_gate.weight"));
+                L.ssm_conv1d  = bind_req(layer_name(i, "ssm_conv1d.weight"));
+                L.ssm_a       = bind_req(layer_name(i, "ssm_a"));
+                L.ssm_alpha   = bind_req(layer_name(i, "ssm_alpha.weight"));
+                L.ssm_beta    = bind_req(layer_name(i, "ssm_beta.weight"));
+                L.ssm_dt      = bind_req(layer_name(i, "ssm_dt.bias"));
+                L.ssm_norm    = bind_req(layer_name(i, "ssm_norm.weight"));
+                L.ssm_out     = bind_req(layer_name(i, "ssm_out.weight"));
+            }
+
+            // MoE FFN (both layer types): router, expert bank, + shared expert.
+            L.ffn_gate_inp       = bind_req(layer_name(i, "ffn_gate_inp.weight"));
+            L.ffn_gate_exps      = bind_req(layer_name(i, "ffn_gate_exps.weight"));
+            L.ffn_up_exps        = bind_req(layer_name(i, "ffn_up_exps.weight"));
+            L.ffn_down_exps      = bind_req(layer_name(i, "ffn_down_exps.weight"));
+            L.ffn_gate_inp_shexp = bind_opt(layer_name(i, "ffn_gate_inp_shexp.weight"));
+            L.ffn_gate_shexp     = bind_opt(layer_name(i, "ffn_gate_shexp.weight"));
+            L.ffn_up_shexp       = bind_opt(layer_name(i, "ffn_up_shexp.weight"));
+            L.ffn_down_shexp     = bind_opt(layer_name(i, "ffn_down_shexp.weight"));
+
+            // post_attention_norm is present in qwen35moe too (ties the
+            // hidden state through a second RMSNorm before the MoE FFN).
+            L.attn_post_norm = bind_opt(layer_name(i, "post_attention_norm.weight"));
+
+            if (!L.attn_norm
+                || (attn_layer && (!L.wq || !L.wk || !L.wv || !L.wo))
+                || (!attn_layer && (!L.gdn_qkv || !L.gdn_gate || !L.ssm_conv1d
+                                    || !L.ssm_a || !L.ssm_alpha || !L.ssm_beta
+                                    || !L.ssm_dt || !L.ssm_norm || !L.ssm_out))
+                || !L.ffn_gate_inp || !L.ffn_gate_exps || !L.ffn_up_exps
+                || !L.ffn_down_exps) {
+                std::fprintf(stderr,
+                    "[sp-engine] LlamaWeights: qwen35moe layer %d (%s) missing required tensor(s)\n",
+                    i, attn_layer ? "attn" : "gdn");
+                return false;
+            }
+            continue;
+        }
+
+        // --- Standard llama-family path (all other archs) --------------
+        L.kind = LlamaLayerKind::STANDARD;
         L.wq        = bind_req(layer_name(i, "attn_q.weight"));
         L.wk        = bind_req(layer_name(i, "attn_k.weight"));
         L.wv        = bind_req(layer_name(i, "attn_v.weight"));
@@ -364,6 +452,20 @@ void LlamaWeights::print_summary(std::FILE* f) const {
     std::fprintf(f, "  bound tensors:      %d\n", n_bound_tensors_);
     std::fprintf(f, "  missing (optional): %d\n", n_missing_optional_);
     std::fprintf(f, "  layers:             %d\n", (int)layers_.size());
+    // Layer-kind breakdown (relevant for hybrid archs like qwen35moe).
+    int n_std = 0, n_moe_attn = 0, n_moe_gdn = 0;
+    for (const auto& L : layers_) {
+        switch (L.kind) {
+            case LlamaLayerKind::STANDARD: ++n_std;      break;
+            case LlamaLayerKind::MOE_ATTN: ++n_moe_attn; break;
+            case LlamaLayerKind::MOE_GDN:  ++n_moe_gdn;  break;
+        }
+    }
+    if (n_moe_attn || n_moe_gdn) {
+        std::fprintf(f, "    standard:         %d\n", n_std);
+        std::fprintf(f, "    MoE full-attn:    %d\n", n_moe_attn);
+        std::fprintf(f, "    MoE gated-dnet:   %d\n", n_moe_gdn);
+    }
     std::fprintf(f, "  tok_embd:           %s\n", tok_embd   ? "OK" : "MISSING");
     std::fprintf(f, "  output_norm:        %s\n", output_norm? "OK" : "MISSING");
     std::fprintf(f, "  output:             %s%s\n",
