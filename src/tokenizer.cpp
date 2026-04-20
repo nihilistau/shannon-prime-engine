@@ -542,14 +542,17 @@ std::unique_ptr<Tokenizer> Tokenizer::create(const Vocab& vocab) {
         return std::make_unique<SpmTokenizer>(vocab, pre);
     }
 
-    // GPT-2 byte-level BPE: llama-3 / qwen2 / qwen3 / gpt2 and anything
-    // else that ships merges.
-    if (pre == "llama-bpe" || pre == "qwen2" || pre == "default" || pre == "gpt2") {
+    // GPT-2 byte-level BPE: llama-3 / qwen2 / qwen3 / qwen35 / gpt2 and
+    // anything else that ships merges. qwen35 (Qwen3.6-MoE) uses the
+    // same byte-level BPE + pretok regex as qwen2 — the `pre` field
+    // just rev-tags the merge table version.
+    if (pre == "llama-bpe" || pre == "qwen2" || pre == "qwen35" ||
+        pre == "default"   || pre == "gpt2") {
         return std::make_unique<BpeTokenizer>(vocab, pre);
     }
     std::fprintf(stderr,
         "[sp-engine] unsupported tokenizer model='%s' pre='%s' "
-        "(BPE llama-bpe/qwen2/default/gpt2 and SPM llama supported)\n",
+        "(BPE llama-bpe/qwen2/qwen35/default/gpt2 and SPM llama supported)\n",
         model.c_str(), pre.c_str());
     return nullptr;
 }

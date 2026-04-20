@@ -28,6 +28,7 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdio>
 #include <memory>
 #include <vector>
 

@@ -141,6 +141,50 @@ double Model::get_f64(const std::string& key, double fallback) const {
     return gguf_try_f64(impl_->gguf, key.c_str(), fallback);
 }
 
+std::vector<int32_t> Model::get_i32_array(const std::string& key) const {
+    std::vector<int32_t> out;
+    int64_t id = gguf_find_key(impl_->gguf, key.c_str());
+    if (id < 0) return out;
+    if (gguf_get_kv_type(impl_->gguf, id) != GGUF_TYPE_ARRAY) return out;
+
+    const gguf_type et = gguf_get_arr_type(impl_->gguf, id);
+    const size_t    n  = gguf_get_arr_n   (impl_->gguf, id);
+    const void*     d  = gguf_get_arr_data(impl_->gguf, id);
+    if (!d || n == 0) return out;
+
+    out.resize(n);
+    switch (et) {
+        case GGUF_TYPE_INT8:
+            for (size_t i = 0; i < n; ++i) out[i] = (int32_t)((const int8_t*)d)[i];
+            break;
+        case GGUF_TYPE_UINT8:
+            for (size_t i = 0; i < n; ++i) out[i] = (int32_t)((const uint8_t*)d)[i];
+            break;
+        case GGUF_TYPE_INT16:
+            for (size_t i = 0; i < n; ++i) out[i] = (int32_t)((const int16_t*)d)[i];
+            break;
+        case GGUF_TYPE_UINT16:
+            for (size_t i = 0; i < n; ++i) out[i] = (int32_t)((const uint16_t*)d)[i];
+            break;
+        case GGUF_TYPE_INT32:
+            std::memcpy(out.data(), d, n * sizeof(int32_t));
+            break;
+        case GGUF_TYPE_UINT32:
+            for (size_t i = 0; i < n; ++i) out[i] = (int32_t)((const uint32_t*)d)[i];
+            break;
+        case GGUF_TYPE_INT64:
+            for (size_t i = 0; i < n; ++i) out[i] = (int32_t)((const int64_t*)d)[i];
+            break;
+        case GGUF_TYPE_UINT64:
+            for (size_t i = 0; i < n; ++i) out[i] = (int32_t)((const uint64_t*)d)[i];
+            break;
+        default:
+            out.clear();
+            break;
+    }
+    return out;
+}
+
 Model::TensorInfo Model::tensor_info(size_t i) const {
     TensorInfo ti;
     if (i >= tensor_names_.size()) return ti;

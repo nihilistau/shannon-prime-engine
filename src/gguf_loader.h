@@ -56,6 +56,11 @@ public:
     std::string get_str(const std::string& key, const std::string& fallback = "") const;
     int64_t     get_i64(const std::string& key, int64_t fallback = 0) const;
     double      get_f64(const std::string& key, double  fallback = 0.0) const;
+    // Reads an int-typed array (accepts i8/i16/i32/i64, u8/u16/u32/u64)
+    // and returns it as int32_t. Returns an empty vector if the key is
+    // missing or not an integer array. Used for things like qwen35moe's
+    // `rope.dimension_sections` (4-element mRoPE section layout).
+    std::vector<int32_t> get_i32_array(const std::string& key) const;
 
     // --- Tensor iteration ----------------------------------------------
     struct TensorInfo {
