@@ -93,19 +93,44 @@ samples per slot).
 | 8b    | `qwen35moe` forward — gated attention + mRoPE + GDN delta-rule + MoE FFN | ✓ |
 | 8c    | `GdnStateCache` — per-layer recurrent state (fp16 host storage) | ✓ |
 | 8d    | `qwen35moe` PPL + A/B-vs-HF numerical validation | pending user run |
+| 9a    | `phi3` loader — fused `attn_qkv` + packed SwiGLU `ffn_up` | ✓ |
+| 9b    | `gemma3` loader+forward — SWA + sandwich norms + soft-cap + embd scale | ✓ |
+| 9c    | Vendor patches: CUDA K-quant getrows + n_layer-scaled cgraph | ✓ |
 
-**Architecture coverage.** Llama-3 family, Qwen 3 / 3.5 dense, and Qwen
-3.6-35B-A3B (hybrid SSM+MoE, GGUF arch `qwen35moe`) run through the same
-`logits` / `chat` / `perplexity` / `cache_ppl` verbs. The hybrid path is the
-most involved: 10 MoE full-attention layers with a gated-attention Q-split
-and mRoPE, interleaved with 30 Gated DeltaNet layers that maintain a bounded
-recurrent state (conv + delta-rule ssm). Host-side state storage is
-half-precision (`ggml_fp16_t`) — the in-graph tensors stay f32 because the
-CPU kernels for `ggml_gated_delta_net` + `ggml_ssm_conv` are f32-only, so the
-cache converts at the API boundary and halves the ~63 MiB GDN footprint on
-Qwen3.6-35B-A3B to ~31 MiB. See `src/gdn_state.h` for the shape contract and
-`docs/MODEL-PACK.md` (in the shannon-prime submodule) for the `qwen3-next`
-compression preset.
+**Architecture coverage.** Llama-3 family, Qwen 3 / 3.5 dense, Qwen
+3.6-35B-A3B (hybrid SSM+MoE, GGUF arch `qwen35moe`), Phi-3 / 3.1 / 4 (GGUF
+arch `phi3`), and Gemma 3 (GGUF arch `gemma3`) all run through the same
+`logits` / `chat` / `perplexity` / `cache_ppl` verbs. The hybrid `qwen35moe`
+path is the most involved: 10 MoE full-attention layers with a
+gated-attention Q-split and mRoPE, interleaved with 30 Gated DeltaNet layers
+that maintain a bounded recurrent state (conv + delta-rule ssm). Host-side
+state storage is half-precision (`ggml_fp16_t`) — the in-graph tensors stay
+f32 because the CPU kernels for `ggml_gated_delta_net` + `ggml_ssm_conv` are
+f32-only, so the cache converts at the API boundary and halves the ~63 MiB
+GDN footprint on Qwen3.6-35B-A3B to ~31 MiB. See `src/gdn_state.h` for the
+shape contract and `docs/MODEL-PACK.md` (in the shannon-prime submodule) for
+the `qwen3-next` compression preset.
+
+The `phi3` loader handles the fused `attn_qkv` tensor (Q/K/V packed along
+`n_embd`) and the packed-SwiGLU `ffn_up` layout (gate/up interleaved along
+`2*n_ff`); the forward path splits them per-block and feeds the shared
+attention/SwiGLU builders. The `gemma3` loader+forward wires sliding-window
+attention, sandwich (pre+post) norms around attn and FFN, final logit
+soft-cap, and the token-embedding scale (`sqrt(n_embd)`). The `dbrx`
+tokenizer pre-type is accepted by the BPE path for phi-4 GGUF compatibility.
+
+**Vendor patches** (applied against pinned `vendor/ggml` — see
+`patches/README.md` for the apply flow):
+
+- `patches/ggml-cuda-getrows-kquant.patch` — adds K-quant / IQ* source-type
+  dispatch to `vendor/ggml/src/ggml-cuda/getrows.cu`. Required to run any
+  GGUF whose `token_embd.weight` is a K-quant (Gemma-3-12B Q3_K_L ships Q6_K
+  embed, phi-4 Q4_K_M ships Q4_K). Engine SHA: `f487fe0`.
+- `src/forward.cpp` cgraph-size fix — `ggml_new_graph_custom` capacity scales
+  with `n_layer * 256` (floor 2048) in both `forward_full` and `decode`.
+  Required for deep-stack models (gemma-3-12b = 48 layers; default
+  `GGML_DEFAULT_GRAPH_SIZE=2048` overflows before prefill completes). Engine
+  SHA: `021e297`.
 
 ## Measured numbers
 
@@ -434,6 +459,9 @@ shannon-prime-engine/
 │   └── shannon-prime/       ← git submodule → github.com/nihilistau/shannon-prime
 ├── vendor/
 │   └── ggml/                ← git submodule → github.com/ggml-org/ggml (MIT)
+├── patches/                 ← vendor patches applied on top of vendor/ggml
+│   ├── README.md             apply-flow docs
+│   └── ggml-cuda-getrows-kquant.patch
 ├── src/                     ← engine code (this repo's original contribution)
 │   ├── engine.{h,cpp}       Public API + Config (PeMode, sqfree, mobius)
 │   ├── gguf_loader.{h,cpp}  Typed view over gguf_context
