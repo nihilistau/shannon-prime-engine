@@ -48,7 +48,7 @@ ggml_context* LlamaWeights::ctx() const { return impl_->ctx; }
 // ------------------------------------------------------------------
 static bool supported_arch(const std::string& a) {
     static const std::unordered_set<std::string> ok = {
-        "llama", "qwen2", "qwen3", "mistral3", "phi3", "granite"
+        "llama", "qwen2", "qwen3", "mistral3", "phi3", "granite", "gemma3"
     };
     return ok.count(a) != 0;
 }
@@ -114,6 +114,10 @@ bool LlamaWeights::bind_tensors_(LlamaWeights& w, ggml_context* tctx,
         L.ffn_gate  = bind_req(layer_name(i, "ffn_gate.weight"));
         L.ffn_up    = bind_req(layer_name(i, "ffn_up.weight"));
         L.ffn_down  = bind_req(layer_name(i, "ffn_down.weight"));
+
+        // Gemma3 sandwich norms. Optional — stay nullptr for llama/qwen/etc.
+        L.attn_post_norm = bind_opt(layer_name(i, "post_attention_norm.weight"));
+        L.ffn_post_norm  = bind_opt(layer_name(i, "post_ffw_norm.weight"));
 
         if (!L.attn_norm || !L.wq || !L.wk || !L.wv || !L.wo
             || !L.ffn_norm || !L.ffn_gate || !L.ffn_up || !L.ffn_down) {

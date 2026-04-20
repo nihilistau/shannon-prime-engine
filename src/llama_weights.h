@@ -5,10 +5,12 @@
 // Commercial license available — contact raydaniels@gmail.com
 //
 // Materialises the tensors of a llama-family GGUF (arch ∈ {llama, qwen2,
-// qwen3, mistral3, phi3, granite}) into a ggml_context and exposes typed
-// per-layer handles. The weight layout is identical across these archs
-// modulo a handful of optional bias / norm tensors; a single struct
-// covers them all.
+// qwen3, mistral3, phi3, granite, gemma3}) into a ggml_context and exposes
+// typed per-layer handles. The weight layout is identical across these
+// archs modulo a handful of optional bias / norm tensors; a single struct
+// covers them all. Gemma3 adds sandwich norms (post_attention_norm /
+// post_ffw_norm) — these live on LlamaLayer as optional tensors that stay
+// nullptr for non-gemma archs.
 
 #pragma once
 
@@ -47,6 +49,14 @@ struct LlamaLayer {
     ggml_tensor* ffn_gate    = nullptr;
     ggml_tensor* ffn_up      = nullptr;
     ggml_tensor* ffn_down    = nullptr;
+
+    // Gemma3 sandwich norms (nullptr for other archs). Gemma3 applies an
+    // extra RMSNorm to each block's attention output and FFN output
+    // BEFORE the residual add — the classic pre-norm path has a pre-norm
+    // only. These tensors land as "blk.N.post_attention_norm.weight" and
+    // "blk.N.post_ffw_norm.weight" in the GGUF.
+    ggml_tensor* attn_post_norm = nullptr;
+    ggml_tensor* ffn_post_norm  = nullptr;
 };
 
 class LlamaWeights {

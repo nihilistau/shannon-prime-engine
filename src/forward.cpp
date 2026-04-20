@@ -37,6 +37,10 @@ struct ForwardContext::Impl {
     float rope_freq_base  = 10000.0f;
     float rope_freq_scale = 1.0f;
     float rms_norm_eps    = 1e-5f;  // Llama-3 default; Qwen3 uses 1e-6
+    // Token-embedding scale. Gemma3 multiplies tok_embd lookups by
+    // sqrt(n_embd) before the first block; other archs leave embeddings
+    // untouched (scale = 1.0).
+    float embd_scale      = 1.0f;
 
     // PrimePE-RoPE-ALiBi precomputed values. `freq_factors_vec` is
     // empty when PE is Standard/AlibiOnly (ggml_rope_ext gets nullptr);
@@ -142,6 +146,16 @@ std::unique_ptr<ForwardContext> ForwardContext::create(const Model& model,
             fc->impl_->rope_mode = 0;          // GGML_ROPE_TYPE_NORMAL
         } else {
             fc->impl_->rope_mode = 2;          // GGML_ROPE_TYPE_NEOX (qwen*, phi*, gemma*, ...)
+        }
+    }
+
+    // Token-embedding scale. Gemma family (gemma / gemma2 / gemma3)
+    // multiplies tok_embd lookups by sqrt(hidden_dim) before the first
+    // block; other archs leave embeddings untouched.
+    {
+        const std::string& a = model.architecture();
+        if (a == "gemma" || a == "gemma2" || a == "gemma3") {
+            fc->impl_->embd_scale = sqrtf((float)fc->impl_->n_embd);
         }
     }
 
@@ -255,6 +269,9 @@ bool ForwardContext::embed(const std::vector<int32_t>& token_ids,
 
     // Lookup.
     ggml_tensor* emb = ggml_get_rows(gctx, W->tok_embd, ids);
+    if (impl_->embd_scale != 1.0f) {
+        emb = ggml_scale(gctx, emb, impl_->embd_scale);
+    }
     ggml_set_name(emb, "emb");
     ggml_set_output(emb);
 
@@ -410,6 +427,14 @@ static ggml_tensor* build_block(ggml_context* gctx,
     ggml_tensor* y1 = ggml_mul_mat(gctx, L.wo, attn);
     if (L.bo) y1 = ggml_add(gctx, y1, L.bo);
 
+    // Gemma3 sandwich norm: an extra RMSNorm on the attention output
+    // BEFORE the residual add. For non-gemma archs this tensor is
+    // nullptr and we fall through to the classic pre-norm path.
+    if (L.attn_post_norm) {
+        y1 = ggml_rms_norm(gctx, y1, rms_eps);
+        y1 = ggml_mul(gctx, y1, L.attn_post_norm);
+    }
+
     x = ggml_add(gctx, x, y1);
 
     // FFN.
@@ -421,6 +446,12 @@ static ggml_tensor* build_block(ggml_context* gctx,
     gate = ggml_silu(gctx, gate);
     ggml_tensor* ffn  = ggml_mul(gctx, gate, up);
     ffn  = ggml_mul_mat(gctx, L.ffn_down, ffn);
+
+    // Gemma3 sandwich norm on the FFN output (mirrors attn_post_norm above).
+    if (L.ffn_post_norm) {
+        ffn = ggml_rms_norm(gctx, ffn, rms_eps);
+        ffn = ggml_mul(gctx, ffn, L.ffn_post_norm);
+    }
 
     x = ggml_add(gctx, x, ffn);
     return x;
@@ -466,6 +497,9 @@ bool ForwardContext::forward_one_block(const std::vector<int32_t>& token_ids,
     ggml_set_input(kq_mask);
 
     ggml_tensor* x = ggml_get_rows(gctx, W->tok_embd, ids);
+    if (impl_->embd_scale != 1.0f) {
+        x = ggml_scale(gctx, x, impl_->embd_scale);
+    }
     x = build_block(gctx, x, pos, kq_mask, freq_factors, impl_->alibi_max_bias,
                      W->layers()[0], n,
                      impl_->head_dim, impl_->n_head, impl_->n_head_kv,
@@ -566,6 +600,9 @@ bool ForwardContext::forward_full(const std::vector<int32_t>& token_ids,
     ggml_set_input(kq_mask);
 
     ggml_tensor* x = ggml_get_rows(gctx, W->tok_embd, ids);
+    if (impl_->embd_scale != 1.0f) {
+        x = ggml_scale(gctx, x, impl_->embd_scale);
+    }
 
     std::vector<ggml_tensor*> cap_K, cap_V;
     if (capture) {
@@ -992,6 +1029,9 @@ bool ForwardContext::decode(int32_t token_id,
     ggml_set_input(mask);
 
     ggml_tensor* x = ggml_get_rows(gctx, W->tok_embd, ids);
+    if (impl_->embd_scale != 1.0f) {
+        x = ggml_scale(gctx, x, impl_->embd_scale);
+    }
 
     // Per-layer ggml_cpy results (kept so build_forward_expand reaches
     // them — the graph needs the cpy ops as live nodes).
