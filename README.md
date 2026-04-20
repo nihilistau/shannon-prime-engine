@@ -89,6 +89,23 @@ samples per slot).
 | 7b    | GPU-resident ship cache (`create_gpu`, `read_gpu`, `write_gpu`) | ✓ |
 | 7c    | GPU-resident sqfree cache + batched read + calibration sync | infrastructure ✓ / real-model PPL validating |
 | 7d    | Vulkan backend selection; release packaging | planned |
+| 8a    | `qwen35moe` loader — arch registration + MoE/GDN tensor binding | ✓ |
+| 8b    | `qwen35moe` forward — gated attention + mRoPE + GDN delta-rule + MoE FFN | ✓ |
+| 8c    | `GdnStateCache` — per-layer recurrent state (fp16 host storage) | ✓ |
+| 8d    | `qwen35moe` PPL + A/B-vs-HF numerical validation | pending user run |
+
+**Architecture coverage.** Llama-3 family, Qwen 3 / 3.5 dense, and Qwen
+3.6-35B-A3B (hybrid SSM+MoE, GGUF arch `qwen35moe`) run through the same
+`logits` / `chat` / `perplexity` / `cache_ppl` verbs. The hybrid path is the
+most involved: 10 MoE full-attention layers with a gated-attention Q-split
+and mRoPE, interleaved with 30 Gated DeltaNet layers that maintain a bounded
+recurrent state (conv + delta-rule ssm). Host-side state storage is
+half-precision (`ggml_fp16_t`) — the in-graph tensors stay f32 because the
+CPU kernels for `ggml_gated_delta_net` + `ggml_ssm_conv` are f32-only, so the
+cache converts at the API boundary and halves the ~63 MiB GDN footprint on
+Qwen3.6-35B-A3B to ~31 MiB. See `src/gdn_state.h` for the shape contract and
+`docs/MODEL-PACK.md` (in the shannon-prime submodule) for the `qwen3-next`
+compression preset.
 
 ## Measured numbers
 

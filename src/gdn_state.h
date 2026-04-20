@@ -16,10 +16,13 @@
 //   ssm_state   : delta-rule recurrent memory, shape
 //                 [head_v_dim, head_v_dim, num_v_heads, n_seqs]
 //
-// Total footprint per GDN layer on Qwen3.6-35B-A3B (single sequence):
-//   conv: 3 × 8192 × 4 bytes = 96 KiB
-//   ssm:  128 × 128 × 32 × 4 bytes ≈ 2 MiB
-// → ~63 MiB across all 30 GDN layers. Immaterial next to weights.
+// Total footprint per GDN layer on Qwen3.6-35B-A3B (single sequence,
+// fp16 internal storage — the in-graph tensors stay f32 because the
+// CPU kernels require f32; conversion happens at the read/write
+// boundary):
+//   conv: 3 × 8192 × 2 bytes = 48 KiB
+//   ssm:  128 × 128 × 32 × 2 bytes = 1 MiB
+// → ~31 MiB across all 30 GDN layers. Immaterial next to weights.
 //
 // Unlike KvCache the state is bounded and persists across the entire
 // decode chain — no max_seq dimension. reset() zeros everything for a
