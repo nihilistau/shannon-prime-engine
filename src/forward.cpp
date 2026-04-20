@@ -1373,6 +1373,23 @@ bool ForwardContext::forward_full(const std::vector<int32_t>& token_ids,
     const size_t graph_size = (impl_->is_moe) ? 8192u : (size_t)GGML_DEFAULT_GRAPH_SIZE;
     ggml_cgraph* graph = ggml_new_graph_custom(gctx, graph_size, /*grads=*/false);
     ggml_build_forward_expand(graph, logits);
+    // The GDN per-layer state outputs (conv history + ssm state) are
+    // terminal ggml_cont nodes — nothing downstream consumes them. The
+    // logits-rooted expand therefore skips them entirely, gallocr sees
+    // no nodes for the ggml_cont, and the post-compute tensor_get fires
+    // "tensor buffer not set". Expand from each state-output root so
+    // gallocr allocates their backing buffers. ggml_set_output merely
+    // hints at the role; the expand is what puts the node in the graph.
+    if (have_gdn_shapes) {
+        for (int il = 0; il < impl_->n_layer; ++il) {
+            if (gdn_conv_state_out[(size_t)il]) {
+                ggml_build_forward_expand(graph, gdn_conv_state_out[(size_t)il]);
+            }
+            if (gdn_ssm_state_out[(size_t)il]) {
+                ggml_build_forward_expand(graph, gdn_ssm_state_out[(size_t)il]);
+            }
+        }
+    }
     if (!ggml_gallocr_alloc_graph(impl_->allocr, graph)) {
         std::fprintf(stderr, "[sp-engine] forward_full: gallocr failed\n");
         ggml_free(gctx); return false;
