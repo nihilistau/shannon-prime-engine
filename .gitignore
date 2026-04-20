@@ -43,5 +43,9 @@ logs/*.bin
 logs/*.sp_freq_factors.bin
 !logs/.gitkeep
 
+# Ad-hoc build/run logs at repo root (e.g. build_log.txt, gdn_smoke.log)
+/build_log*.txt
+/*.log
+
 # Internal templates not for the published repo
 COPYRIGHT_HEADER.txt
