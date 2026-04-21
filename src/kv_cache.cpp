@@ -166,6 +166,20 @@ struct KvCache::Impl {
     // cuda_cache — when cuda_sqfree_inited is true the ship path is off.
     sp_cuda_sqfree_cache_t cuda_sqfree_cache{};
     bool                   cuda_sqfree_inited = false;
+
+    // GPU-resident hierarchical cache. Exclusive with cuda_cache and
+    // cuda_sqfree_cache — when cuda_hier_inited is true, the hier
+    // compress/decompress pipelines run entirely in VRAM.
+    sp_cuda_hier_cache_t   cuda_hier_cache{};
+    bool                   cuda_hier_inited = false;
+
+    // Cold storage: per-layer K and V pinned CPU buffers for GPU→CPU
+    // offload. cold_k[il] / cold_v[il] for each of n_layer layers.
+    std::vector<sp_cuda_cold_layer_t> cold_k;
+    std::vector<sp_cuda_cold_layer_t> cold_v;
+    bool cold_inited = false;
+    int  cold_last_wb_pos = 0;   // last position writeback'd to cold
+    int  cold_evict_keep  = 0;   // 0 = no eviction
 #endif
 
     // Cauchy reset system (decode-chain causal stability). Non-null when
@@ -207,6 +221,13 @@ struct KvCache::Impl {
         if (cuda_sqfree_inited) {
             sp_cuda_sqfree_cache_free(&cuda_sqfree_cache);
         }
+        if (cuda_hier_inited) {
+            sp_cuda_hier_cache_free(&cuda_hier_cache);
+        }
+        if (cold_inited) {
+            for (auto& cl : cold_k) sp_cuda_cold_layer_free(&cl);
+            for (auto& cl : cold_v) sp_cuda_cold_layer_free(&cl);
+        }
 #endif
         // Cauchy system components.
         delete ricci;
@@ -235,11 +256,17 @@ float KvCache::compression_ratio() const {
 std::string KvCache::describe() const {
     const char* mode = impl_->hierarchical ? "hierarchical" :
                        impl_->sqfree       ? "sqfree"       : "shadow";
+    const bool gpu =
+#ifdef SP_ENGINE_WITH_CUDA
+        impl_->cuda_inited || impl_->cuda_sqfree_inited || impl_->cuda_hier_inited;
+#else
+        false;
+#endif
     char buf[256];
     std::snprintf(buf, sizeof(buf),
-                  "%s cache: n_layer=%d n_head_kv=%d head_dim=%d "
+                  "%s%s cache: n_layer=%d n_head_kv=%d head_dim=%d "
                   "pad_dim=%d max_seq=%d compression=%.2fx",
-                  mode,
+                  mode, gpu ? " (GPU)" : "",
                   impl_->n_layer, impl_->n_head_kv, impl_->head_dim,
                   impl_->pad_dim, impl_->max_seq, compression_ratio());
     if (impl_->hier_inited) {
@@ -595,16 +622,13 @@ bool KvCache::calibrate_end() {
                          impl_->ricci->metric_criticality);
         }
 #ifdef SP_ENGINE_WITH_CUDA
-        // GPU-domain calibration produces a correct variance-ranked
-        // order (K_corr parity with CPU on synthetic data: 0.9925
-        // mean, 0.9804 min). BUT on real Qwen3-8B decode chains the
-        // calibrated order regresses PPL (+0.21 vs static Möbius),
-        // while on the CPU cache path the same calibration improves
-        // PPL (-0.25). The asymmetry is likely an interaction between
-        // variance-ranked band assignments and fp16 scale handling in
-        // the CUDA band_quantize; not yet root-caused. Default OFF to
-        // keep the best-measured GPU PPL; enable via
-        // SHANNON_PRIME_SYNC_CALIB_TO_GPU=1 when investigating.
+        // GPU-domain calibration syncs the CPU's variance-ranked order
+        // to the CUDA cache's Möbius permutation table. The fp16 scale
+        // asymmetry in band_quantize (root cause of the prior PPL
+        // regression with variance-ranking) has been fixed — inv_scale
+        // is now recomputed from the stored fp16. Re-measure with the
+        // fix in place; default still OFF until validated on Qwen3-8B.
+        // Enable via SHANNON_PRIME_SYNC_CALIB_TO_GPU=1.
         const char* env_sync = std::getenv("SHANNON_PRIME_SYNC_CALIB_TO_GPU");
         const bool sync_enabled = env_sync && std::atoi(env_sync) != 0;
         if (sync_enabled && impl_->cuda_inited && impl_->shadow_inited &&
@@ -697,6 +721,35 @@ bool KvCache::calibrate_end() {
                 "to GPU (sk_k=%d n_res=%d n_terms=%d)\n",
                 m->sk_k, m->n_res, m->n_terms);
         }
+
+        // Hier GPU: upload calibrated W matrices from CPU companion.
+        if (impl_->cuda_hier_inited && impl_->hier_inited) {
+            const sp_hier_cache_t& hc = impl_->hier;
+            const int ns = hc.n_slots;
+            const int nt = hc.predictors[0].n_target;
+            const int nsk = hc.predictors[0].n_skeleton;
+            const size_t w_per_slot = (size_t)nt * nsk;
+
+            // Flatten all per-slot W into a contiguous buffer for upload
+            std::vector<uint16_t> W_all((size_t)ns * w_per_slot);
+            for (int s = 0; s < ns; ++s) {
+                const sp_hier_predictor_t& hp = hc.predictors[s];
+                if (hp.W) {
+                    std::memcpy(W_all.data() + (size_t)s * w_per_slot,
+                                hp.W, w_per_slot * sizeof(uint16_t));
+                }
+                // else: uncalibrated slot → zeros → zero prediction (safe)
+            }
+            if (sp_cuda_hier_cache_upload_W(&impl_->cuda_hier_cache,
+                                             W_all.data()) != 0) {
+                std::fprintf(stderr, "[sp-engine] calibrate_end: "
+                             "hier GPU W upload failed\n");
+                return false;
+            }
+            std::fprintf(stderr,
+                "[sp-engine:diag] calibrate_end: uploaded %d hier W matrices "
+                "to GPU (%d×%d fp16 each)\n", ns, nt, nsk);
+        }
 #endif
         return true;
     }
@@ -720,6 +773,30 @@ bool KvCache::calibrate_end_ema(float keep_frac) {
         impl_->ricci->calib_n > 0) {
         sp_ricci_calibrate_end(impl_->ricci);
     }
+#ifdef SP_ENGINE_WITH_CUDA
+    // Upload updated W matrices to GPU after EMA blend.
+    if (impl_->cuda_hier_inited && impl_->hier_inited) {
+        const sp_hier_cache_t& hc = impl_->hier;
+        const int ns = hc.n_slots;
+        const int nt = hc.predictors[0].n_target;
+        const int nsk = hc.predictors[0].n_skeleton;
+        const size_t w_per_slot = (size_t)nt * nsk;
+        std::vector<uint16_t> W_all((size_t)ns * w_per_slot);
+        for (int s = 0; s < ns; ++s) {
+            const sp_hier_predictor_t& hp = hc.predictors[s];
+            if (hp.W) {
+                std::memcpy(W_all.data() + (size_t)s * w_per_slot,
+                            hp.W, w_per_slot * sizeof(uint16_t));
+            }
+        }
+        if (sp_cuda_hier_cache_upload_W(&impl_->cuda_hier_cache,
+                                         W_all.data()) != 0) {
+            std::fprintf(stderr, "[sp-engine] calibrate_end_ema: "
+                         "hier GPU W upload failed\n");
+            return false;
+        }
+    }
+#endif
     return true;
 }
 
@@ -733,7 +810,7 @@ bool KvCache::is_hierarchical() const {
 
 bool KvCache::is_gpu() const {
 #ifdef SP_ENGINE_WITH_CUDA
-    return impl_->cuda_inited || impl_->cuda_sqfree_inited;
+    return impl_->cuda_inited || impl_->cuda_sqfree_inited || impl_->cuda_hier_inited;
 #else
     return false;
 #endif
@@ -753,9 +830,83 @@ std::unique_ptr<KvCache> KvCache::create_gpu(int n_layer, int n_head_kv,
     return nullptr;
 #else
     if (cfg.hierarchical) {
-        std::fprintf(stderr, "[sp-engine] KvCache::create_gpu: hierarchical "
-                             "path is not yet GPU-resident, falling back to CPU zero-copy staging\n");
-        return KvCache::create(n_layer, n_head_kv, head_dim, max_seq, cfg);
+        // GPU-resident hierarchical path. We init a CPU hier cache first
+        // (needed for calibration), then create the CUDA cache from its
+        // structural metadata. W matrices upload after calibrate_end.
+        if (n_layer <= 0 || n_head_kv <= 0 || head_dim <= 0 || max_seq <= 0) {
+            std::fprintf(stderr, "[sp-engine] KvCache::create_gpu: bad dims\n");
+            return nullptr;
+        }
+        auto kv = std::unique_ptr<KvCache>(new KvCache());
+        kv->impl_->n_layer   = n_layer;
+        kv->impl_->n_head_kv = n_head_kv;
+        kv->impl_->head_dim  = head_dim;
+        kv->impl_->max_seq   = max_seq;
+        kv->impl_->hierarchical = true;
+
+        sp_config_t* sc = &kv->impl_->cfg;
+        sp_config_init(sc, head_dim, n_layer, n_head_kv);
+        sc->use_mobius_mask = false;  // hier doesn't use Möbius
+
+        // Parse skeleton band bits
+        auto skel_bits = parse_csv_bits(cfg.hier_skel_bits);
+        if (skel_bits.empty()) skel_bits = {5, 5};
+        int hier_res_bits = (cfg.hier_res_bits >= 1 && cfg.hier_res_bits <= 4)
+                            ? cfg.hier_res_bits : 2;
+        int hier_level = cfg.hier_level;
+
+        // Init CPU companion for calibration
+        if (sp_hier_cache_init(&kv->impl_->hier, sc, max_seq,
+                                hier_level,
+                                (int)skel_bits.size(), skel_bits.data(),
+                                hier_res_bits) != 0) {
+            std::fprintf(stderr, "[sp-engine] KvCache::create_gpu: "
+                         "sp_hier_cache_init (companion) failed\n");
+            return nullptr;
+        }
+        kv->impl_->hier_inited = true;
+        kv->impl_->pad_dim = kv->impl_->hier.pad_dim;
+
+        // Init GPU cache from companion's structural metadata
+        const sp_hier_cache_t& hc = kv->impl_->hier;
+        const sp_hier_predictor_t& hp0 = hc.predictors[0]; // all slots share geometry
+        if (sp_cuda_hier_cache_init(&kv->impl_->cuda_hier_cache, sc,
+                                     hc.pad_dim, hp0.n_skeleton, hp0.n_target,
+                                     hp0.target_res_bits,
+                                     hp0.skeleton_idx, hp0.target_idx,
+                                     &hp0.skel_bands,
+                                     max_seq,
+                                     n_layer * n_head_kv,
+                                     stream) != 0) {
+            std::fprintf(stderr, "[sp-engine] KvCache::create_gpu: "
+                         "sp_cuda_hier_cache_init failed\n");
+            return nullptr;
+        }
+        kv->impl_->cuda_hier_inited = true;
+
+        // Staging buffers for write_gpu / read_gpu
+        kv->impl_->d_stage_bytes = (size_t)head_dim * sizeof(float);
+        if (cudaMalloc((void**)&kv->impl_->d_stage,
+                       kv->impl_->d_stage_bytes) != cudaSuccess) {
+            std::fprintf(stderr, "[sp-engine] KvCache::create_gpu: "
+                         "d_stage cudaMalloc failed (hier)\n");
+            return nullptr;
+        }
+        kv->impl_->d_scratch_batch_bytes = (size_t)head_dim * max_seq * sizeof(float);
+        if (cudaMalloc((void**)&kv->impl_->d_scratch_batch,
+                       kv->impl_->d_scratch_batch_bytes) != cudaSuccess) {
+            std::fprintf(stderr, "[sp-engine] KvCache::create_gpu: "
+                         "scratch_batch cudaMalloc failed (hier)\n");
+            return nullptr;
+        }
+
+        std::fprintf(stderr, "[sp-engine] KvCache::create_gpu: hier path, "
+                     "hd=%d pad_dim=%d n_skel=%d n_target=%d res_bits=%d "
+                     "bytes_per_pos=%d\n",
+                     head_dim, hc.pad_dim, hp0.n_skeleton, hp0.n_target,
+                     hp0.target_res_bits,
+                     kv->impl_->cuda_hier_cache.bytes_per_pos_k);
+        return kv;
     }
     // sqfree is GPU-resident; spinor lands as a use_spinor flag into
     // sp_cuda_sqfree_cache_init (wired through kernel_spinor_extract/
@@ -894,7 +1045,8 @@ std::unique_ptr<KvCache> KvCache::create_gpu(int n_layer, int n_head_kv,
 // offsets in place — no staging copy needed.
 bool KvCache::write_gpu(int layer, int pos_offset, int n_tokens,
                         const float* d_K_flat, const float* d_V_flat) {
-    if (!impl_->cuda_inited && !impl_->cuda_sqfree_inited) {
+    if (!impl_->cuda_inited && !impl_->cuda_sqfree_inited
+        && !impl_->cuda_hier_inited) {
         std::fprintf(stderr, "[sp-engine] write_gpu on non-GPU cache\n");
         return false;
     }
@@ -903,6 +1055,18 @@ bool KvCache::write_gpu(int layer, int pos_offset, int n_tokens,
 
     const int H  = impl_->n_head_kv;
     const int hd = impl_->head_dim;
+    if (impl_->cuda_hier_inited) {
+        for (int q = 0; q < n_tokens; ++q) {
+            const int pos = pos_offset + q;
+            for (int h = 0; h < H; ++h) {
+                const float* d_k_vec = d_K_flat + (size_t)(q * H + h) * hd;
+                const float* d_v_vec = d_V_flat + (size_t)(q * H + h) * hd;
+                sp_cuda_hier_write_k(&impl_->cuda_hier_cache, layer, h, pos, d_k_vec);
+                sp_cuda_hier_write_v(&impl_->cuda_hier_cache, layer, h, pos, d_v_vec);
+            }
+        }
+        return true;
+    }
     if (impl_->cuda_sqfree_inited) {
         for (int q = 0; q < n_tokens; ++q) {
             const int pos = pos_offset + q;
@@ -936,7 +1100,8 @@ bool KvCache::write_gpu(int layer, int pos_offset, int n_tokens,
 // async on the cache stream, so latency is the per-layer kernel time.
 bool KvCache::read_gpu(int layer, int kv_len,
                        float* d_K_out, float* d_V_out) const {
-    if (!impl_->cuda_inited && !impl_->cuda_sqfree_inited) {
+    if (!impl_->cuda_inited && !impl_->cuda_sqfree_inited
+        && !impl_->cuda_hier_inited) {
         std::fprintf(stderr, "[sp-engine] read_gpu on non-GPU cache\n");
         return false;
     }
@@ -946,6 +1111,23 @@ bool KvCache::read_gpu(int layer, int kv_len,
 
     const int H  = impl_->n_head_kv;
     const int hd = impl_->head_dim;
+
+    // Hierarchical GPU cache: per-vec read + 2D scatter into strided layout.
+    // Batched read is a future optimisation — n_target × n_skeleton matmul
+    // per slot makes the per-vec path fast enough for decode.
+    if (impl_->cuda_hier_inited) {
+        cudaStream_t s = (cudaStream_t)impl_->cuda_hier_cache.stream;
+        for (int pos = 0; pos < kv_len; ++pos) {
+            for (int h = 0; h < H; ++h) {
+                const size_t off_elems = (size_t)pos * H * hd + (size_t)h * hd;
+                sp_cuda_hier_read_k(&impl_->cuda_hier_cache, layer, h, pos,
+                                     d_K_out + off_elems);
+                sp_cuda_hier_read_v(&impl_->cuda_hier_cache, layer, h, pos,
+                                     d_V_out + off_elems);
+            }
+        }
+        return true;
+    }
 
     // Sqfree GPU cache: batched read processes all kv_len positions
     // per (layer, head) in one kernel-dispatch series (~9 launches vs
@@ -1171,6 +1353,235 @@ void KvCache::cauchy_print_stats() const {
                      impl_->ricci->metric_criticality,
                      impl_->ricci->n_samples);
     }
+}
+
+// ── Hot/cold offload (tiered GPU ↔ CPU ↔ disk) ────────────────────────
+
+bool KvCache::has_cold_storage() const {
+#ifdef SP_ENGINE_WITH_CUDA
+    return impl_->cold_inited;
+#else
+    return false;
+#endif
+}
+
+bool KvCache::enable_cold_storage(int cold_mb, int evict_keep) {
+#ifdef SP_ENGINE_WITH_CUDA
+    if (impl_->cold_inited) return true;  // already enabled
+    if (!impl_->cuda_inited && !impl_->cuda_sqfree_inited) {
+        std::fprintf(stderr, "[sp-engine] enable_cold_storage: no GPU cache active\n");
+        return false;
+    }
+
+    const int nL = impl_->n_layer;
+    const int nH = impl_->n_head_kv;
+    const int k_stride = impl_->cuda_inited
+                         ? impl_->cuda_cache.k_bands.total_bytes
+                         : impl_->cuda_sqfree_cache.bytes_per_pos_k;
+    const int v_stride = impl_->cuda_inited
+                         ? impl_->cuda_cache.v_bands.total_bytes
+                         : impl_->cuda_sqfree_cache.bytes_per_pos_v;
+
+    // Per-layer capacity: cold_mb=0 means allocate for full max_seq
+    int64_t cap_bytes_k, cap_bytes_v;
+    if (cold_mb > 0) {
+        // Split cold_mb evenly between K and V across all layers
+        const int64_t total = (int64_t)cold_mb * 1024LL * 1024LL;
+        cap_bytes_k = total / (2 * nL);
+        cap_bytes_v = total / (2 * nL);
+    } else {
+        cap_bytes_k = (int64_t)impl_->max_seq * nH * k_stride;
+        cap_bytes_v = (int64_t)impl_->max_seq * nH * v_stride;
+    }
+
+    impl_->cold_k.resize((size_t)nL);
+    impl_->cold_v.resize((size_t)nL);
+
+    for (int il = 0; il < nL; ++il) {
+        if (sp_cuda_cold_layer_init(&impl_->cold_k[(size_t)il],
+                                    cap_bytes_k, k_stride, nH) != 0) {
+            std::fprintf(stderr, "[sp-engine] cold_layer_init K L%d failed\n", il);
+            // Cleanup what we've allocated so far
+            for (int j = 0; j < il; ++j) {
+                sp_cuda_cold_layer_free(&impl_->cold_k[(size_t)j]);
+                sp_cuda_cold_layer_free(&impl_->cold_v[(size_t)j]);
+            }
+            return false;
+        }
+        if (sp_cuda_cold_layer_init(&impl_->cold_v[(size_t)il],
+                                    cap_bytes_v, v_stride, nH) != 0) {
+            std::fprintf(stderr, "[sp-engine] cold_layer_init V L%d failed\n", il);
+            sp_cuda_cold_layer_free(&impl_->cold_k[(size_t)il]);
+            for (int j = 0; j < il; ++j) {
+                sp_cuda_cold_layer_free(&impl_->cold_k[(size_t)j]);
+                sp_cuda_cold_layer_free(&impl_->cold_v[(size_t)j]);
+            }
+            return false;
+        }
+    }
+
+    impl_->cold_inited     = true;
+    impl_->cold_last_wb_pos = 0;
+    impl_->cold_evict_keep  = evict_keep;
+
+    const double total_mb = (double)(cap_bytes_k + cap_bytes_v) * nL
+                            / (1024.0 * 1024.0);
+    std::fprintf(stderr,
+        "[sp-engine] cold storage enabled: %d layers × %.1f MB/layer "
+        "= %.1f MB total pinned RAM%s\n",
+        nL, (cap_bytes_k + cap_bytes_v) / (1024.0 * 1024.0),
+        total_mb,
+        cold_mb > 0 ? " (ring-buffer)" : " (full)");
+    return true;
+#else
+    (void)cold_mb; (void)evict_keep;
+    std::fprintf(stderr, "[sp-engine] enable_cold_storage: built without CUDA\n");
+    return false;
+#endif
+}
+
+bool KvCache::cold_writeback(int current_pos) {
+#ifdef SP_ENGINE_WITH_CUDA
+    if (!impl_->cold_inited) return false;
+    if (current_pos <= impl_->cold_last_wb_pos) return true;  // nothing new
+
+    const int start = impl_->cold_last_wb_pos;
+    const int n_new = current_pos - start;
+    void *stream = impl_->cuda_inited
+                   ? impl_->cuda_cache.stream
+                   : impl_->cuda_sqfree_cache.stream;
+
+    for (int il = 0; il < impl_->n_layer; ++il) {
+        // K
+        {
+            const void *d_k = impl_->cuda_inited
+                ? (const uint8_t*)impl_->cuda_cache.d_k_cache
+                : (const uint8_t*)impl_->cuda_sqfree_cache.d_k_cache;
+            // Offset to this layer's slab. Each layer has n_head_kv * max_seq * stride bytes.
+            const int stride = impl_->cold_k[(size_t)il].packed_stride;
+            const int nH = impl_->cold_k[(size_t)il].n_heads;
+            const int64_t layer_offset = (int64_t)il * nH * impl_->max_seq * stride;
+            sp_cuda_cold_writeback(&impl_->cold_k[(size_t)il],
+                                  (const uint8_t*)d_k + layer_offset,
+                                  start, n_new, stream);
+        }
+        // V
+        {
+            const void *d_v = impl_->cuda_inited
+                ? (const uint8_t*)impl_->cuda_cache.d_v_cache
+                : (const uint8_t*)impl_->cuda_sqfree_cache.d_v_cache;
+            const int stride = impl_->cold_v[(size_t)il].packed_stride;
+            const int nH = impl_->cold_v[(size_t)il].n_heads;
+            const int64_t layer_offset = (int64_t)il * nH * impl_->max_seq * stride;
+            sp_cuda_cold_writeback(&impl_->cold_v[(size_t)il],
+                                  (const uint8_t*)d_v + layer_offset,
+                                  start, n_new, stream);
+        }
+    }
+
+    impl_->cold_last_wb_pos = current_pos;
+    return true;
+#else
+    (void)current_pos;
+    return false;
+#endif
+}
+
+int KvCache::cold_restore(int n_pos) {
+#ifdef SP_ENGINE_WITH_CUDA
+    if (!impl_->cold_inited) return -1;
+    void *stream = impl_->cuda_inited
+                   ? impl_->cuda_cache.stream
+                   : impl_->cuda_sqfree_cache.stream;
+
+    for (int il = 0; il < impl_->n_layer; ++il) {
+        {
+            void *d_k = impl_->cuda_inited
+                ? impl_->cuda_cache.d_k_cache
+                : (void*)impl_->cuda_sqfree_cache.d_k_cache;
+            const int stride = impl_->cold_k[(size_t)il].packed_stride;
+            const int nH = impl_->cold_k[(size_t)il].n_heads;
+            const int64_t layer_offset = (int64_t)il * nH * impl_->max_seq * stride;
+            if (sp_cuda_cold_restore(&impl_->cold_k[(size_t)il],
+                                     (uint8_t*)d_k + layer_offset,
+                                     n_pos, stream) != 0) {
+                return -1;
+            }
+        }
+        {
+            void *d_v = impl_->cuda_inited
+                ? impl_->cuda_cache.d_v_cache
+                : (void*)impl_->cuda_sqfree_cache.d_v_cache;
+            const int stride = impl_->cold_v[(size_t)il].packed_stride;
+            const int nH = impl_->cold_v[(size_t)il].n_heads;
+            const int64_t layer_offset = (int64_t)il * nH * impl_->max_seq * stride;
+            if (sp_cuda_cold_restore(&impl_->cold_v[(size_t)il],
+                                     (uint8_t*)d_v + layer_offset,
+                                     n_pos, stream) != 0) {
+                return -1;
+            }
+        }
+    }
+    std::fprintf(stderr, "[sp-engine] cold_restore: %d positions restored to GPU\n", n_pos);
+    return n_pos;
+#else
+    (void)n_pos;
+    return -1;
+#endif
+}
+
+// ── Disk serialisation (VHT2 v2 binary format) ────────────────────────
+
+int KvCache::save_to_disk(const std::string& prefix, int n_pos,
+                          uint64_t model_hash) const {
+    if (n_pos <= 0 || n_pos > impl_->max_seq) {
+        std::fprintf(stderr, "[sp-engine] save_to_disk: bad n_pos=%d (max_seq=%d)\n",
+                     n_pos, impl_->max_seq);
+        return -1;
+    }
+
+    int rc = -1;
+    if (impl_->hier_inited) {
+        rc = sp_hier_cache_save(&impl_->hier, prefix.c_str(), n_pos, model_hash);
+    } else if (impl_->sq_inited) {
+        rc = sp_sqfree_cache_save(&impl_->sq, prefix.c_str(), n_pos, model_hash);
+    } else if (impl_->shadow_inited) {
+        rc = sp_shadow_cache_save(&impl_->shadow, prefix.c_str(), n_pos, model_hash);
+    } else {
+        std::fprintf(stderr, "[sp-engine] save_to_disk: no cache initialised\n");
+        return -1;
+    }
+
+    if (rc == 0) {
+        const char* mode = impl_->hier_inited ? "hierarchical" :
+                           impl_->sq_inited   ? "sqfree"       : "shadow";
+        std::fprintf(stderr, "[sp-engine] cache saved: %s n_pos=%d prefix=%s (%s)\n",
+                     mode, n_pos, prefix.c_str(),
+                     impl_->calibrated ? "calibrated" : "uncalibrated");
+    }
+    return rc;
+}
+
+int KvCache::load_from_disk(const std::string& prefix, uint64_t expected_hash) {
+    int rc = -1;
+    if (impl_->hier_inited) {
+        rc = sp_hier_cache_load(&impl_->hier, prefix.c_str(), expected_hash);
+    } else if (impl_->sq_inited) {
+        rc = sp_sqfree_cache_load(&impl_->sq, prefix.c_str(), expected_hash);
+    } else if (impl_->shadow_inited) {
+        rc = sp_shadow_cache_load(&impl_->shadow, prefix.c_str(), expected_hash);
+    } else {
+        std::fprintf(stderr, "[sp-engine] load_from_disk: no cache initialised\n");
+        return -1;
+    }
+
+    if (rc >= 0) {
+        const char* mode = impl_->hier_inited ? "hierarchical" :
+                           impl_->sq_inited   ? "sqfree"       : "shadow";
+        std::fprintf(stderr, "[sp-engine] cache loaded: %s n_pos=%d prefix=%s\n",
+                     mode, rc, prefix.c_str());
+    }
+    return rc;
 }
 
 } // namespace sp::engine

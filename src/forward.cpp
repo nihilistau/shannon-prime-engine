@@ -83,6 +83,14 @@ struct ForwardContext::Impl {
     ggml_backend_buffer_t compute_buf = nullptr;
     ggml_gallocr_t        allocr = nullptr;
 
+    // Multi-backend scheduler for partial GPU offload. When non-null,
+    // alloc_and_compute() routes through the scheduler instead of the
+    // single-backend path. The scheduler handles cross-backend copies
+    // (CPU ↔ GPU) transparently based on tensor buffer residency.
+    ggml_backend_sched_t  backend_sched = nullptr;
+    ggml_backend_t        cpu_backend   = nullptr;  // fallback; owned when sched is active
+    bool                  owns_cpu_backend = false;
+
     size_t ctx_size = 0;
     std::vector<uint8_t> ctx_mem;              // backing for graph ggml_context
 
@@ -135,9 +143,28 @@ struct ForwardContext::Impl {
     int gdn_d_inner       = 0;
 
     ~Impl() {
+        if (backend_sched) ggml_backend_sched_free(backend_sched);
         if (compute_buf) ggml_backend_buffer_free(compute_buf);
         if (allocr)      ggml_gallocr_free(allocr);
+        if (cpu_backend && owns_cpu_backend) ggml_backend_free(cpu_backend);
         if (backend && owns_backend) ggml_backend_free(backend);
+    }
+
+    // Unified alloc + compute path: routes through the scheduler when
+    // partial offload is active, falls back to single-backend otherwise.
+    bool alloc_graph(ggml_cgraph* graph) {
+        if (backend_sched) {
+            ggml_backend_sched_reset(backend_sched);
+            return ggml_backend_sched_alloc_graph(backend_sched, graph);
+        }
+        return ggml_gallocr_alloc_graph(allocr, graph);
+    }
+
+    ggml_status compute_graph(ggml_cgraph* graph) {
+        if (backend_sched) {
+            return ggml_backend_sched_graph_compute(backend_sched, graph);
+        }
+        return ggml_backend_graph_compute(backend, graph);
     }
 };
 
@@ -172,6 +199,10 @@ void ForwardContext::bind_gdn_state(GdnStateCache* gdn) {
 }
 
 int ForwardContext::kv_pos() const { return impl_->kv_pos; }
+
+void ForwardContext::set_kv_pos(int pos) {
+    impl_->kv_pos = pos;
+}
 
 std::unique_ptr<ForwardContext> ForwardContext::create(const Model& model,
                                                         const LlamaWeights& weights,
@@ -372,6 +403,44 @@ std::unique_ptr<ForwardContext> ForwardContext::create(const Model& model,
         }
     }
 
+    // Multi-backend scheduler: when an external GPU backend was supplied,
+    // create a scheduler with [GPU, CPU] priority so that ops on CPU-
+    // resident tensors (partial offload) automatically get cross-backend
+    // copies inserted. The scheduler owns allocation; gallocr is the
+    // fallback for single-backend (CPU-only or full-GPU) paths.
+    {
+        bool ext_is_gpu = false;
+        if (external_backend) {
+            ggml_backend_dev_t dev = ggml_backend_get_device(external_backend);
+            ext_is_gpu = dev && ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU;
+        }
+        if (ext_is_gpu) {
+            fc->impl_->cpu_backend = ggml_backend_init_by_type(
+                GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
+            fc->impl_->owns_cpu_backend = (fc->impl_->cpu_backend != nullptr);
+            if (fc->impl_->cpu_backend) {
+                ggml_backend_t backends[2] = {
+                    external_backend,        // priority 0 — GPU
+                    fc->impl_->cpu_backend   // priority 1 — CPU fallback
+                };
+                fc->impl_->backend_sched = ggml_backend_sched_new(
+                    backends, nullptr, 2,
+                    GGML_DEFAULT_GRAPH_SIZE,
+                    /*parallel=*/false,
+                    /*op_offload=*/true);
+                if (fc->impl_->backend_sched) {
+                    std::fprintf(stderr,
+                        "[sp-engine] ForwardContext: multi-backend scheduler active "
+                        "(GPU + CPU fallback)\n");
+                } else {
+                    std::fprintf(stderr,
+                        "[sp-engine] ForwardContext: sched_new failed — "
+                        "falling back to single-backend\n");
+                }
+            }
+        }
+    }
+
     fc->impl_->allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(fc->impl_->backend));
     if (!fc->impl_->allocr) {
         std::fprintf(stderr, "[sp-engine] ForwardContext: gallocr_new failed\n");
@@ -428,7 +497,7 @@ bool ForwardContext::embed(const std::vector<int32_t>& token_ids,
     ggml_build_forward_expand(graph, emb);
 
     // Allocate compute buffer (right-sized for this graph).
-    if (!ggml_gallocr_alloc_graph(impl_->allocr, graph)) {
+    if (!impl_->alloc_graph(graph)) {
         std::fprintf(stderr, "[sp-engine] ForwardContext::embed: allocr failed\n");
         ggml_free(gctx);
         return false;
@@ -439,7 +508,7 @@ bool ForwardContext::embed(const std::vector<int32_t>& token_ids,
                             (size_t)n * sizeof(int32_t));
 
     // Compute.
-    if (ggml_backend_graph_compute(impl_->backend, graph) != GGML_STATUS_SUCCESS) {
+    if (impl_->compute_graph(graph) != GGML_STATUS_SUCCESS) {
         std::fprintf(stderr, "[sp-engine] ForwardContext::embed: compute failed\n");
         ggml_free(gctx);
         return false;
@@ -1162,7 +1231,7 @@ bool ForwardContext::forward_one_block(const std::vector<int32_t>& token_ids,
 
     ggml_cgraph* graph = ggml_new_graph(gctx);
     ggml_build_forward_expand(graph, x);
-    if (!ggml_gallocr_alloc_graph(impl_->allocr, graph)) {
+    if (!impl_->alloc_graph(graph)) {
         ggml_free(gctx); return false;
     }
 
@@ -1197,7 +1266,7 @@ bool ForwardContext::forward_one_block(const std::vector<int32_t>& token_ids,
         ggml_backend_tensor_set(kq_mask, mask.data(), 0, mask.size() * sizeof(float));
     }
 
-    if (ggml_backend_graph_compute(impl_->backend, graph) != GGML_STATUS_SUCCESS) {
+    if (impl_->compute_graph(graph) != GGML_STATUS_SUCCESS) {
         ggml_free(gctx); return false;
     }
     out_flat.resize((size_t)n * (size_t)impl_->n_embd);
@@ -1447,7 +1516,7 @@ bool ForwardContext::forward_full(const std::vector<int32_t>& token_ids,
             }
         }
     }
-    if (!ggml_gallocr_alloc_graph(impl_->allocr, graph)) {
+    if (!impl_->alloc_graph(graph)) {
         std::fprintf(stderr, "[sp-engine] forward_full: gallocr failed\n");
         ggml_free(gctx); return false;
     }
@@ -1555,7 +1624,7 @@ bool ForwardContext::forward_full(const std::vector<int32_t>& token_ids,
         }
     }
 
-    if (ggml_backend_graph_compute(impl_->backend, graph) != GGML_STATUS_SUCCESS) {
+    if (impl_->compute_graph(graph) != GGML_STATUS_SUCCESS) {
         std::fprintf(stderr, "[sp-engine] forward_full: compute failed\n");
         ggml_free(gctx); return false;
     }
@@ -2085,7 +2154,7 @@ bool ForwardContext::decode(int32_t token_id,
         ggml_build_forward_expand(graph, cpy_K[(size_t)L]);
         ggml_build_forward_expand(graph, cpy_V[(size_t)L]);
     }
-    if (!ggml_gallocr_alloc_graph(impl_->allocr, graph)) {
+    if (!impl_->alloc_graph(graph)) {
         std::fprintf(stderr, "[sp-engine] decode: gallocr failed (past_n=%d)\n", past_n);
         ggml_free(gctx); return false;
     }
@@ -2176,7 +2245,7 @@ bool ForwardContext::decode(int32_t token_id,
         }
     }
 
-    if (ggml_backend_graph_compute(impl_->backend, graph) != GGML_STATUS_SUCCESS) {
+    if (impl_->compute_graph(graph) != GGML_STATUS_SUCCESS) {
         std::fprintf(stderr, "[sp-engine] decode: compute failed (past_n=%d)\n", past_n);
         ggml_free(gctx); return false;
     }

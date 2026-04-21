@@ -88,7 +88,8 @@ if(SP_ENGINE_WITH_CUDA)
     endif()
     add_library(shannon_prime_cuda_backend STATIC
         ${SP_CORE_DIR}/backends/cuda/shannon_prime_cuda.cu
-        ${SP_CORE_DIR}/backends/cuda/shannon_prime_sqfree.cu)
+        ${SP_CORE_DIR}/backends/cuda/shannon_prime_sqfree.cu
+        ${SP_CORE_DIR}/backends/cuda/shannon_prime_hier.cu)
     target_include_directories(shannon_prime_cuda_backend PUBLIC
         ${SP_CORE_DIR}/backends/cuda
         ${SP_CORE_DIR}/core)

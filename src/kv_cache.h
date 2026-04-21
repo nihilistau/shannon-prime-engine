@@ -108,6 +108,44 @@ public:
     bool is_calibrated() const;
     bool is_hierarchical() const;
 
+    // --- hot/cold offload (tiered GPU ↔ CPU ↔ disk) ---
+    //
+    // Enable cold storage for GPU-resident caches. Allocates `cold_mb`
+    // megabytes of pinned CPU RAM per K and V per layer. When the cache
+    // grows past `evict_keep` positions, the oldest GPU positions are
+    // copied to CPU (and optionally zeroed on GPU to reclaim VRAM).
+    //
+    // cold_mb=0 means unlimited (allocate enough for max_seq).
+    // evict_keep=0 means no GPU eviction — just mirror to CPU.
+    bool enable_cold_storage(int cold_mb = 0, int evict_keep = 0);
+
+    // Writeback new positions to cold storage. Call after write/write_gpu.
+    // Only copies positions that haven't been written back yet.
+    bool cold_writeback(int current_pos);
+
+    // Restore cold storage back to GPU. Used after disk load or eviction
+    // recovery. Returns the number of positions restored, or -1 on error.
+    int  cold_restore(int n_pos);
+
+    // Query cold storage state.
+    bool has_cold_storage() const;
+
+    // --- disk serialisation (VHT2 v2 binary format) ---
+    //
+    // Save compressed cache contents [0, n_pos) to disk. Writes per-layer
+    // files {prefix}.L{n}.bin with a 64-byte VHT2 header. For hierarchical
+    // caches the predictor W matrices are saved in {prefix}.hier_w.bin.
+    // `model_hash` is an FNV-1a hash of the model path — used to detect
+    // loads against a different model. Returns 0 on success, -1 on error.
+    int save_to_disk(const std::string& prefix, int n_pos,
+                     uint64_t model_hash) const;
+
+    // Load cache state from disk. Validates the VHT2 header magic and
+    // model hash. Returns the number of positions loaded (the n_pos
+    // stored in the header), or -1 on error. The cache must already be
+    // created with matching dimensions.
+    int load_from_disk(const std::string& prefix, uint64_t expected_hash);
+
     // --- diagnostics / introspection ---
     int  n_layer()           const;
     int  n_head_kv()         const;

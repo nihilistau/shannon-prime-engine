@@ -31,6 +31,45 @@ decode loop reads past K/V from a compressed KvCache, attends,
 writes new K/V back. Cache modes: ship (default), sqfree, sqfree+
 spinor, and hierarchical Vilenkin predictor (9% skeleton).
 
+## New in this build (2026-04-22)
+
+1. **Disk serialization.** `--save-cache <prefix>` / `--load-cache <prefix>` on the `chat` and `cache_ppl` verbs. Writes the compressed KV-cache to a VHT2 v2 binary format that can be reloaded across runs — no re-prefill needed. Env vars: `SP_ENGINE_SAVE_CACHE` / `SP_ENGINE_LOAD_CACHE`.
+
+2. **Hot/cold tiered storage.** `--cold`, `--cold-mb N`, `--evict-keep N`. Evicts cold KV blocks from GPU VRAM into CPU pinned RAM, reclaiming device memory for long contexts. Env vars: `SP_ENGINE_COLD_MB` / `SP_ENGINE_EVICT_KEEP`.
+
+3. **Partial GPU offload via scheduler bridge.** `--n-gpu-layers N` now works end-to-end — the `ggml_backend_sched_t` handles cross-backend copies automatically. `0` = full offload (default), `N` = first N transformer blocks on GPU, remainder on CPU.
+
+4. **Hierarchical GPU-resident cache.** All three cache paths (ship, sqfree, hier) are now GPU-resident. `--hierarchical` with `SP_ENGINE_BACKEND=gpu` runs the full hier compress/decompress pipeline in VRAM — no host round-trips.
+
+5. **GPU calibration fp16 fix.** `band_quantize` now recomputes `inv_scale` from stored fp16 scale values. Eliminates the variance-ranking asymmetry that caused the +0.21 PPL calibration regression on the GPU path.
+
+### Quick-start: save / load a cache
+
+```bash
+# Prefill and save the compressed cache to disk
+SP_ENGINE_BACKEND=gpu ./build-cuda/bin/sp-engine chat \
+    --model model.gguf --n-predict 50 \
+    --save-cache my_session \
+    "Summarize the history of information theory"
+
+# Resume from the saved cache (skips prefill)
+SP_ENGINE_BACKEND=gpu ./build-cuda/bin/sp-engine chat \
+    --model model.gguf --n-predict 50 \
+    --load-cache my_session \
+    "Continue from where you left off"
+```
+
+### Quick-start: hot/cold tiered storage
+
+```bash
+# Keep 512 MiB of cold storage in CPU pinned RAM, retain 32 most-recent
+# KV blocks on GPU, evict the rest
+SP_ENGINE_BACKEND=gpu ./build-cuda/bin/sp-engine chat \
+    --model model.gguf --n-predict 200 \
+    --cold --cold-mb 512 --evict-keep 32 \
+    "Write a long essay about prime numbers"
+```
+
 ## Headline result
 
 **Qwen3-8B-Q8 ship cache-mode PPL = 18.14 vs baseline 18.05 → +0.5% at 4.06× KV compression** (wiki.test.raw, ctx=512 chunks=2, decode-per-token through the compressed cache).
@@ -87,8 +126,12 @@ samples per slot).
 | 6d    | Cauchy decode-chain reset (Mertens-only shipping default) | ✓ |
 | 7a    | CUDA backend selection + weight offload (`SP_ENGINE_BACKEND=gpu`) | ✓ |
 | 7b    | GPU-resident ship cache (`create_gpu`, `read_gpu`, `write_gpu`) | ✓ |
-| 7c    | GPU-resident sqfree cache + batched read + calibration sync | infrastructure ✓ / real-model PPL validating |
+| 7c    | GPU-resident sqfree + hier cache (all three paths GPU-resident) | ✓ |
 | 7d    | Vulkan backend selection; release packaging | planned |
+| 5b-ii | Disk serialization (`--save-cache` / `--load-cache`, VHT2 v2 binary) | ✓ |
+| 5b-iii| Hot/cold tiered storage (`--cold`, `--cold-mb`, `--evict-keep`) | ✓ |
+| 5b-iv | Scheduler bridge partial offload (`--n-gpu-layers N` end-to-end) | ✓ |
+| 5b-v  | GPU calibration fp16 fix (`band_quantize` inv_scale recompute) | ✓ |
 | 8a    | `qwen35moe` loader — arch registration + MoE/GDN tensor binding | ✓ |
 | 8b    | `qwen35moe` forward — gated attention + mRoPE + GDN delta-rule + MoE FFN | ✓ |
 | 8c    | `GdnStateCache` — per-layer recurrent state (fp16 host storage) | ✓ |
@@ -214,9 +257,8 @@ cleanly; full four-way decode-chain comparison:
 | hierarchical cache | 26.37 | +113% | 10m35s |
 
 (Dolphin numbers predate the GPU-resident cache for sqfree /
-hierarchical paths — those still run host-side for now. Ship cache
-on Dolphin uses the pre-GPU-resident path. Extending the GPU cache
-to sqfree+spinor is tracked as follow-up work.)
+hierarchical paths. As of 2026-04-22 all three cache paths — ship,
+sqfree, and hierarchical — are GPU-resident.)
 
 The 1B cache-mode results are load-bearing for the *scaling-law
 fit*, not for deployment decisions — nobody compresses a 1B model's
@@ -285,8 +327,11 @@ regenerating the GGUF each time.
 
 **Backend / offload flags (shared across `chat` / `perplexity` / `cache_ppl`):**
 `--n-gpu-layers N` (`-ngl N`) — when `SP_ENGINE_BACKEND=gpu` is set, overrides
-`SP_ENGINE_N_GPU_LAYERS` for this invocation. Default = all layers offloaded.
-Values below `model.n_layer` keep the head + token_embd + output_norm on CPU.
+`SP_ENGINE_N_GPU_LAYERS` for this invocation. Default `0` = full offload (all
+layers on GPU). Values `N` > 0 place the first N transformer blocks on GPU and
+the remainder on CPU; the `ggml_backend_sched_t` scheduler bridge handles
+cross-backend tensor copies automatically. Head + token_embd + output_norm
+stay CPU-resident when N < `model.n_layer`.
 
 ### Cache-config flags (shared across `kv_smoke` / `prefill` / `chat` / `perplexity --cache` / `cache_ppl`)
 
@@ -303,6 +348,11 @@ Values below `model.n_layer` keep the head + token_embd + output_norm on CPU.
 | `--hier-level N` | Hierarchical skeleton level (0 = auto, picks second-to-last prime grouping). |
 | `--hier-res-bits N` | Hierarchical residual bits (default 2). |
 | `--hier-skel-bits CSV` | Hierarchical skeleton band bits (default `5,5`). |
+| `--save-cache <prefix>` | Write compressed KV-cache to `<prefix>.spkv` (VHT2 v2 binary format). Works on `chat` and `cache_ppl` verbs. |
+| `--load-cache <prefix>` | Load a previously saved cache from `<prefix>.spkv`, skipping prefill. Works on `chat` and `cache_ppl` verbs. |
+| `--cold` | Enable hot/cold tiered storage. Cold KV blocks evicted from GPU VRAM to CPU pinned RAM. |
+| `--cold-mb N` | Maximum CPU pinned RAM budget for cold storage (MiB). Default: unlimited. |
+| `--evict-keep N` | Number of most-recent KV blocks to keep hot on GPU. Older blocks are evicted to cold storage. |
 
 ### Cauchy decode-chain reset (optional)
 
@@ -393,12 +443,16 @@ Override: `SP_CALIBRATE=1` on the `prefill` CLI verb forces explicit calibration
 | `SP_ENGINE_BACKEND` | — | `gpu` / `cuda` / `vulkan` switches forward + weight-offload to the chosen GPU backend. Unset = CPU (mmap weights). |
 | `SP_ENGINE_N_GPU_LAYERS` | all | Integer count of transformer blocks to offload. Only meaningful when `SP_ENGINE_BACKEND` selects GPU. At count ≥ `model.n_layer` the head + token_embd + output_norm + rope_freqs tensors also land on the backend; below that, they stay CPU-resident and the loader picks a split offload. Overridden per-verb by `--n-gpu-layers` / `-ngl`. |
 | `SHANNON_PRIME_GPU_CACHE` | 1 | When the backend is GPU, route KvCache to the GPU-resident path (`create_gpu`). Set to 0 to force the host cache (A/B diagnostic). |
-| `SHANNON_PRIME_SYNC_CALIB_TO_GPU` | 0 | After `calibrate_end`, upload the variance-ranked mask (ship `d_mobius_order` + sqfree Knight CSR) to the GPU cache. Default off: the ship path documents a +0.21 PPL asymmetric regression with calibration sync, and the sqfree path regresses similarly on real Qwen3 data (~+19 PPL). Opt in for investigation. |
+| `SHANNON_PRIME_SYNC_CALIB_TO_GPU` | 0 | After `calibrate_end`, upload the variance-ranked mask (ship `d_mobius_order` + sqfree Knight CSR) to the GPU cache. The fp16 `inv_scale` fix (2026-04-22) eliminates the variance-ranking asymmetry that previously caused a +0.21 PPL regression. Consider re-evaluating with `=1`. |
 | `SHANNON_PRIME_SQFREE_NO_BATCH` | 0 | Fall back to the per-vec sqfree GPU read path. Diagnostic-only — the batched path is correct on kv_smoke (K_corr 0.943, matches CPU) but real-model PPL validation is still open. |
 | `SP_CALIBRATE` | 0 | Force the `prefill` CLI verb to calibrate before writing. Normally `ForwardContext::prefill` auto-calibrates on first call regardless. |
 | `SP_DEBUG_DECODE` | 0 | Print layer-0 K / X correlation diff between decode and a reference `forward_full` at each step. Diagnostic for decode-graph bugs. |
 | `SP_SKIP_CAPTURE` | 0 | Disable K/V capture in decode (and thus cache writes). Debug harness from the V-capture-view regression hunt; leave off. |
 | `SHANNON_PRIME_NO_CALIBRATE` | 0 | Skip the auto-calibration pass — used when A/B-testing the calibrated vs static mask on the same run. |
+| `SP_ENGINE_SAVE_CACHE` | — | Path prefix for cache serialization on exit. Equivalent to `--save-cache <prefix>`. Writes `<prefix>.spkv` in VHT2 v2 binary format. |
+| `SP_ENGINE_LOAD_CACHE` | — | Path prefix to load a serialized cache on startup. Equivalent to `--load-cache <prefix>`. Skips prefill when a valid `.spkv` file is found. |
+| `SP_ENGINE_COLD_MB` | — | Maximum CPU pinned RAM budget (MiB) for hot/cold tiered storage. Equivalent to `--cold-mb N`. Implies `--cold`. |
+| `SP_ENGINE_EVICT_KEEP` | — | Number of most-recent KV blocks to retain on GPU when cold storage is active. Equivalent to `--evict-keep N`. |
 | `SHANNON_PRIME_MODEL_PRESET` | — | Seed the model-pack overlay default: `auto`, `off`, or an arch name (e.g. `qwen3moe`). Equivalent to passing `--model-preset <value>` on the CLI, but picked up by every verb that accepts a Config. An explicit CLI flag always wins. |
 
 ### Sidecar auto-load (`.sp_freq_factors.bin`)

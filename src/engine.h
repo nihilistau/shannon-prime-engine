@@ -107,6 +107,23 @@ struct Config {
     // default behavior (no Ricci, Mertens only).
     bool        cauchy_mertens_only = false;
     float       params_b        = 0.0f;
+
+    // Hot/cold tiered storage — GPU VRAM → CPU pinned RAM → disk.
+    // cold_mb:      total pinned RAM budget in MB (0 = unlimited, allocate
+    //               enough for max_seq). Env: SP_ENGINE_COLD_MB.
+    // evict_keep:   keep this many recent positions in GPU VRAM, evict
+    //               older ones (0 = no eviction, just mirror). Env:
+    //               SP_ENGINE_EVICT_KEEP.
+    int         cold_mb      = 0;
+    int         evict_keep   = 0;
+    bool        enable_cold  = false;
+
+    // Disk serialisation — save/load compressed KV cache state.
+    // Both are empty by default (no save/load). Set via --save-cache /
+    // --load-cache CLI flags or SP_ENGINE_SAVE_CACHE / SP_ENGINE_LOAD_CACHE
+    // env vars. The path is a prefix: each layer writes {prefix}.L{n}.bin.
+    std::string save_cache_path;
+    std::string load_cache_path;
 };
 
 // Seed Config fields from environment variables. Called by each CLI verb
@@ -120,6 +137,27 @@ inline void seed_config_from_env(Config& cfg) {
     if (cfg.model_preset.empty()) {
         if (const char* s = std::getenv("SHANNON_PRIME_MODEL_PRESET")) {
             cfg.model_preset = s;
+        }
+    }
+    if (!cfg.enable_cold) {
+        if (const char* s = std::getenv("SP_ENGINE_COLD_MB")) {
+            cfg.cold_mb = std::atoi(s);
+            cfg.enable_cold = (cfg.cold_mb > 0);
+        }
+    }
+    if (cfg.evict_keep == 0) {
+        if (const char* s = std::getenv("SP_ENGINE_EVICT_KEEP")) {
+            cfg.evict_keep = std::atoi(s);
+        }
+    }
+    if (cfg.save_cache_path.empty()) {
+        if (const char* s = std::getenv("SP_ENGINE_SAVE_CACHE")) {
+            cfg.save_cache_path = s;
+        }
+    }
+    if (cfg.load_cache_path.empty()) {
+        if (const char* s = std::getenv("SP_ENGINE_LOAD_CACHE")) {
+            cfg.load_cache_path = s;
         }
     }
 }

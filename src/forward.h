@@ -141,6 +141,10 @@ public:
 
     int kv_pos() const;
 
+    // Set the cache position explicitly — used after loading cache state
+    // from disk so decode continues at the right offset.
+    void set_kv_pos(int pos);
+
     // Hparams the caller set at create(); exposed for diagnostics.
     int n_embd()  const;
     int n_vocab() const;

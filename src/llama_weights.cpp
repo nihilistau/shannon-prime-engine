@@ -307,35 +307,20 @@ std::unique_ptr<LlamaWeights> LlamaWeights::load_backend_offload_(
     const int n_layer_total = (int)model.n_layer();
     const bool full_offload = n_gpu_layers >= n_layer_total;
 
-    // Safety gate: partial offload on a non-CPU backend is currently
-    // broken. Non-layer tensors (output, token_embd, output_norm,
-    // rope_freqs) stay CPU-mmap-resident with t->data pointing at host
-    // memory; when the CUDA matmul kernels deref those pointers during
-    // forward, Windows reports ACCESS_VIOLATION (0xC0000005).
-    //
-    // A tried-and-rejected shortcut: cudaHostRegister-pinning the CPU-
-    // resident tensors with cudaHostRegisterMapped. cudaHostRegister
-    // succeeds on every mmap'd tensor (verified: 76/76 OK on Dolphin
-    // -ngl 8), but ggml's CUDA backend ignores the pin — tensors
-    // without a CUDA-buffer-type annotation are treated as device-
-    // native and the cuBLAS call still crashes. The real fix needs
-    // ggml_backend_sched_t to route ops based on per-tensor buffer
-    // type and insert cross-backend copies; that's a separate ~300
-    // LOC refactor tracked as follow-up. Until then, refuse upfront.
+    // Partial offload: layers [0, n_gpu_layers) go to GPU, the rest
+    // plus non-layer tensors (output, token_embd, etc.) stay CPU-mmap.
+    // ForwardContext builds a ggml_backend_sched_t that handles cross-
+    // backend copies transparently, so mixed residency works.
     const bool backend_is_gpu = [&]{
         ggml_backend_dev_t dev = ggml_backend_get_device(backend);
         return dev && ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU;
     }();
     if (!full_offload && backend_is_gpu) {
         std::fprintf(stderr,
-            "[sp-engine] LlamaWeights::load: partial offload "
-            "(n_gpu_layers=%d < model.n_layer=%d) is not supported "
-            "on non-CPU backends — the forward graph can't dispatch "
-            "matmul over mixed CPU/GPU weight residency yet. Either "
-            "pass n_gpu_layers >= %d (full offload) or unset "
-            "SP_ENGINE_BACKEND for the CPU mmap path.\n",
-            n_gpu_layers, n_layer_total, n_layer_total);
-        return nullptr;
+            "[sp-engine] LlamaWeights::load: partial offload — "
+            "layers [0,%d) on GPU, [%d,%d) + non-layer on CPU. "
+            "ForwardContext scheduler handles cross-backend copies.\n",
+            n_gpu_layers, n_gpu_layers, n_layer_total);
     }
 
 #ifdef SP_ENGINE_WITH_CUDA

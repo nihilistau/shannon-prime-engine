@@ -14,6 +14,10 @@
 #include "tokenizer.h"
 #include "vocab.h"
 
+extern "C" {
+#include "shannon_prime.h"
+}
+
 #include "ggml-backend.h"
 #include <cstdlib>
 #include <cstring>
@@ -128,6 +132,17 @@ static void usage(const char* prog) {
         "                        explicit --k-bits/--v-bits/--residual-bits win)\n"
         "  --no-calibrate       skip automatic calibration during prefill\n"
         "\n"
+        "Hot/cold tiered storage (GPU ↔ CPU offload):\n"
+        "  --cold                enable cold storage (GPU→CPU mirror, unlimited)\n"
+        "  --cold-mb <n>         enable cold storage with ring buffer of N MB\n"
+        "  --evict-keep <n>      keep N recent positions on GPU, evict older ones\n"
+        "                        (env: SP_ENGINE_COLD_MB, SP_ENGINE_EVICT_KEEP)\n"
+        "\n"
+        "Disk serialisation (cache save/load):\n"
+        "  --save-cache <prefix> save compressed KV state after generation\n"
+        "  --load-cache <prefix> load compressed KV state before generation\n"
+        "                        (env: SP_ENGINE_SAVE_CACHE, SP_ENGINE_LOAD_CACHE)\n"
+        "\n"
         "Hierarchical Vilenkin predictor (maximum compression):\n"
         "  --hierarchical       enable hierarchical predictor (~9%% skeleton)\n"
         "  --hier-level <n>     0 = auto, 1..n_primes-1 = explicit\n"
@@ -207,6 +222,8 @@ int main(int argc, char** argv) {
             else if (a == "--cauchy-cooldown" && i + 1 < argc) cc.cauchy_cooldown = std::atoi(argv[++i]);
             else if (a == "--cauchy-use-ricci")                cc.cauchy_use_ricci = true;
             else if (a == "--params-b"        && i + 1 < argc) cc.params_b        = (float)std::atof(argv[++i]);
+            else if (a == "--save-cache"      && i + 1 < argc) cc.save_cache_path = argv[++i];
+            else if (a == "--load-cache"      && i + 1 < argc) cc.load_cache_path = argv[++i];
             else if (a.size() >= 2 && a[0] == '-' && a[1] == '-') {
                 std::fprintf(stderr, "cache_ppl: unknown flag %s\n", a.c_str()); return 2;
             }
@@ -288,6 +305,18 @@ int main(int argc, char** argv) {
         if (!kv) { std::fprintf(stderr, "KvCache::create failed\n"); return 7; }
         std::fprintf(stderr, "[sp-engine] %s%s\n", kv->describe().c_str(),
                      kv->is_gpu() ? " [GPU-resident]" : "");
+
+        // Model hash for save/load validation.
+        const uint64_t model_hash_cp = sp_fnv1a_hash(cc.model_path.c_str(),
+                                                      cc.model_path.size());
+
+        // Load cached state if --load-cache given.
+        if (!cc.load_cache_path.empty()) {
+            const int lp = kv->load_from_disk(cc.load_cache_path, model_hash_cp);
+            if (lp < 0) {
+                std::fprintf(stderr, "[sp-engine] WARNING: --load-cache failed\n");
+            }
+        }
 
         // Init the Cauchy reset system BEFORE the calibration pass so the
         // Ricci sentinel can learn its p=3 baseline from the same vectors
@@ -468,6 +497,13 @@ int main(int argc, char** argv) {
         const double corr_gap = 1.0 - mean_kc;
         std::printf("Corr gap     = %.6f  (1 - K_corr)\n", corr_gap);
         std::printf("Scaling term = %.4f  (4700 · gap²)\n", 4700.0 * corr_gap * corr_gap);
+
+        // Save cache state if --save-cache given.
+        if (!cc.save_cache_path.empty() && kv) {
+            if (kv->save_to_disk(cc.save_cache_path, n_ctx, model_hash_cp) != 0) {
+                std::fprintf(stderr, "[sp-engine] WARNING: --save-cache failed\n");
+            }
+        }
         return 0;
     }
 
@@ -807,6 +843,11 @@ int main(int argc, char** argv) {
             else if (a == "--cauchy-warmup"   && i + 1 < argc) cc.cauchy_warmup   = std::atoi(argv[++i]);
             else if (a == "--cauchy-use-ricci")                cc.cauchy_use_ricci    = true;
             else if (a == "--params-b"        && i + 1 < argc) cc.params_b        = (float)std::atof(argv[++i]);
+            else if (a == "--save-cache"      && i + 1 < argc) cc.save_cache_path = argv[++i];
+            else if (a == "--load-cache"      && i + 1 < argc) cc.load_cache_path = argv[++i];
+            else if (a == "--cold-mb"         && i + 1 < argc) { cc.cold_mb = std::atoi(argv[++i]); cc.enable_cold = true; }
+            else if (a == "--cold")                             cc.enable_cold = true;
+            else if (a == "--evict-keep"      && i + 1 < argc) cc.evict_keep = std::atoi(argv[++i]);
             else if (a.size() >= 2 && a[0] == '-' && a[1] == '-') {
                 std::fprintf(stderr, "chat: unknown flag %s\n", a.c_str()); return 2;
             }
@@ -876,7 +917,33 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "[sp-engine] PE: %s\n",
                      sp::engine::prime_pe_describe(cc.pe_mode, cc.pe_alpha, cc.pe_tier).c_str());
 
+        // Enable cold storage (tiered GPU→CPU offload) when requested.
+        if (cc.enable_cold && kv->is_gpu()) {
+            if (!kv->enable_cold_storage(cc.cold_mb, cc.evict_keep)) {
+                std::fprintf(stderr, "[sp-engine] WARNING: cold storage init failed\n");
+            }
+        }
+
         fc->bind_cache(kv.get());
+
+        // Model hash for save/load validation.
+        const uint64_t model_hash = sp_fnv1a_hash(cc.model_path.c_str(),
+                                                   cc.model_path.size());
+
+        // Load cached KV state from disk if --load-cache was given.
+        int loaded_pos = 0;
+        if (!cc.load_cache_path.empty()) {
+            loaded_pos = kv->load_from_disk(cc.load_cache_path, model_hash);
+            if (loaded_pos < 0) {
+                std::fprintf(stderr, "[sp-engine] WARNING: --load-cache failed "
+                             "(continuing with empty cache)\n");
+                loaded_pos = 0;
+            } else if (loaded_pos > 0) {
+                fc->set_kv_pos(loaded_pos);
+                std::fprintf(stderr, "[sp-engine] cache loaded: resuming at kv_pos=%d\n",
+                             loaded_pos);
+            }
+        }
 
         // Cauchy reset system: same semantics as perplexity --cache.
         // On a recommended reset during generation, we re-prefill the
@@ -1019,6 +1086,14 @@ int main(int argc, char** argv) {
                      fc->kv_pos(), n_prompt, n_predict);
         if (cc.cauchy_mode > 0 && kv) {
             kv->cauchy_print_stats();
+        }
+
+        // Save cache to disk if --save-cache was given.
+        if (!cc.save_cache_path.empty() && kv) {
+            const int save_pos = fc->kv_pos();
+            if (kv->save_to_disk(cc.save_cache_path, save_pos, model_hash) != 0) {
+                std::fprintf(stderr, "[sp-engine] WARNING: --save-cache failed\n");
+            }
         }
         return 0;
     }
