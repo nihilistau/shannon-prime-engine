@@ -47,92 +47,63 @@ struct Config {
     int         hier_res_bits   = 2;       // 1-4 bits for target residuals
     std::string hier_skel_bits  = "5,5";   // Band bits for skeleton quantisation
 
-    // Backend selection. `Vulkan` is planned (engine stage 7d); today it
-    // falls through to whatever `ggml_backend_init_by_type(GPU)` picks.
+    // Backend selection.
     enum class Backend { CPU, CUDA, Vulkan };
     Backend     backend = Backend::CPU;
-    // n_gpu_layers semantics (when backend != CPU):
-    //   0 (default)       — use engine default (all layers; equivalent to
-    //                       passing N_GPU_LAYERS_ALL to LlamaWeights::load)
-    //   1..model.n_layer  — offload only the first N blocks; the rest plus
-    //                       non-layer tensors (head, token_embd) stay CPU
-    //   >= model.n_layer  — full offload (same as 0)
-    // When backend == CPU, this field is ignored (mmap zero-copy load).
     int         n_gpu_layers = 0;
 
-    // Positional-encoding mode. Default is Standard (geometric RoPE, no
-    // ALiBi, byte-for-byte compatible with llama.cpp). Non-standard modes
-    // implement the paper's "PrimePE-RoPE-ALiBi" family — lattice-drawn
-    // frequencies + distance-based attention bias:
-    //   PrimePe        geometric freqs replaced by lattice-drawn integer
-    //                  freqs, blended with geometric at pe_alpha
-    //   PrimePeAlibi   PrimePe + per-head ALiBi slopes added to attn scores
-    //   AlibiOnly      standard RoPE + ALiBi (ablation)
+    // Positional-encoding mode.
     enum class PeMode { Standard, PrimePe, PrimePeAlibi, AlibiOnly };
     PeMode      pe_mode  = PeMode::Standard;
-    float       pe_alpha = 0.17f;   // blend factor 0..1; paper's sweet spot 0.15–0.22
-    int         pe_tier  = 0;       // 0 = composite lattice, 1 = prime generators
+    float       pe_alpha = 0.17f;
+    int         pe_tier  = 0;
 
     // Cauchy reset system — decode-chain causal stability.
-    //   mode 0 = off (default)
-    //   mode 1 = fixed-N resets every `cauchy_fixed_n` tokens
-    //   mode 2 = dynamic: Ricci sentinel (p=3 band energy drift) + Mertens
-    //           oracle (zeta-zero-scheduled proactive reset points)
-    // params_b is the model size in billions — used to tune Ricci threshold
-    // (small models need tighter detection).
     int         cauchy_mode     = 0;
     int         cauchy_fixed_n  = 512;
-    // Minimum positions between resets. Default 64 keeps reset rate
-    // bounded (measured ~3-5 resets per chunk). Lower values allow
-    // more frequent resets — each one pays a full forward_full pass,
-    // so use with care until partial-reset lands.
     int         cauchy_cooldown = 64;
-    // Initial delay before Cauchy is allowed to fire, counted from
-    // the start of the decode loop within a chunk. The first N decode
-    // positions post-prefill have low accumulated compression error —
-    // resetting them is pure overhead. Measured sweet spot on Qwen3-8B
-    // ctx=1024: warmup=64 (best PPL recovery), warmup=128 (same PPL,
-    // fewer resets). warmup=256 starves the mechanism.
     int         cauchy_warmup   = 64;
-    // Opt-in the Ricci drift sentinel. Default off — measured to
-    // contribute 0 incremental PPL on Qwen3-8B-Q8 ctx=1024
-    // (full system 11.92 ≡ Mertens-only 11.92; Ricci-only 12.02).
-    // Enable for drift-diagnostic research.
     bool        cauchy_use_ricci = false;
-    // Ablation: when true, Cauchy mode 2 skips the Mertens
-    // (proactive zeta-schedule) layer and runs Ricci-only. Implies
-    // cauchy_use_ricci. Useful for isolating the reactive layer.
     bool        cauchy_ricci_only = false;
-    // Ablation flag kept for backward compat — this is now the
-    // default behavior (no Ricci, Mertens only).
     bool        cauchy_mertens_only = false;
     float       params_b        = 0.0f;
 
     // Hot/cold tiered storage — GPU VRAM → CPU pinned RAM → disk.
-    // cold_mb:      total pinned RAM budget in MB (0 = unlimited, allocate
-    //               enough for max_seq). Env: SP_ENGINE_COLD_MB.
-    // evict_keep:   keep this many recent positions in GPU VRAM, evict
-    //               older ones (0 = no eviction, just mirror). Env:
-    //               SP_ENGINE_EVICT_KEEP.
     int         cold_mb      = 0;
     int         evict_keep   = 0;
     bool        enable_cold  = false;
 
     // Disk serialisation — save/load compressed KV cache state.
-    // Both are empty by default (no save/load). Set via --save-cache /
-    // --load-cache CLI flags or SP_ENGINE_SAVE_CACHE / SP_ENGINE_LOAD_CACHE
-    // env vars. The path is a prefix: each layer writes {prefix}.L{n}.bin.
     std::string save_cache_path;
     std::string load_cache_path;
+
+    // System 1↔2 switching — entropy-gated dynamic cache routing.
+    //
+    // When enabled, the engine maintains two caches:
+    //   System 1: ship path (fast, moderate compression)
+    //   System 2: hier or sqfree path (slower, maximum fidelity)
+    //
+    // During decode, the output logit entropy after each token determines
+    // which cache stores the NEXT token's K/V. High entropy (model is
+    // uncertain, distributing probability mass widely) → System 2 for
+    // maximum reconstruction fidelity on these "hard" tokens. Low entropy
+    // (model is confident) → System 1 for speed.
+    //
+    // The threshold is in nats (natural log). Typical softmax entropy for
+    // an 8B model ranges from ~0.3 (very confident) to ~8 (very uncertain).
+    // Default threshold 2.0 routes ~15-25% of tokens to System 2.
+    //
+    // On read, the DualKvCache merges positions from both caches
+    // transparently — the decode graph sees a single unified K/V history.
+    bool        system12          = false;
+    float       s12_threshold     = 2.0f;  // entropy threshold (nats)
+    // System 2 cache type: "hier" (default) or "sqfree"
+    std::string s12_sys2          = "hier";
 };
 
 // Seed Config fields from environment variables. Called by each CLI verb
 // immediately after Config construction, so the precedence ordering stays:
 //   Config default → env var → CLI flag.
-// Only fills fields the env var owns; never clobbers a value already set
-// by the caller (so tests that construct a Config programmatically aren't
-// affected). Keep this header-inline so every call site picks it up
-// without a link dependency.
 inline void seed_config_from_env(Config& cfg) {
     if (cfg.model_preset.empty()) {
         if (const char* s = std::getenv("SHANNON_PRIME_MODEL_PRESET")) {
@@ -158,6 +129,21 @@ inline void seed_config_from_env(Config& cfg) {
     if (cfg.load_cache_path.empty()) {
         if (const char* s = std::getenv("SP_ENGINE_LOAD_CACHE")) {
             cfg.load_cache_path = s;
+        }
+    }
+    if (!cfg.system12) {
+        if (const char* s = std::getenv("SP_ENGINE_SYSTEM12")) {
+            cfg.system12 = (std::atoi(s) != 0);
+        }
+    }
+    if (cfg.s12_threshold == 2.0f) {
+        if (const char* s = std::getenv("SP_ENGINE_S12_THRESHOLD")) {
+            cfg.s12_threshold = (float)std::atof(s);
+        }
+    }
+    if (cfg.s12_sys2.empty() || cfg.s12_sys2 == "hier") {
+        if (const char* s = std::getenv("SP_ENGINE_S12_SYS2")) {
+            cfg.s12_sys2 = s;
         }
     }
 }

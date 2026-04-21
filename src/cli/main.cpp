@@ -19,6 +19,7 @@ extern "C" {
 }
 
 #include "ggml-backend.h"
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 
@@ -34,6 +35,25 @@ struct SpBackendGuard {
     SpBackendGuard& operator=(const SpBackendGuard&) = delete;
     operator ggml_backend_t() const { return b; }
 };
+
+// Compute Shannon entropy H = -Σ p_i log(p_i) from raw logits (nats).
+// Uses log-sum-exp for numerical stability.
+static float sp_logit_entropy(const float* logits, int n) {
+    float mx = logits[0];
+    for (int i = 1; i < n; ++i) {
+        if (logits[i] > mx) mx = logits[i];
+    }
+    double sum_exp = 0.0;
+    for (int i = 0; i < n; ++i) {
+        sum_exp += std::exp((double)(logits[i] - mx));
+    }
+    const double log_Z = (double)mx + std::log(sum_exp);
+    double weighted_sum = 0.0;
+    for (int i = 0; i < n; ++i) {
+        weighted_sum += (double)logits[i] * std::exp((double)(logits[i] - mx));
+    }
+    return (float)(log_Z - weighted_sum / sum_exp);
+}
 
 // Backend selection helper shared across verbs: reads SP_ENGINE_BACKEND
 // and returns a ggml_backend_t (caller owns, must ggml_backend_free).
@@ -71,7 +91,6 @@ static int sp_default_n_gpu_layers() {
 }
 
 #include <algorithm>
-#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -164,6 +183,12 @@ static void usage(const char* prog) {
         "  --cauchy-ricci-only   mode 2 without Mertens schedule (Ricci drift only, ablation)\n"
         "  --cauchy-mertens-only mode 2 without Ricci sentinel (now the default)\n"
         "  --params-b <f>        model size in billions (tunes Ricci threshold)\n"
+        "\n"
+        "System 1↔2 switching (entropy-gated dynamic cache routing):\n"
+        "  --system12            enable dual-cache mode (ship + hier/sqfree)\n"
+        "  --s12-threshold <f>   entropy threshold in nats (default: 2.0)\n"
+        "  --s12-sys2 <type>     System 2 cache type: hier (default) | sqfree\n"
+        "                        (env: SP_ENGINE_SYSTEM12, SP_ENGINE_S12_THRESHOLD)\n"
         "\n", prog);
 }
 
@@ -224,6 +249,9 @@ int main(int argc, char** argv) {
             else if (a == "--params-b"        && i + 1 < argc) cc.params_b        = (float)std::atof(argv[++i]);
             else if (a == "--save-cache"      && i + 1 < argc) cc.save_cache_path = argv[++i];
             else if (a == "--load-cache"      && i + 1 < argc) cc.load_cache_path = argv[++i];
+            else if (a == "--system12")                         cc.system12       = true;
+            else if (a == "--s12-threshold"   && i + 1 < argc) cc.s12_threshold  = (float)std::atof(argv[++i]);
+            else if (a == "--s12-sys2"        && i + 1 < argc) cc.s12_sys2       = argv[++i];
             else if (a.size() >= 2 && a[0] == '-' && a[1] == '-') {
                 std::fprintf(stderr, "cache_ppl: unknown flag %s\n", a.c_str()); return 2;
             }
@@ -848,6 +876,9 @@ int main(int argc, char** argv) {
             else if (a == "--cold-mb"         && i + 1 < argc) { cc.cold_mb = std::atoi(argv[++i]); cc.enable_cold = true; }
             else if (a == "--cold")                             cc.enable_cold = true;
             else if (a == "--evict-keep"      && i + 1 < argc) cc.evict_keep = std::atoi(argv[++i]);
+            else if (a == "--system12")                         cc.system12       = true;
+            else if (a == "--s12-threshold"   && i + 1 < argc) cc.s12_threshold  = (float)std::atof(argv[++i]);
+            else if (a == "--s12-sys2"        && i + 1 < argc) cc.s12_sys2       = argv[++i];
             else if (a.size() >= 2 && a[0] == '-' && a[1] == '-') {
                 std::fprintf(stderr, "chat: unknown flag %s\n", a.c_str()); return 2;
             }
@@ -883,6 +914,7 @@ int main(int argc, char** argv) {
 
         // Prefer GPU-resident cache when backend is GPU + ship path.
         std::unique_ptr<sp::engine::KvCache> kv;
+        std::unique_ptr<sp::engine::DualKvCache> dual;
         {
             const char* env_gpu = std::getenv("SHANNON_PRIME_GPU_CACHE");
             const bool prefer_gpu_cache = (env_gpu == nullptr) || (std::atoi(env_gpu) != 0);
@@ -891,40 +923,72 @@ int main(int argc, char** argv) {
                 ggml_backend_dev_t dev = ggml_backend_get_device((ggml_backend_t)bk);
                 backend_is_gpu = dev && ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU;
             }
-            // Ship, sqfree, and sqfree+spinor are GPU-resident;
-            // hierarchical still host-side until its GPU cache lands.
-            const bool gpu_ok = !cc.hierarchical;
-            if (prefer_gpu_cache && backend_is_gpu && gpu_ok) {
-                kv = sp::engine::KvCache::create_gpu(fc->n_layer(),
+
+            if (cc.system12) {
+                // System 1↔2: dual cache mode.
+                if (backend_is_gpu) {
+                    dual = sp::engine::DualKvCache::create_gpu(
+                        fc->n_layer(), (int)m->n_head_kv(),
+                        (int)m->head_dim(), max_seq, cc,
+                        cc.s12_sys2, cc.s12_threshold,
+                        /*stream=*/nullptr);
+                }
+                if (!dual) {
+                    dual = sp::engine::DualKvCache::create(
+                        fc->n_layer(), (int)m->n_head_kv(),
+                        (int)m->head_dim(), max_seq, cc,
+                        cc.s12_sys2, cc.s12_threshold);
+                }
+                if (!dual) {
+                    std::fprintf(stderr, "DualKvCache::create failed\n"); return 5;
+                }
+                std::fprintf(stderr, "[sp-engine] %s\n", dual->describe().c_str());
+            } else {
+                // Standard single-cache path.
+                // Ship, sqfree, and sqfree+spinor are GPU-resident;
+                // hierarchical uses GPU path when available.
+                const bool gpu_ok = !cc.hierarchical;
+                if (prefer_gpu_cache && backend_is_gpu && gpu_ok) {
+                    kv = sp::engine::KvCache::create_gpu(fc->n_layer(),
+                                                          (int)m->n_head_kv(),
+                                                          (int)m->head_dim(),
+                                                          max_seq, cc,
+                                                          /*stream=*/nullptr);
+                    if (!kv) {
+                        std::fprintf(stderr, "[sp-engine] create_gpu failed; falling back to host cache\n");
+                    }
+                }
+                if (!kv) {
+                    kv = sp::engine::KvCache::create(fc->n_layer(),
                                                       (int)m->n_head_kv(),
                                                       (int)m->head_dim(),
-                                                      max_seq, cc,
-                                                      /*stream=*/nullptr);
-                if (!kv) {
-                    std::fprintf(stderr, "[sp-engine] create_gpu failed; falling back to host cache\n");
+                                                      max_seq, cc);
                 }
-            }
-            if (!kv) {
-                kv = sp::engine::KvCache::create(fc->n_layer(),
-                                                  (int)m->n_head_kv(),
-                                                  (int)m->head_dim(),
-                                                  max_seq, cc);
+                if (!kv) { std::fprintf(stderr, "KvCache::create failed\n"); return 5; }
+                std::fprintf(stderr, "[sp-engine] %s%s\n", kv->describe().c_str(),
+                             kv->is_gpu() ? " [GPU-resident]" : "");
             }
         }
-        if (!kv) { std::fprintf(stderr, "KvCache::create failed\n"); return 5; }
-        std::fprintf(stderr, "[sp-engine] %s%s\n", kv->describe().c_str(),
-                     kv->is_gpu() ? " [GPU-resident]" : "");
         std::fprintf(stderr, "[sp-engine] PE: %s\n",
                      sp::engine::prime_pe_describe(cc.pe_mode, cc.pe_alpha, cc.pe_tier).c_str());
 
         // Enable cold storage (tiered GPU→CPU offload) when requested.
-        if (cc.enable_cold && kv->is_gpu()) {
+        if (!dual && cc.enable_cold && kv && kv->is_gpu()) {
             if (!kv->enable_cold_storage(cc.cold_mb, cc.evict_keep)) {
                 std::fprintf(stderr, "[sp-engine] WARNING: cold storage init failed\n");
             }
         }
 
-        fc->bind_cache(kv.get());
+        // Bind the primary cache for prefill. System 1↔2 uses System 1
+        // for prefill; all prefill positions are routed to ship path.
+        if (dual) {
+            for (int p = 0; p < n_prompt; ++p) {
+                dual->route_position(p, 0.0f);  // System 1
+            }
+            fc->bind_cache(dual->sys1());
+        } else {
+            fc->bind_cache(kv.get());
+        }
 
         // Model hash for save/load validation.
         const uint64_t model_hash = sp_fnv1a_hash(cc.model_path.c_str(),
@@ -975,6 +1039,7 @@ int main(int argc, char** argv) {
         std::fflush(stdout);
 
         std::string out_so_far;
+        int sys2_routed = 0;
         for (int step = 0; step < n_predict; ++step) {
             int arg = 0;
             float best = last_logits[0];
@@ -987,6 +1052,15 @@ int main(int argc, char** argv) {
             std::fflush(stdout);
 
             if (step + 1 == n_predict) break;
+
+            // System 1↔2: entropy-gate the NEXT token's cache routing.
+            // High entropy → System 2 (maximum fidelity); low → System 1.
+            if (dual) {
+                const float H = sp_logit_entropy(last_logits.data(), n_vocab);
+                const int pos = n_prompt + step;  // position of the token about to be decoded
+                sys2_routed += dual->route_position(pos, H);
+            }
+
             if (naive) {
                 running.push_back(arg);
                 std::vector<float> all;
@@ -1086,6 +1160,12 @@ int main(int argc, char** argv) {
                      fc->kv_pos(), n_prompt, n_predict);
         if (cc.cauchy_mode > 0 && kv) {
             kv->cauchy_print_stats();
+        }
+        if (dual && sys2_routed > 0) {
+            std::fprintf(stderr,
+                "[sp-engine] System 1↔2: %d/%d decode tokens → System 2 (%.1f%%)\n",
+                sys2_routed, n_predict,
+                100.0f * sys2_routed / (float)std::max(1, n_predict));
         }
 
         // Save cache to disk if --save-cache was given.

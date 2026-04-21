@@ -218,4 +218,104 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 
+// ── System 1↔2 dual cache ─────────────────────────────────────────
+//
+// DualKvCache wraps two KvCache instances: a ship-path "System 1"
+// cache (fast, moderate fidelity) and a hier or sqfree "System 2"
+// cache (slower, maximum fidelity). The engine's decode loop calls
+// route_position() with the output-logit entropy after each token;
+// high-entropy positions are stored in System 2, low-entropy in
+// System 1.
+//
+// read_merged() produces a single contiguous K/V buffer for the
+// decode graph by reading both caches and interleaving positions
+// according to the routing table.
+//
+// Calibration, Cauchy, disk I/O, and cold storage are delegated to
+// whichever cache owns the relevant position (Cauchy uses the System 1
+// cache; calibration feeds both).
+
+class DualKvCache {
+public:
+    // Create both caches. sys2_type is "hier" or "sqfree". The System 1
+    // cache is always ship-path. Returns nullptr on failure. The Config's
+    // sqfree/hierarchical flags are overridden internally — the caller
+    // should set them to false (DualKvCache manages its own composition).
+    static std::unique_ptr<DualKvCache> create(int n_layer, int n_head_kv,
+                                                int head_dim, int max_seq,
+                                                const Config& cfg,
+                                                const std::string& sys2_type,
+                                                float entropy_threshold);
+
+    // GPU-resident variant (System 1 = GPU ship, System 2 = GPU hier).
+    static std::unique_ptr<DualKvCache> create_gpu(int n_layer, int n_head_kv,
+                                                    int head_dim, int max_seq,
+                                                    const Config& cfg,
+                                                    const std::string& sys2_type,
+                                                    float entropy_threshold,
+                                                    void* stream);
+
+    ~DualKvCache();
+
+    // Route a position to System 1 or System 2 based on entropy. Call
+    // BEFORE writing the position. Returns 1 if routed to System 2,
+    // 0 if System 1.
+    int route_position(int pos, float entropy);
+
+    // Write to whichever cache pos is routed to. The layer's full
+    // n_tokens batch is split internally per-position. For single-token
+    // decode (n_tokens=1), the routing of pos_offset is used directly.
+    bool write(int layer, int pos_offset, int n_tokens,
+               const float* K_flat, const float* V_flat);
+
+    // GPU-native write.
+    bool write_gpu(int layer, int pos_offset, int n_tokens,
+                   const float* d_K_flat, const float* d_V_flat);
+
+    // Read merged K/V for [0, kv_len) into contiguous host buffers.
+    // Positions come from whichever cache they were routed to.
+    bool read_merged(int layer, int kv_len,
+                     std::vector<float>& K_out,
+                     std::vector<float>& V_out) const;
+
+    // GPU-native merged read.
+    bool read_merged_gpu(int layer, int kv_len,
+                         float* d_K_out, float* d_V_out) const;
+
+    // Access underlying caches for calibration, Cauchy, etc.
+    KvCache* sys1()       { return sys1_.get(); }
+    KvCache* sys2()       { return sys2_.get(); }
+    const KvCache* sys1() const { return sys1_.get(); }
+    const KvCache* sys2() const { return sys2_.get(); }
+
+    // Query which system owns a position. Returns 1 (sys1) or 2 (sys2).
+    int owner_of(int pos) const;
+
+    // Stats: how many positions routed to each system.
+    int sys1_count() const;
+    int sys2_count() const;
+
+    // Diagnostics.
+    int  n_layer()      const;
+    int  n_head_kv()    const;
+    int  head_dim()     const;
+    int  max_seq()      const;
+    bool is_gpu()       const;
+    float threshold()   const { return threshold_; }
+    std::string describe() const;
+
+private:
+    DualKvCache() = default;
+    std::unique_ptr<KvCache> sys1_;   // ship path (System 1)
+    std::unique_ptr<KvCache> sys2_;   // hier or sqfree (System 2)
+    float threshold_ = 2.0f;
+    // Per-position routing: false = System 1, true = System 2.
+    // Index is sequence position. Sized to max_seq at creation.
+    std::vector<bool> route_;
+    int max_seq_ = 0;
+    int n_layer_ = 0;
+    int n_head_kv_ = 0;
+    int head_dim_ = 0;
+};
+
 } // namespace sp::engine
