@@ -1,5 +1,13 @@
 # Step 3 — GPU-resident sqfree+spinor cache
 
+> **Status (2026-04-21):** MVP shipped. Infrastructure landed in `c4a25db`
+> (GPU cache + dispatch), `95ff818` (fix residual quantize to match CPU),
+> `22639fb` (batched read + kernel-launch-overhead fix), `4e14acb` (spinor
+> branch wired through write/read/batch-read). Real-model PPL validation
+> is the remaining open thread — see the notes at the end. This file is
+> the as-designed record, retained for the rationale; refer to the engine
+> README stage table (7c) for the current status of the shipped kernels.
+
 Design doc for extending `KvCache::create_gpu` to support the sqfree
 (and sqfree+spinor) aggressive paths. Mirrors what ship-path got in
 step 3 of the original plan (commit `b7349ff` + `209507c`).

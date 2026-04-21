@@ -96,6 +96,8 @@ samples per slot).
 | 9a    | `phi3` loader — fused `attn_qkv` + packed SwiGLU `ffn_up` | ✓ |
 | 9b    | `gemma3` loader+forward — SWA + sandwich norms + soft-cap + embd scale | ✓ |
 | 9c    | Vendor patches: CUDA K-quant getrows + n_layer-scaled cgraph | ✓ |
+| 10a   | `Engine` library API: `load` / `generate` / `perplexity` wired end-to-end | ✓ |
+| 10b   | CLI `run` verb + per-verb `--n-gpu-layers` partial-offload + `SP_ENGINE_N_GPU_LAYERS` env | ✓ |
 
 **Architecture coverage.** Llama-3 family, Qwen 3 / 3.5 dense, Qwen
 3.6-35B-A3B (hybrid SSM+MoE, GGUF arch `qwen35moe`), Phi-3 / 3.1 / 4 (GGUF
@@ -145,6 +147,11 @@ the weight-offload fix in `209507c`):
 | baseline (no cache) | 18.13 | — | 1m09s | — |
 | GPU + host cache | 18.64 | +2.8% | 6m24s | 4.06× |
 | **GPU + GPU cache (ship)** | **19.29** | **+6.4%** | **1m28s** | **4.06×** |
+
+*These are GPU-backend chained-decode numbers measured through the engine's
+`perplexity --cache` verb — distinct from the hook-measured numbers in the
+parent shannon-prime README, which run CPU compression and skip the GPU
+numerical differences decomposed below.*
 
 **Two fixes unlocked the 15× speedup.**
 
@@ -274,6 +281,12 @@ regenerating the GGUF each time.
 | `chat --model <gguf> --n-predict N <prompt>` | Greedy generation: prefill + single-token decode reading from the compressed cache. Add `--naive` to force-forward-full each step. |
 | `perplexity --model <gguf> <textfile>` | Baseline PPL (`forward_full` per chunk). Add `--cache` for decode-through-compressed-cache PPL. |
 | `cache_ppl --model <gguf> <textfile>` | Baseline PPL + K/V round-trip correlation + scaling-law input per chunk. Fast diagnostic alternative to `perplexity --cache`. |
+| `run --model <gguf> --n-predict N <prompt>` | Library-API demo. Goes through the public `Engine::load` + `Engine::generate` path instead of the verb-specific loaders — use it to sanity-check downstream consumers that bind against `libsp_engine`. |
+
+**Backend / offload flags (shared across `chat` / `perplexity` / `cache_ppl`):**
+`--n-gpu-layers N` (`-ngl N`) — when `SP_ENGINE_BACKEND=gpu` is set, overrides
+`SP_ENGINE_N_GPU_LAYERS` for this invocation. Default = all layers offloaded.
+Values below `model.n_layer` keep the head + token_embd + output_norm on CPU.
 
 ### Cache-config flags (shared across `kv_smoke` / `prefill` / `chat` / `perplexity --cache` / `cache_ppl`)
 
@@ -378,6 +391,7 @@ Override: `SP_CALIBRATE=1` on the `prefill` CLI verb forces explicit calibration
 | Variable | Default | Effect |
 |---|---|---|
 | `SP_ENGINE_BACKEND` | — | `gpu` / `cuda` / `vulkan` switches forward + weight-offload to the chosen GPU backend. Unset = CPU (mmap weights). |
+| `SP_ENGINE_N_GPU_LAYERS` | all | Integer count of transformer blocks to offload. Only meaningful when `SP_ENGINE_BACKEND` selects GPU. At count ≥ `model.n_layer` the head + token_embd + output_norm + rope_freqs tensors also land on the backend; below that, they stay CPU-resident and the loader picks a split offload. Overridden per-verb by `--n-gpu-layers` / `-ngl`. |
 | `SHANNON_PRIME_GPU_CACHE` | 1 | When the backend is GPU, route KvCache to the GPU-resident path (`create_gpu`). Set to 0 to force the host cache (A/B diagnostic). |
 | `SHANNON_PRIME_SYNC_CALIB_TO_GPU` | 0 | After `calibrate_end`, upload the variance-ranked mask (ship `d_mobius_order` + sqfree Knight CSR) to the GPU cache. Default off: the ship path documents a +0.21 PPL asymmetric regression with calibration sync, and the sqfree path regresses similarly on real Qwen3 data (~+19 PPL). Opt in for investigation. |
 | `SHANNON_PRIME_SQFREE_NO_BATCH` | 0 | Fall back to the per-vec sqfree GPU read path. Diagnostic-only — the batched path is correct on kv_smoke (K_corr 0.943, matches CPU) but real-model PPL validation is still open. |
