@@ -307,6 +307,31 @@ std::unique_ptr<LlamaWeights> LlamaWeights::load_backend_offload_(
     const int n_layer_total = (int)model.n_layer();
     const bool full_offload = n_gpu_layers >= n_layer_total;
 
+    // Safety gate: partial offload on a non-CPU backend is currently
+    // broken. Non-layer tensors (output, token_embd, output_norm,
+    // rope_freqs) stay CPU-mmap-resident with t->data pointing at host
+    // memory; when the CUDA matmul kernels deref those pointers during
+    // forward, Windows reports ACCESS_VIOLATION (0xC0000005). Wiring
+    // the scheduler bridge / cudaHostRegister path is a separate
+    // workstream. Refuse upfront rather than let users fall into an
+    // opaque segfault. To get partial-offload behaviour today, run on
+    // CPU (unset SP_ENGINE_BACKEND) — the mmap path scales to models
+    // much larger than VRAM.
+    if (!full_offload) {
+        ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+        if (dev && ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+            std::fprintf(stderr,
+                "[sp-engine] LlamaWeights::load: partial offload "
+                "(n_gpu_layers=%d < model.n_layer=%d) is not supported "
+                "on non-CPU backends — the forward graph can't dispatch "
+                "matmul over mixed CPU/GPU weight residency yet. Either "
+                "pass n_gpu_layers >= %d (full offload) or unset "
+                "SP_ENGINE_BACKEND for the CPU mmap path.\n",
+                n_gpu_layers, n_layer_total, n_layer_total);
+            return nullptr;
+        }
+    }
+
 #ifdef SP_ENGINE_WITH_CUDA
     auto dump_vram = [](const char* tag) {
         size_t free_b = 0, total_b = 0;

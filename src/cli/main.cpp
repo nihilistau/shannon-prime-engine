@@ -322,6 +322,20 @@ int main(int argc, char** argv) {
         int    corr_samples = 0;
         bool   calibrated_once = false;
 
+        // Opt-in: hierarchical predictor recalibrates per-chunk. The
+        // default single-calibration flow drifts — measured K_corr
+        // decay 0.9847 -> 0.9805 across 8 chunks on Qwen3-8B, because
+        // the ridge W trained on chunk 1 overfits its local statistics.
+        // Env SHANNON_PRIME_HIER_RECAL_PER_CHUNK=1 rebuilds the
+        // predictor at every chunk boundary. Extra cost: one
+        // calibrate_begin/feed/end per chunk (Cholesky solve over
+        // n_skeleton × n_skeleton, fast). Ship / sqfree masks aren't
+        // chunk-sensitive so this flag only fires on hierarchical.
+        const bool hier_recal_per_chunk = []{
+            const char* env = std::getenv("SHANNON_PRIME_HIER_RECAL_PER_CHUNK");
+            return env && std::atoi(env) != 0;
+        }();
+
         std::vector<float> logits;
         std::vector<int32_t> chunk((size_t)n_ctx);
         const int32_t bos = v->bos_id();
@@ -339,10 +353,14 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "forward_full failed at chunk %d\n", c); return 8;
             }
 
-            // Calibrate on first chunk.
-            if (!calibrated_once && !kv->is_calibrated()) {
+            // Calibrate on first chunk, and (optionally, for hier) on
+            // every subsequent chunk to counter predictor drift.
+            const bool hier = kv->is_hierarchical();
+            const bool do_calibrate =
+                (!calibrated_once && !kv->is_calibrated()) ||
+                (hier && hier_recal_per_chunk && c > 0);
+            if (do_calibrate) {
                 if (kv->calibrate_begin()) {
-                    const bool hier = kv->is_hierarchical();
                     for (int L = 0; L < n_layer; ++L) {
                         const float* K_data = Ks[(size_t)L].data();
                         for (int q = 0; q < n_ctx; ++q) {
