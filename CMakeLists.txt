@@ -96,6 +96,7 @@ if(SP_ENGINE_WITH_CUDA)
     target_link_libraries(shannon_prime_cuda_backend PUBLIC shannon_prime_core)
     set_target_properties(shannon_prime_cuda_backend PROPERTIES
         CUDA_SEPARABLE_COMPILATION ON
+        CUDA_RESOLVE_DEVICE_SYMBOLS ON
         POSITION_INDEPENDENT_CODE ON)
 endif()
 
