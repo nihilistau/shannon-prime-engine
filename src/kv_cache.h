@@ -100,6 +100,11 @@ public:
     void calibrate_feed(const float* vec);
     void calibrate_feed(int slot, const float* vec);  // hierarchical per-slot
     bool calibrate_end();
+    // Sticky-EMA variant for hierarchical mode only. keep_frac in [0,1];
+    // 0 is equivalent to calibrate_end() (full replacement). On non-hier
+    // caches this falls through to calibrate_end() — ship / sqfree masks
+    // don't need blended updates.
+    bool calibrate_end_ema(float keep_frac);
     bool is_calibrated() const;
     bool is_hierarchical() const;
 

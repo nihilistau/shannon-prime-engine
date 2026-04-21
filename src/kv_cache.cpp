@@ -703,6 +703,26 @@ bool KvCache::calibrate_end() {
     return false;
 }
 
+bool KvCache::calibrate_end_ema(float keep_frac) {
+    // Only hier has a W predictor worth blending. Other modes have band
+    // allocations / variance orders where "blend the previous calibration"
+    // doesn't have clean semantics (the masks are index sets, not
+    // coefficients). Fall through to the full end() path for those.
+    if (!impl_->hier_inited || keep_frac <= 0.0f) return calibrate_end();
+
+    const int rc = sp_hier_cache_calibrate_end_ema(&impl_->hier, keep_frac);
+    if (rc != 0) return false;
+    impl_->calibrated = true;
+    // Matches calibrate_end: finalise Ricci if it was fed. Sqfree GPU
+    // mask sync and shadow var_order sync are skipped — they're not
+    // relevant on the hier path.
+    if (impl_->ricci && !impl_->ricci->calibrated &&
+        impl_->ricci->calib_n > 0) {
+        sp_ricci_calibrate_end(impl_->ricci);
+    }
+    return true;
+}
+
 bool KvCache::is_calibrated() const {
     return impl_->calibrated;
 }

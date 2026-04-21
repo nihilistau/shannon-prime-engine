@@ -331,9 +331,25 @@ int main(int argc, char** argv) {
         // calibrate_begin/feed/end per chunk (Cholesky solve over
         // n_skeleton × n_skeleton, fast). Ship / sqfree masks aren't
         // chunk-sensitive so this flag only fires on hierarchical.
+        //
+        // SHANNON_PRIME_HIER_EMA_KEEP=<0..1> switches the per-chunk
+        // recalibration from full replacement to a sticky-EMA blend:
+        //   W = keep · W_prev + (1 - keep) · W_fresh
+        // Useful on very long contexts where you want the predictor to
+        // track chunk statistics slowly rather than snap to each new
+        // chunk. keep=0 is identical to full replacement (the default).
+        // Typical values: 0.3-0.7. Only affects hierarchical mode.
         const bool hier_recal_per_chunk = []{
             const char* env = std::getenv("SHANNON_PRIME_HIER_RECAL_PER_CHUNK");
             return env && std::atoi(env) != 0;
+        }();
+        const float hier_ema_keep = []{
+            const char* env = std::getenv("SHANNON_PRIME_HIER_EMA_KEEP");
+            if (!env) return 0.0f;
+            float v = (float)std::atof(env);
+            if (v < 0.0f) v = 0.0f;
+            if (v > 1.0f) v = 1.0f;
+            return v;
         }();
 
         std::vector<float> logits;
@@ -374,7 +390,15 @@ int main(int argc, char** argv) {
                             }
                         }
                     }
-                    kv->calibrate_end();
+                    // On the first calibration there's no prior W to blend
+                    // against, so use plain end(). From chunk 2 onward (hier
+                    // recal mode), use the EMA variant if keep > 0.
+                    const bool have_prior = calibrated_once;
+                    if (hier && have_prior && hier_ema_keep > 0.0f) {
+                        kv->calibrate_end_ema(hier_ema_keep);
+                    } else {
+                        kv->calibrate_end();
+                    }
                 }
                 calibrated_once = true;
             }
