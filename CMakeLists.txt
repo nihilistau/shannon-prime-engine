@@ -16,6 +16,13 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 
+# Silence MSVC's "unsafe CRT" deprecation warnings for getenv/fopen/etc.
+# We use the portable variants intentionally; the *_s wrappers are
+# non-standard.
+if(MSVC)
+    add_compile_definitions(_CRT_SECURE_NO_WARNINGS)
+endif()
+
 # Default to Release; user can override with -DCMAKE_BUILD_TYPE=...
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
     set(CMAKE_BUILD_TYPE Release CACHE STRING "" FORCE)
@@ -112,7 +119,6 @@ add_library(sp_engine STATIC
     src/engine.cpp
     src/kv_cache.cpp
     src/gdn_state.cpp
-    src/model_loader.cpp
     src/gguf_loader.cpp
     src/vocab.cpp
     src/tokenizer.cpp

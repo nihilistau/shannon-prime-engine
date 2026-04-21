@@ -38,9 +38,15 @@ struct ggml_context;
 struct ggml_tensor;
 struct ggml_backend;
 struct ggml_backend_buffer;
+
 typedef struct ggml_backend * ggml_backend_t;
 
 namespace sp::engine {
+
+// Sentinel for "offload every layer". Passed to LlamaWeights::load when
+// the caller wants the full-offload path (all blk.* and non-layer tensors
+// land on the backend). Any value >= model.n_layer() is equivalent.
+inline constexpr int N_GPU_LAYERS_ALL = 9999;
 
 class Model;
 
@@ -146,7 +152,8 @@ public:
     // Returns nullptr on unsupported arch, missing required tensors,
     // or I/O error.
     static std::unique_ptr<LlamaWeights> load(const Model& model,
-                                               ggml_backend_t backend = nullptr);
+                                               ggml_backend_t backend = nullptr,
+                                               int n_gpu_layers = N_GPU_LAYERS_ALL);
 
     ~LlamaWeights();
     LlamaWeights(const LlamaWeights&) = delete;
@@ -181,7 +188,7 @@ private:
     // reach private members without a friend declaration).
     static bool                             bind_tensors_(LlamaWeights& w, ggml_context* tctx, const Model& model);
     static std::unique_ptr<LlamaWeights>    load_cpu_mmap_(const Model& model);
-    static std::unique_ptr<LlamaWeights>    load_backend_offload_(const Model& model, ggml_backend_t backend);
+    static std::unique_ptr<LlamaWeights>    load_backend_offload_(const Model& model, ggml_backend_t backend, int n_gpu_layers);
 };
 
 } // namespace sp::engine

@@ -23,8 +23,10 @@ namespace sp::engine {
 
 struct LlamaWeights::Impl {
     ggml_context* ctx = nullptr;
-    // Paired metadata ggml_context from gguf_init_from_file — owned by
-    // gguf, freed alongside it.
+    // Paired metadata ggml_context from gguf_init_from_file. When set
+    // (cpu-mmap and partial-offload paths), we own it jointly with `gguf`
+    // below. gguf_free only releases the gguf_context itself, so the
+    // paired ggml_context must be freed explicitly.
     ggml_context* meta_ctx = nullptr;
     gguf_context* gguf = nullptr;
     // When we offloaded to a non-CPU backend, this holds the allocated
@@ -33,8 +35,8 @@ struct LlamaWeights::Impl {
     ~Impl() {
         if (backend_buf) ggml_backend_buffer_free(backend_buf);
         if (ctx)         ggml_free(ctx);
-        // meta_ctx is owned by the gguf_context we get from gguf_loader
-        // (not by us) — we don't free it here; Model destructor handles it.
+        if (meta_ctx)    ggml_free(meta_ctx);
+        if (gguf)        gguf_free(gguf);
     }
 };
 
@@ -299,9 +301,11 @@ std::unique_ptr<LlamaWeights> LlamaWeights::load_cpu_mmap_(const Model& model) {
 // at backend-resident tensors.
 // ------------------------------------------------------------------
 std::unique_ptr<LlamaWeights> LlamaWeights::load_backend_offload_(
-        const Model& model, ggml_backend_t backend) {
+        const Model& model, ggml_backend_t backend, int n_gpu_layers) {
     auto w = std::unique_ptr<LlamaWeights>(new LlamaWeights());
     w->arch_ = model.architecture();
+    const int n_layer_total = (int)model.n_layer();
+    const bool full_offload = n_gpu_layers >= n_layer_total;
 
 #ifdef SP_ENGINE_WITH_CUDA
     auto dump_vram = [](const char* tag) {
@@ -405,6 +409,21 @@ std::unique_ptr<LlamaWeights> LlamaWeights::load_backend_offload_(
         else if (ti.n_dims == 3) t = ggml_new_tensor_3d(w->impl_->ctx, ti.type, ti.ne[0], ti.ne[1], ti.ne[2]);
         else                     t = ggml_new_tensor_4d(w->impl_->ctx, ti.type, ti.ne[0], ti.ne[1], ti.ne[2], ti.ne[3]);
         ggml_set_name(t, ti.name.c_str());
+
+        // Memory Gate: Check if we offload this tensor or keep it mapped on CPU.
+        bool offload = true;
+        int layer = -1;
+        if (std::sscanf(ti.name.c_str(), "blk.%d.", &layer) == 1) {
+            if (layer >= n_gpu_layers) offload = false;
+        } else {
+            // Non-layer tensors (head, token_embd, output_norm, rope_freqs)
+            // only go to the backend when every layer is offloaded.
+            if (!full_offload) offload = false;
+        }
+
+        if (!offload) {
+            t->data = ti.src;
+        }
     }
 
 #ifdef SP_ENGINE_WITH_CUDA
@@ -430,7 +449,7 @@ std::unique_ptr<LlamaWeights> LlamaWeights::load_backend_offload_(
     size_t total_bytes = 0;
     for (const auto& ti : tensors) {
         ggml_tensor* dst = ggml_get_tensor(w->impl_->ctx, ti.name.c_str());
-        if (!dst) continue;
+        if (!dst || dst->data == ti.src) continue; // Un-offloaded tensors keep zero-copy mapped src!
         ggml_backend_tensor_set(dst, ti.src, 0, ti.n_bytes);
         total_bytes += ti.n_bytes;
     }
@@ -441,9 +460,15 @@ std::unique_ptr<LlamaWeights> LlamaWeights::load_backend_offload_(
     dump_vram("after all tensor_set copies");
 #endif
 
-    // Pass-1 data has been copied into the backend buffer; release it.
-    ggml_free(mmap_ctx);
-    gguf_free(mmap_gguf);
+    // Pass-1 data has been copied into the backend buffer; release it,
+    // OR if we kept CPU mmap gates open for un-offloaded layers, bind them to the impl so they survive!
+    if (full_offload) {
+        ggml_free(mmap_ctx);
+        gguf_free(mmap_gguf);
+    } else {
+        w->impl_->meta_ctx = mmap_ctx;
+        w->impl_->gguf = mmap_gguf;
+    }
 #ifdef SP_ENGINE_WITH_CUDA
     dump_vram("after mmap ctx + gguf free");
 #endif
@@ -460,7 +485,8 @@ std::unique_ptr<LlamaWeights> LlamaWeights::load_backend_offload_(
 // load; GPU-type backends require the offload path.
 // ------------------------------------------------------------------
 std::unique_ptr<LlamaWeights> LlamaWeights::load(const Model& model,
-                                                  ggml_backend_t backend) {
+                                                  ggml_backend_t backend,
+                                                  int n_gpu_layers) {
     if (!supported_arch(model.architecture())) {
         std::fprintf(stderr,
             "[sp-engine] LlamaWeights: unsupported arch '%s'\n",
@@ -477,7 +503,7 @@ std::unique_ptr<LlamaWeights> LlamaWeights::load(const Model& model,
             use_mmap = true;
         }
     }
-    return use_mmap ? load_cpu_mmap_(model) : load_backend_offload_(model, backend);
+    return use_mmap ? load_cpu_mmap_(model) : load_backend_offload_(model, backend, n_gpu_layers);
 }
 
 void LlamaWeights::print_summary(std::FILE* f) const {

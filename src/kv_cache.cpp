@@ -210,7 +210,10 @@ struct KvCache::Impl {
 #endif
         // Cauchy system components.
         delete ricci;
-        delete mertens;
+        if (mertens) {
+            sp_mertens_free(mertens);
+            delete mertens;
+        }
         ricci   = nullptr;
         mertens = nullptr;
     }
@@ -563,6 +566,8 @@ void KvCache::calibrate_feed(int slot, const float* vec) {
     // head's data. slot = layer * n_head_kv + head.
     if (impl_->hier_inited) {
         sp_hier_cache_calibrate_feed(&impl_->hier, slot, vec);
+        // Delegate to global feed to ensure Cauchy Ricci sentinel receives data
+        calibrate_feed(vec);
     } else {
         // Non-hierarchical paths ignore the slot — forward to shared feed.
         calibrate_feed(vec);
@@ -729,8 +734,8 @@ std::unique_ptr<KvCache> KvCache::create_gpu(int n_layer, int n_head_kv,
 #else
     if (cfg.hierarchical) {
         std::fprintf(stderr, "[sp-engine] KvCache::create_gpu: hierarchical "
-                             "path is not yet GPU-resident (still CPU)\n");
-        return nullptr;
+                             "path is not yet GPU-resident, falling back to CPU zero-copy staging\n");
+        return KvCache::create(n_layer, n_head_kv, head_dim, max_seq, cfg);
     }
     // sqfree is GPU-resident; spinor lands as a use_spinor flag into
     // sp_cuda_sqfree_cache_init (wired through kernel_spinor_extract/

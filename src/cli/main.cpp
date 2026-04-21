@@ -54,6 +54,18 @@ static ggml_backend_t sp_select_backend() {
     return b;
 }
 
+// Number of layers to offload to the backend. N_GPU_LAYERS_ALL ("all") is
+// the default and matches the full-offload path that the CPU-mmap loader
+// has always used. Env var SP_ENGINE_N_GPU_LAYERS sets the baseline;
+// verb-local --n-gpu-layers flags may override further.
+static int sp_default_n_gpu_layers() {
+    if (const char* env = std::getenv("SP_ENGINE_N_GPU_LAYERS")) {
+        const int v = std::atoi(env);
+        if (v > 0) return v;
+    }
+    return sp::engine::N_GPU_LAYERS_ALL;
+}
+
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -64,7 +76,7 @@ static ggml_backend_t sp_select_backend() {
 
 static void usage(const char* prog) {
     std::fprintf(stderr,
-        "sp-engine — Shannon-Prime reference inference engine (scaffolding)\n"
+        "sp-engine — Shannon-Prime reference inference engine\n"
         "\n"
         "Usage: %s <command> [options]\n"
         "\n"
@@ -93,11 +105,18 @@ static void usage(const char* prog) {
         "                       Run perplexity + compressed-cache correlation.\n"
         "                       Reports baseline PPL, K/V round-trip correlation,\n"
         "                       and compression ratio per chunk.\n"
-        "  run <args>           (not yet implemented)\n"
+        "  run --model <gguf> [--n-predict N] [--ctx N] <prompt>\n"
+        "                       Library-API demo: loads via Engine class and does\n"
+        "                       a greedy generate. For rich options use `chat`.\n"
         "\n"
         "Options:\n"
         "  --model <path.gguf>\n"
         "  --ctx <n>            default 2048\n"
+        "  --n-gpu-layers <n>   (-ngl) layers to offload; default = all. Non-layer\n"
+        "                       tensors (head, token_embd) go to backend only\n"
+        "                       when n >= model.n_layer. Requires SP_ENGINE_BACKEND\n"
+        "                       = gpu/cuda/vulkan; CPU loader ignores. Env var\n"
+        "                       SP_ENGINE_N_GPU_LAYERS sets the default.\n"
         "  --sqfree             enable sqfree + Knight skeleton\n"
         "  --spinor             enable SU(2) sheet bit (requires --sqfree)\n"
         "  --no-mobius          disable ship-path Möbius reorder\n"
@@ -138,7 +157,7 @@ int main(int argc, char** argv) {
     std::string cmd = argv[1];
 
     if (cmd == "version") {
-        std::printf("sp-engine 0.1.0 (scaffolding)\n");
+        std::printf("sp-engine 0.1.0\n");
         return 0;
     }
 
@@ -155,12 +174,14 @@ int main(int argc, char** argv) {
         sp::engine::seed_config_from_env(cc);
         int  n_ctx    = 512;
         int  n_chunks = 0;
+        int  ngl      = sp_default_n_gpu_layers();
         std::string textfile;
         for (int i = 2; i < argc; ++i) {
             std::string a = argv[i];
             if      (a == "--model"          && i + 1 < argc) cc.model_path     = argv[++i];
             else if (a == "--ctx"            && i + 1 < argc) n_ctx             = std::atoi(argv[++i]);
             else if (a == "--chunks"         && i + 1 < argc) n_chunks          = std::atoi(argv[++i]);
+            else if ((a == "--n-gpu-layers" || a == "-ngl") && i + 1 < argc) ngl = std::atoi(argv[++i]);
             else if (a == "--sqfree")        cc.sqfree = true;
             else if (a == "--spinor")        { cc.spinor = true; cc.sqfree = true; }
             else if (a == "--no-mobius")     cc.mobius = false;
@@ -204,7 +225,7 @@ int main(int argc, char** argv) {
         cc.arch_name = m->architecture();
         auto v  = sp::engine::Vocab::load(*m);
         auto tk = v ? sp::engine::Tokenizer::create(*v) : nullptr;
-        auto W  = sp::engine::LlamaWeights::load(*m, bk);
+        auto W  = sp::engine::LlamaWeights::load(*m, bk, ngl);
         if (!tk || !W) return 3;
 
         std::FILE* fp = std::fopen(textfile.c_str(), "rb");
@@ -239,10 +260,34 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "text too short for ctx=%d\n", n_ctx); return 6;
         }
 
-        // Create KvCache sized for one chunk at a time.
-        auto kv = sp::engine::KvCache::create(n_layer, n_head_kv, head_dim, n_ctx, cc);
+        // Create KvCache sized for one chunk at a time. Prefer GPU-resident
+        // when the backend is GPU and the config doesn't select hierarchical
+        // (which is still host-only). Env gate SHANNON_PRIME_GPU_CACHE=0
+        // forces the host cache for A/B comparison, matching chat / perplexity.
+        std::unique_ptr<sp::engine::KvCache> kv;
+        {
+            const char* env_gpu = std::getenv("SHANNON_PRIME_GPU_CACHE");
+            const bool prefer_gpu_cache = (env_gpu == nullptr) || (std::atoi(env_gpu) != 0);
+            bool backend_is_gpu = false;
+            if ((ggml_backend_t)bk) {
+                ggml_backend_dev_t dev = ggml_backend_get_device((ggml_backend_t)bk);
+                backend_is_gpu = dev && ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU;
+            }
+            const bool gpu_ok = !cc.hierarchical;
+            if (prefer_gpu_cache && backend_is_gpu && gpu_ok) {
+                kv = sp::engine::KvCache::create_gpu(n_layer, n_head_kv, head_dim,
+                                                      n_ctx, cc, /*stream=*/nullptr);
+                if (!kv) {
+                    std::fprintf(stderr, "[sp-engine] create_gpu failed; falling back to host cache\n");
+                }
+            }
+            if (!kv) {
+                kv = sp::engine::KvCache::create(n_layer, n_head_kv, head_dim, n_ctx, cc);
+            }
+        }
         if (!kv) { std::fprintf(stderr, "KvCache::create failed\n"); return 7; }
-        std::fprintf(stderr, "[sp-engine] %s\n", kv->describe().c_str());
+        std::fprintf(stderr, "[sp-engine] %s%s\n", kv->describe().c_str(),
+                     kv->is_gpu() ? " [GPU-resident]" : "");
 
         // Init the Cauchy reset system BEFORE the calibration pass so the
         // Ricci sentinel can learn its p=3 baseline from the same vectors
@@ -391,6 +436,7 @@ int main(int argc, char** argv) {
         sp::engine::seed_config_from_env(pc);
         int  n_ctx    = 512;
         int  n_chunks = 0;     // 0 = all
+        int  ngl      = sp_default_n_gpu_layers();
         bool use_cache = false;
         std::string textfile;
         for (int i = 2; i < argc; ++i) {
@@ -398,6 +444,7 @@ int main(int argc, char** argv) {
             if      (a == "--model"    && i + 1 < argc) pc.model_path    = argv[++i];
             else if (a == "--ctx"      && i + 1 < argc) n_ctx            = std::atoi(argv[++i]);
             else if (a == "--chunks"   && i + 1 < argc) n_chunks         = std::atoi(argv[++i]);
+            else if ((a == "--n-gpu-layers" || a == "-ngl") && i + 1 < argc) ngl = std::atoi(argv[++i]);
             else if (a == "--cache")        use_cache       = true;
             else if (a == "--sqfree")       pc.sqfree       = true;
             else if (a == "--spinor")       { pc.spinor = true; pc.sqfree = true; }
@@ -436,7 +483,7 @@ int main(int argc, char** argv) {
         pc.arch_name = m->architecture();
         auto v  = sp::engine::Vocab::load(*m);
         auto tk = v ? sp::engine::Tokenizer::create(*v) : nullptr;
-        auto W  = sp::engine::LlamaWeights::load(*m, bk);
+        auto W  = sp::engine::LlamaWeights::load(*m, bk, ngl);
         if (!tk || !W) return 3;
 
         // Read whole file. Binary mode so byte-perfect with what llama.cpp's
@@ -678,6 +725,7 @@ int main(int argc, char** argv) {
         sp::engine::Config cc;
         sp::engine::seed_config_from_env(cc);
         int  n_predict = 32;
+        int  ngl       = sp_default_n_gpu_layers();
         bool naive     = false;
         bool debug_decode = false;
         std::string text;
@@ -689,6 +737,7 @@ int main(int argc, char** argv) {
             else if (a == "--hierarchical") cc.hierarchical = true;
             else if (a == "--naive")        naive      = true;
             else if (a == "--debug-decode") debug_decode = true;
+            else if ((a == "--n-gpu-layers" || a == "-ngl") && i + 1 < argc) ngl = std::atoi(argv[++i]);
             else if (a == "--model"     && i + 1 < argc) cc.model_path = argv[++i];
             else if (a == "--k-bits"    && i + 1 < argc) cc.k_bits_csv = argv[++i];
             else if (a == "--v-bits"    && i + 1 < argc) cc.v_bits_csv = argv[++i];
@@ -737,7 +786,7 @@ int main(int argc, char** argv) {
         cc.arch_name = m->architecture();
         auto v  = sp::engine::Vocab::load(*m);
         auto tk = v ? sp::engine::Tokenizer::create(*v) : nullptr;
-        auto W  = sp::engine::LlamaWeights::load(*m, bk);
+        auto W  = sp::engine::LlamaWeights::load(*m, bk, ngl);
         if (!tk || !W) return 3;
 
         std::vector<int32_t> ids;
@@ -903,8 +952,8 @@ int main(int argc, char** argv) {
                     };
                     float k_corr_total = corr(dbg_K.data(), ref_K_last, n_kv * hd);
                     float x_corr       = corr(dbg_X.data(), ref_X_last, n_embd);
-                    float dec_x_mag    = magn(dbg_X.data(), n_embd);
-                    float ref_x_mag    = magn(ref_X_last, n_embd);
+                    float dec_x_mag    = (float)magn(dbg_X.data(), n_embd);
+                    float ref_x_mag    = (float)magn(ref_X_last, n_embd);
                     int ref_arg = 0; float ref_best = ref_logits[ref_logits.size() - n_vocab];
                     for (int i = 1; i < n_vocab; ++i) {
                         float v = ref_logits[ref_logits.size() - n_vocab + i];
@@ -1065,10 +1114,61 @@ int main(int argc, char** argv) {
     }
 
     if (cmd == "banner") {
-        std::printf("Shannon-Prime Engine — scaffolding build\n");
+        std::printf("Shannon-Prime Engine — reference inference with compressed KV cache\n");
         std::printf("  linked: shannon-prime core (AGPLv3)\n");
         std::printf("  linked: ggml (MIT)\n");
-        std::printf("  status: pre-alpha, no inference path implemented\n");
+        std::printf("  status: pre-alpha, full forward+decode with ship/sqfree/hierarchical cache\n");
+        return 0;
+    }
+
+    // `run` is dispatched here (before the global flag parser) so its
+    // verb-local flags — --n-predict in particular — aren't rejected as
+    // unknown by the strict global parser below. Same pattern as cache_ppl,
+    // perplexity, and chat.
+    if (cmd == "run") {
+        // Library-level demo: load a model via the public Engine API and
+        // run a greedy generate. Honours --model <path>, --n-predict, and
+        // a positional prompt; everything else uses defaults. For rich
+        // options use the dedicated `chat` verb.
+        sp::engine::Config rcfg;
+        sp::engine::seed_config_from_env(rcfg);
+        // Forward SP_ENGINE_BACKEND into cfg.backend so Engine::load picks
+        // the GPU path (the CLI shim — library callers set cfg.backend
+        // explicitly). Bare-minimum: treat {gpu, cuda, vulkan} as CUDA
+        // since the Engine's backend enum collapses to "not CPU" at the
+        // ForwardContext layer.
+        if (const char* env = std::getenv("SP_ENGINE_BACKEND")) {
+            if (std::strcmp(env, "gpu") == 0 || std::strcmp(env, "cuda") == 0) {
+                rcfg.backend = sp::engine::Config::Backend::CUDA;
+            } else if (std::strcmp(env, "vulkan") == 0) {
+                rcfg.backend = sp::engine::Config::Backend::Vulkan;
+            }
+        }
+        int n_predict = 32;
+        std::string prompt;
+        for (int i = 2; i < argc; ++i) {
+            std::string a = argv[i];
+            if      (a == "--model"     && i + 1 < argc) rcfg.model_path = argv[++i];
+            else if (a == "--n-predict" && i + 1 < argc) n_predict       = std::atoi(argv[++i]);
+            else if (a == "--ctx"       && i + 1 < argc) rcfg.n_ctx      = std::atoi(argv[++i]);
+            else if (a.size() >= 2 && a[0] == '-' && a[1] == '-') {
+                std::fprintf(stderr, "run: unknown flag %s\n", a.c_str()); return 2;
+            }
+            else { if (!prompt.empty()) prompt.push_back(' '); prompt += a; }
+        }
+        if (rcfg.model_path.empty()) {
+            std::fprintf(stderr, "run requires --model <path.gguf>\n"); return 1;
+        }
+        if (prompt.empty()) {
+            std::fprintf(stderr, "run requires a prompt\n"); return 1;
+        }
+        sp::engine::Engine engine;
+        int lr = engine.load(rcfg);
+        if (lr != 0) return lr;
+        std::string out;
+        int gr = engine.generate(prompt, n_predict, out);
+        if (gr != 0) return gr;
+        std::printf("%s\n", out.c_str());
         return 0;
     }
 
@@ -1473,6 +1573,10 @@ int main(int argc, char** argv) {
         const int head_dim  = (int)m->head_dim();
         const int n_head_kv = (int)m->n_head_kv();
 
+        // prefill is a CPU-only diagnostic verb — forward runs on CPU-mmap
+        // weights and records per-layer K/V correlation. GPU cache routing
+        // only makes sense when forward is already on GPU, so this verb
+        // keeps the host cache unconditionally.
         auto kv = sp::engine::KvCache::create(n_layer, n_head_kv, head_dim, n, cfg);
         if (!kv) { std::fprintf(stderr, "KvCache::create failed\n"); return 7; }
         std::fprintf(stderr, "[sp-engine] %s\n", kv->describe().c_str());
@@ -1552,20 +1656,6 @@ int main(int argc, char** argv) {
         std::printf("---\nmean over %d layers: K_corr=%.4f  V_corr=%.4f  compression=%.2fx\n",
                     n_layer, overall_k / n_layer, overall_v / n_layer,
                     kv->compression_ratio());
-        return 0;
-    }
-
-    if (cmd == "perplexity" || cmd == "run") {
-        sp::engine::Engine engine;
-        int rc = engine.load(cfg);
-        if (rc != 0) return rc;
-        if (cmd == "perplexity") {
-            std::fprintf(stderr, "(perplexity scaffold: not yet implemented)\n");
-            return 3;
-        }
-        std::string out;
-        engine.generate("", 0, out);
-        std::printf("%s\n", out.c_str());
         return 0;
     }
 

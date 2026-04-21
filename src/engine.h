@@ -47,10 +47,18 @@ struct Config {
     int         hier_res_bits   = 2;       // 1-4 bits for target residuals
     std::string hier_skel_bits  = "5,5";   // Band bits for skeleton quantisation
 
-    // Backend selection.
+    // Backend selection. `Vulkan` is planned (engine stage 7d); today it
+    // falls through to whatever `ggml_backend_init_by_type(GPU)` picks.
     enum class Backend { CPU, CUDA, Vulkan };
     Backend     backend = Backend::CPU;
-    int         n_gpu_layers = 0;  // 0 = CPU-only, otherwise offload count
+    // n_gpu_layers semantics (when backend != CPU):
+    //   0 (default)       — use engine default (all layers; equivalent to
+    //                       passing N_GPU_LAYERS_ALL to LlamaWeights::load)
+    //   1..model.n_layer  — offload only the first N blocks; the rest plus
+    //                       non-layer tensors (head, token_embd) stay CPU
+    //   >= model.n_layer  — full offload (same as 0)
+    // When backend == CPU, this field is ignored (mmap zero-copy load).
+    int         n_gpu_layers = 0;
 
     // Positional-encoding mode. Default is Standard (geometric RoPE, no
     // ALiBi, byte-for-byte compatible with llama.cpp). Non-standard modes
@@ -129,7 +137,10 @@ public:
     float perplexity(const std::string& wikitext_path,
                      int n_chunks, bool verbose = false);
 
-    // Streaming generate. Placeholder — expand when sampling lands.
+    // Greedy generate: tokenise prompt, prefill via ForwardContext with a
+    // KvCache bound (compression mode controlled by cfg), then argmax-decode
+    // n_predict tokens (or until EOS). Sampling temperature is zero; richer
+    // sampling hooks would layer on top of ForwardContext::decode directly.
     int generate(const std::string& prompt, int n_predict,
                  std::string& out);
 

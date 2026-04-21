@@ -53,6 +53,8 @@ struct ForwardContext::Impl {
     // gemma3 doesn't parameterise it per-layer in the GGUF.
     int   swa_window         = 0;
     float swa_rope_freq_base = 10000.0f;
+    float attn_logit_softcapping = 0.0f;
+    float final_logit_softcapping = 0.0f;
 
     // FFN activation. Llama/qwen/mistral/phi/granite use SwiGLU
     // (silu(gate) * up); gemma (1/2/3) uses GeGLU with the tanh
@@ -238,6 +240,8 @@ std::unique_ptr<ForwardContext> ForwardContext::create(const Model& model,
     if (model.architecture() == "gemma3") {
         const int64_t w = model.get_i64("gemma3.attention.sliding_window", 0);
         if (w > 0) fc->impl_->swa_window = (int)w;
+        fc->impl_->attn_logit_softcapping = (float)model.get_f64("gemma3.attention.logit_softcapping", 0.0);
+        fc->impl_->final_logit_softcapping = (float)model.get_f64("gemma3.final_logit_softcapping", 0.0);
     }
 
     // FFN activation flavor. Gemma family uses GELU (tanh approx)
@@ -618,6 +622,7 @@ static ggml_tensor* build_block(ggml_context* gctx,
                                  float rms_eps,
                                  int   rope_mode,
                                  bool  ffn_gelu,             // gemma* → GELU, else SiLU
+                                 float attn_logit_softcap,   // gemma2/gemma3 logit softcapping
                                  // Optional captures: if non-null, the
                                  // post-RoPE pre-GQA-broadcast K and V
                                  // tensors are returned through these.
@@ -707,7 +712,7 @@ static ggml_tensor* build_block(ggml_context* gctx,
     ggml_tensor* mask_f16 = ggml_cast(gctx, kq_mask, GGML_TYPE_F16);
     ggml_tensor* attn = ggml_flash_attn_ext(gctx, qp, kp, vp, mask_f16,
                                             1.0f / sqrtf((float)head_dim),
-                                            alibi_max_bias, 0.0f);
+                                            alibi_max_bias, attn_logit_softcap);
     ggml_flash_attn_ext_set_prec(attn, GGML_PREC_F32);
     attn = ggml_reshape_2d(gctx, attn, n_embd_q, n);
 
@@ -796,7 +801,7 @@ static ggml_tensor* build_block_moe_attn(ggml_context* gctx,
                                           int   n_expert,
                                           int   n_expert_used,
                                           bool  norm_topk_prob,
-                                          float expert_weights_scale,
+                                          float expert_weights_scale, float attn_logit_softcap,
                                           ggml_tensor** k_capture = nullptr,
                                           ggml_tensor** v_capture = nullptr) {
     // Qwen3-Next gated attention.
@@ -886,7 +891,7 @@ static ggml_tensor* build_block_moe_attn(ggml_context* gctx,
     ggml_tensor* mask_f16 = ggml_cast(gctx, kq_mask, GGML_TYPE_F16);
     ggml_tensor* attn = ggml_flash_attn_ext(gctx, qp, kp, vp, mask_f16,
                                             1.0f / sqrtf((float)head_dim),
-                                            0.0f, 0.0f);
+                                            0.0f, attn_logit_softcap);
     ggml_flash_attn_ext_set_prec(attn, GGML_PREC_F32);
     // attn comes back as [head_dim, n_head, n]. Apply the sigmoid gate
     // element-wise before the wo projection.
@@ -1152,7 +1157,7 @@ bool ForwardContext::forward_one_block(const std::vector<int32_t>& token_ids,
                      W->layers()[0], n,
                      impl_->head_dim, impl_->n_head, impl_->n_head_kv,
                      impl_->n_rot, block0_freq_base, impl_->rope_freq_scale,
-                     impl_->rms_norm_eps, impl_->rope_mode, impl_->ffn_gelu);
+                     impl_->rms_norm_eps, impl_->rope_mode, impl_->ffn_gelu, impl_->attn_logit_softcapping);
     ggml_set_output(x);
 
     ggml_cgraph* graph = ggml_new_graph(gctx);
@@ -1338,7 +1343,7 @@ bool ForwardContext::forward_full(const std::vector<int32_t>& token_ids,
                              L, n,
                              impl_->head_dim, impl_->n_head, impl_->n_head_kv,
                              impl_->n_rot, layer_freq_base, impl_->rope_freq_scale,
-                             impl_->rms_norm_eps, impl_->rope_mode, impl_->ffn_gelu,
+                             impl_->rms_norm_eps, impl_->rope_mode, impl_->ffn_gelu, impl_->attn_logit_softcapping,
                              capture ? &k_cap : nullptr,
                              capture ? &v_cap : nullptr);
             break;
@@ -1352,7 +1357,7 @@ bool ForwardContext::forward_full(const std::vector<int32_t>& token_ids,
                                       impl_->rope_freq_base, impl_->rope_freq_scale,
                                       impl_->rms_norm_eps,
                                       impl_->n_expert, impl_->n_expert_used,
-                                      impl_->norm_topk_prob, impl_->expert_weights_scale,
+                                      impl_->norm_topk_prob, impl_->expert_weights_scale, impl_->attn_logit_softcapping,
                                       capture ? &k_cap : nullptr,
                                       capture ? &v_cap : nullptr);
             break;
@@ -1404,6 +1409,11 @@ bool ForwardContext::forward_full(const std::vector<int32_t>& token_ids,
     ggml_tensor* h = ggml_rms_norm(gctx, x, impl_->rms_norm_eps);
     h = ggml_mul(gctx, h, W->output_norm);
     ggml_tensor* logits = ggml_mul_mat(gctx, W->output, h);
+    if (impl_->final_logit_softcapping > 0.0f) {
+        ggml_tensor* down_scale = ggml_scale(gctx, logits, 1.0f / impl_->final_logit_softcapping);
+        ggml_tensor* tanhv = ggml_tanh(gctx, down_scale);
+        logits = ggml_scale(gctx, tanhv, impl_->final_logit_softcapping);
+    }
     ggml_set_output(logits);
 
     // GGML_DEFAULT_GRAPH_SIZE (2048) is enough for shallow dense stacks
@@ -1664,6 +1674,7 @@ static ggml_tensor* build_block_decode(ggml_context* gctx,
                                         float freq_scale,
                                         float rms_eps,
                                         int   rope_mode,
+                                        float attn_logit_softcap,
                                         ggml_tensor** k_capture,
                                         ggml_tensor** v_capture) {
     const int n_embd_q = n_head * head_dim;
@@ -1751,8 +1762,13 @@ static ggml_tensor* build_block_decode(ggml_context* gctx,
     ggml_tensor* Qp = ggml_cont(gctx, ggml_permute(gctx, Q,      0, 2, 1, 3));
     ggml_tensor* Kp = ggml_cont(gctx, ggml_permute(gctx, K_full, 0, 2, 1, 3));
     ggml_tensor* KQ = ggml_mul_mat(gctx, Kp, Qp);
-    KQ = ggml_soft_max_ext(gctx, KQ, mask,
-                           1.0f / sqrtf((float)head_dim), alibi_max_bias);
+    KQ = ggml_scale(gctx, KQ, 1.0f / sqrtf((float)head_dim));
+    if (attn_logit_softcap > 0.0f) {
+        KQ = ggml_scale(gctx, KQ, 1.0f / attn_logit_softcap);
+        KQ = ggml_tanh(gctx, KQ);
+        KQ = ggml_scale(gctx, KQ, attn_logit_softcap);
+    }
+    KQ = ggml_soft_max_ext(gctx, KQ, mask, 1.0f, alibi_max_bias);
 
     ggml_tensor* Vp = ggml_cont(gctx, ggml_permute(gctx, V_full, 1, 2, 0, 3));
     ggml_tensor* attn = ggml_mul_mat(gctx, Vp, KQ);
@@ -1761,6 +1777,11 @@ static ggml_tensor* build_block_decode(ggml_context* gctx,
 
     ggml_tensor* y1 = ggml_mul_mat(gctx, L.wo, attn);
     if (L.bo) y1 = ggml_add(gctx, y1, L.bo);
+
+    if (L.attn_post_norm) {
+        y1 = ggml_rms_norm(gctx, y1, rms_eps);
+        y1 = ggml_mul(gctx, y1, L.attn_post_norm);
+    }
 
     x = ggml_add(gctx, x, y1);
 
@@ -2018,7 +2039,7 @@ bool ForwardContext::decode(int32_t token_id,
                                past_n, hd, impl_->n_head, n_kv,
                                impl_->n_rot,
                                layer_freq_base, impl_->rope_freq_scale,
-                               impl_->rms_norm_eps, impl_->rope_mode,
+                               impl_->rms_norm_eps, impl_->rope_mode, impl_->attn_logit_softcapping,
                                &k_cap, &v_cap);
         // Copy this layer's capture into its slice of the batched
         // output tensors. ggml_cpy returns the destination view.
@@ -2041,6 +2062,11 @@ bool ForwardContext::decode(int32_t token_id,
     ggml_tensor* h = ggml_rms_norm(gctx, x, impl_->rms_norm_eps);
     h = ggml_mul(gctx, h, W->output_norm);
     ggml_tensor* logits_t = ggml_mul_mat(gctx, W->output, h);
+    if (impl_->final_logit_softcapping > 0.0f) {
+        ggml_tensor* down_scale = ggml_scale(gctx, logits_t, 1.0f / impl_->final_logit_softcapping);
+        ggml_tensor* tanhv = ggml_tanh(gctx, down_scale);
+        logits_t = ggml_scale(gctx, tanhv, impl_->final_logit_softcapping);
+    }
     ggml_set_output(logits_t);
 
     // Same graph-size story as forward_full above: the default 2048-node
