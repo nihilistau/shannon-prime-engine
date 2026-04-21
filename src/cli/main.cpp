@@ -78,6 +78,70 @@ static ggml_backend_t sp_select_backend() {
     return b;
 }
 
+// Multi-GPU enumeration: returns all GPU backends when n_gpus != 1.
+// Caller owns the returned backends (must free each).
+// When n_gpus == 0, auto-detects all. When n_gpus == 1 or no GPUs found,
+// returns empty vector (caller falls through to single-GPU path).
+struct SpMultiGpuGuard {
+    std::vector<ggml_backend_t> backends;
+    ~SpMultiGpuGuard() {
+        for (auto* b : backends) {
+            if (b) ggml_backend_free(b);
+        }
+    }
+    SpMultiGpuGuard() = default;
+    SpMultiGpuGuard(const SpMultiGpuGuard&) = delete;
+    SpMultiGpuGuard& operator=(const SpMultiGpuGuard&) = delete;
+};
+
+static std::vector<ggml_backend_t> sp_enumerate_gpus(int n_gpus_requested) {
+    if (n_gpus_requested == 1) return {};  // explicitly single-GPU
+
+    // Check if GPU backend is requested via env.
+    const char* env = std::getenv("SP_ENGINE_BACKEND");
+    if (!env) return {};
+    const bool want_gpu = (std::strcmp(env, "gpu") == 0 ||
+                           std::strcmp(env, "cuda") == 0 ||
+                           std::strcmp(env, "vulkan") == 0);
+    if (!want_gpu) return {};
+
+    std::vector<ggml_backend_t> gpus;
+    const size_t n_dev = ggml_backend_dev_count();
+    for (size_t i = 0; i < n_dev; ++i) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        if (!dev) continue;
+        if (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU) continue;
+
+        ggml_backend_t b = ggml_backend_dev_init(dev, nullptr);
+        if (!b) continue;
+
+        size_t free_mem = 0, total_mem = 0;
+        ggml_backend_dev_memory(dev, &free_mem, &total_mem);
+        std::fprintf(stderr,
+            "[sp-engine] GPU %zu: %s — %.2f / %.2f GiB\n",
+            gpus.size(), ggml_backend_dev_description(dev),
+            free_mem / (1024.0 * 1024.0 * 1024.0),
+            total_mem / (1024.0 * 1024.0 * 1024.0));
+        gpus.push_back(b);
+    }
+
+    // Clamp to requested count.
+    int want = (n_gpus_requested == 0) ? (int)gpus.size() : n_gpus_requested;
+    while ((int)gpus.size() > want) {
+        ggml_backend_free(gpus.back());
+        gpus.pop_back();
+    }
+
+    // Single GPU → return empty to use standard path.
+    if (gpus.size() <= 1) {
+        for (auto* b : gpus) ggml_backend_free(b);
+        return {};
+    }
+
+    std::fprintf(stderr, "[sp-engine] multi-GPU mode: %zu GPUs\n", gpus.size());
+    return gpus;
+}
+
 // Number of layers to offload to the backend. N_GPU_LAYERS_ALL ("all") is
 // the default and matches the full-offload path that the CPU-mmap loader
 // has always used. Env var SP_ENGINE_N_GPU_LAYERS sets the baseline;
@@ -140,6 +204,9 @@ static void usage(const char* prog) {
         "                       when n >= model.n_layer. Requires SP_ENGINE_BACKEND\n"
         "                       = gpu/cuda/vulkan; CPU loader ignores. Env var\n"
         "                       SP_ENGINE_N_GPU_LAYERS sets the default.\n"
+        "  --n-gpus <n>         multi-GPU: use N GPUs (0=auto-detect, 1=single GPU)\n"
+        "                       Layers are sharded: layer L → GPU[L*N/n_layer].\n"
+        "                       (env: SP_ENGINE_N_GPUS)\n"
         "  --sqfree             enable sqfree + Knight skeleton\n"
         "  --spinor             enable SU(2) sheet bit (requires --sqfree)\n"
         "  --no-mobius          disable ship-path Möbius reorder\n"
@@ -222,6 +289,7 @@ int main(int argc, char** argv) {
             else if (a == "--ctx"            && i + 1 < argc) n_ctx             = std::atoi(argv[++i]);
             else if (a == "--chunks"         && i + 1 < argc) n_chunks          = std::atoi(argv[++i]);
             else if ((a == "--n-gpu-layers" || a == "-ngl") && i + 1 < argc) ngl = std::atoi(argv[++i]);
+            else if (a == "--n-gpus"        && i + 1 < argc) cc.n_gpus         = std::atoi(argv[++i]);
             else if (a == "--sqfree")        cc.sqfree = true;
             else if (a == "--spinor")        { cc.spinor = true; cc.sqfree = true; }
             else if (a == "--no-mobius")     cc.mobius = false;
@@ -264,13 +332,23 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "cache_ppl requires a UTF-8 text file path\n"); return 1;
         }
 
-        SpBackendGuard bk(sp_select_backend());
+        // Multi-GPU: enumerate GPUs, fall through to single-GPU if <= 1.
+        SpMultiGpuGuard mgpu;
+        mgpu.backends = sp_enumerate_gpus(cc.n_gpus);
+        SpBackendGuard bk(mgpu.backends.empty() ? sp_select_backend() : nullptr);
+
         auto m  = sp::engine::Model::load(cc.model_path);
         if (!m) return 2;
         cc.arch_name = m->architecture();
         auto v  = sp::engine::Vocab::load(*m);
         auto tk = v ? sp::engine::Tokenizer::create(*v) : nullptr;
-        auto W  = sp::engine::LlamaWeights::load(*m, bk, ngl);
+
+        std::unique_ptr<sp::engine::LlamaWeights> W;
+        if (!mgpu.backends.empty()) {
+            W = sp::engine::LlamaWeights::load_multi_gpu(*m, mgpu.backends, ngl);
+        } else {
+            W = sp::engine::LlamaWeights::load(*m, bk, ngl);
+        }
         if (!tk || !W) return 3;
 
         std::FILE* fp = std::fopen(textfile.c_str(), "rb");
@@ -290,7 +368,12 @@ int main(int argc, char** argv) {
                      fsize, all_ids.size());
 
         sp::engine::PeSettings pe{cc.pe_mode, cc.pe_alpha, cc.pe_tier};
-        auto fc = sp::engine::ForwardContext::create(*m, *W, 1024 * 1024 * 1024, pe, bk);
+        std::unique_ptr<sp::engine::ForwardContext> fc;
+        if (!mgpu.backends.empty()) {
+            fc = sp::engine::ForwardContext::create_multi_gpu(*m, *W, mgpu.backends, 1024*1024*1024, pe);
+        } else {
+            fc = sp::engine::ForwardContext::create(*m, *W, 1024 * 1024 * 1024, pe, bk);
+        }
         if (!fc) return 5;
 
         const int n_layer   = fc->n_layer();
@@ -551,6 +634,7 @@ int main(int argc, char** argv) {
             else if (a == "--ctx"      && i + 1 < argc) n_ctx            = std::atoi(argv[++i]);
             else if (a == "--chunks"   && i + 1 < argc) n_chunks         = std::atoi(argv[++i]);
             else if ((a == "--n-gpu-layers" || a == "-ngl") && i + 1 < argc) ngl = std::atoi(argv[++i]);
+            else if (a == "--n-gpus"        && i + 1 < argc) pc.n_gpus        = std::atoi(argv[++i]);
             else if (a == "--cache")        use_cache       = true;
             else if (a == "--sqfree")       pc.sqfree       = true;
             else if (a == "--spinor")       { pc.spinor = true; pc.sqfree = true; }
@@ -583,13 +667,22 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "perplexity requires a UTF-8 text file path\n"); return 1;
         }
 
-        SpBackendGuard bk(sp_select_backend());
+        SpMultiGpuGuard mgpu_ppl;
+        mgpu_ppl.backends = sp_enumerate_gpus(pc.n_gpus);
+        SpBackendGuard bk(mgpu_ppl.backends.empty() ? sp_select_backend() : nullptr);
+
         auto m  = sp::engine::Model::load(pc.model_path);
         if (!m) return 2;
         pc.arch_name = m->architecture();
         auto v  = sp::engine::Vocab::load(*m);
         auto tk = v ? sp::engine::Tokenizer::create(*v) : nullptr;
-        auto W  = sp::engine::LlamaWeights::load(*m, bk, ngl);
+
+        std::unique_ptr<sp::engine::LlamaWeights> W;
+        if (!mgpu_ppl.backends.empty()) {
+            W = sp::engine::LlamaWeights::load_multi_gpu(*m, mgpu_ppl.backends, ngl);
+        } else {
+            W = sp::engine::LlamaWeights::load(*m, bk, ngl);
+        }
         if (!tk || !W) return 3;
 
         // Read whole file. Binary mode so byte-perfect with what llama.cpp's
@@ -613,11 +706,13 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "[sp-engine] tokenised %zu bytes -> %zu tokens\n",
                      fsize, all_ids.size());
 
-        // Estimate scratch: full forward at n=ctx for an n_layer=36 / 8B model
-        // wants ~1 GB. The 1 GB ctx_size we pass to ForwardContext::create
-        // covers up to ctx ~ 1024 on Qwen3-8B comfortably.
         sp::engine::PeSettings pe_empty;
-        auto fc = sp::engine::ForwardContext::create(*m, *W, 1024 * 1024 * 1024, pe_empty, bk);
+        std::unique_ptr<sp::engine::ForwardContext> fc;
+        if (!mgpu_ppl.backends.empty()) {
+            fc = sp::engine::ForwardContext::create_multi_gpu(*m, *W, mgpu_ppl.backends, 1024*1024*1024, pe_empty);
+        } else {
+            fc = sp::engine::ForwardContext::create(*m, *W, 1024 * 1024 * 1024, pe_empty, bk);
+        }
         if (!fc) return 5;
 
         const int n_vocab_local = fc->n_vocab();
@@ -844,6 +939,7 @@ int main(int argc, char** argv) {
             else if (a == "--naive")        naive      = true;
             else if (a == "--debug-decode") debug_decode = true;
             else if ((a == "--n-gpu-layers" || a == "-ngl") && i + 1 < argc) ngl = std::atoi(argv[++i]);
+            else if (a == "--n-gpus"    && i + 1 < argc) cc.n_gpus     = std::atoi(argv[++i]);
             else if (a == "--model"     && i + 1 < argc) cc.model_path = argv[++i];
             else if (a == "--k-bits"    && i + 1 < argc) cc.k_bits_csv = argv[++i];
             else if (a == "--v-bits"    && i + 1 < argc) cc.v_bits_csv = argv[++i];
@@ -894,13 +990,23 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "chat requires a prompt\n"); return 1;
         }
 
-        SpBackendGuard bk(sp_select_backend());
+        // Multi-GPU: enumerate GPUs, fall through to single-GPU if <= 1.
+        SpMultiGpuGuard mgpu_chat;
+        mgpu_chat.backends = sp_enumerate_gpus(cc.n_gpus);
+        SpBackendGuard bk(mgpu_chat.backends.empty() ? sp_select_backend() : nullptr);
+
         auto m = sp::engine::Model::load(cc.model_path);
         if (!m) return 2;
         cc.arch_name = m->architecture();
         auto v  = sp::engine::Vocab::load(*m);
         auto tk = v ? sp::engine::Tokenizer::create(*v) : nullptr;
-        auto W  = sp::engine::LlamaWeights::load(*m, bk, ngl);
+
+        std::unique_ptr<sp::engine::LlamaWeights> W;
+        if (!mgpu_chat.backends.empty()) {
+            W = sp::engine::LlamaWeights::load_multi_gpu(*m, mgpu_chat.backends, ngl);
+        } else {
+            W = sp::engine::LlamaWeights::load(*m, bk, ngl);
+        }
         if (!tk || !W) return 3;
 
         std::vector<int32_t> ids;
@@ -909,7 +1015,12 @@ int main(int argc, char** argv) {
         const int max_seq  = n_prompt + n_predict + 4;
 
         sp::engine::PeSettings pe{cc.pe_mode, cc.pe_alpha, cc.pe_tier};
-        auto fc = sp::engine::ForwardContext::create(*m, *W, 1024 * 1024 * 1024, pe, bk);
+        std::unique_ptr<sp::engine::ForwardContext> fc;
+        if (!mgpu_chat.backends.empty()) {
+            fc = sp::engine::ForwardContext::create_multi_gpu(*m, *W, mgpu_chat.backends, 1024*1024*1024, pe);
+        } else {
+            fc = sp::engine::ForwardContext::create(*m, *W, 1024 * 1024 * 1024, pe, bk);
+        }
         if (!fc) return 4;
 
         // Prefer GPU-resident cache when backend is GPU + ship path.

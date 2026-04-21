@@ -60,6 +60,15 @@ public:
                                                    PeSettings pe = {},
                                                    ggml_backend_t external_backend = nullptr);
 
+    // Multi-GPU variant: builds a scheduler over [GPU0, GPU1, ..., CPU].
+    // `gpu_backends` must outlive this ForwardContext (caller-owned).
+    static std::unique_ptr<ForwardContext> create_multi_gpu(
+            const Model&         model,
+            const LlamaWeights& weights,
+            const std::vector<ggml_backend_t>& gpu_backends,
+            int ctx_size_bytes = 512 * 1024 * 1024,
+            PeSettings pe = {});
+
     ~ForwardContext();
     ForwardContext(const ForwardContext&) = delete;
     ForwardContext& operator=(const ForwardContext&) = delete;

@@ -155,6 +155,15 @@ public:
                                                ggml_backend_t backend = nullptr,
                                                int n_gpu_layers = N_GPU_LAYERS_ALL);
 
+    // Multi-GPU variant: distribute layers across multiple GPU backends.
+    // Layer L → backends[L * n_gpus / n_layer]. Non-layer tensors → backends[0]
+    // when fully offloaded, CPU-mapped otherwise.
+    // Returns nullptr if any backend init or allocation fails.
+    static std::unique_ptr<LlamaWeights> load_multi_gpu(
+            const Model& model,
+            const std::vector<ggml_backend_t>& gpu_backends,
+            int n_gpu_layers = N_GPU_LAYERS_ALL);
+
     ~LlamaWeights();
     LlamaWeights(const LlamaWeights&) = delete;
     LlamaWeights& operator=(const LlamaWeights&) = delete;
@@ -189,6 +198,9 @@ private:
     static bool                             bind_tensors_(LlamaWeights& w, ggml_context* tctx, const Model& model);
     static std::unique_ptr<LlamaWeights>    load_cpu_mmap_(const Model& model);
     static std::unique_ptr<LlamaWeights>    load_backend_offload_(const Model& model, ggml_backend_t backend, int n_gpu_layers);
+    static std::unique_ptr<LlamaWeights>    load_multi_gpu_(const Model& model,
+                                                             const std::vector<ggml_backend_t>& gpu_backends,
+                                                             int n_gpu_layers);
 };
 
 } // namespace sp::engine

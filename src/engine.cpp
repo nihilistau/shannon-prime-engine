@@ -70,7 +70,8 @@ float logit_entropy(const float* logits, int n) {
 struct Engine::Impl {
     Config                             cfg;
     bool                               loaded        = false;
-    ggml_backend_t                     backend       = nullptr;
+    ggml_backend_t                     backend       = nullptr;  // primary GPU (or nullptr for CPU)
+    std::vector<ggml_backend_t>        gpu_backends;             // all GPUs (multi-GPU path)
     std::unique_ptr<Model>             model;
     std::unique_ptr<Vocab>             vocab;
     std::unique_ptr<Tokenizer>         tok;
@@ -83,7 +84,12 @@ struct Engine::Impl {
         tok.reset();
         vocab.reset();
         model.reset();
-        if (backend) ggml_backend_free(backend);
+        // Free GPU backends. In multi-GPU mode, backend == gpu_backends[0].
+        for (auto* b : gpu_backends) {
+            if (b) ggml_backend_free(b);
+        }
+        gpu_backends.clear();
+        backend = nullptr;  // already freed via gpu_backends
     }
 };
 
@@ -103,7 +109,62 @@ int Engine::load(const Config& cfg) {
         return 0;
     }
 
-    impl_->backend = select_backend_from_cfg(cfg);
+    // ── GPU enumeration ─────────────────────────────────────────────
+    //
+    // When cfg.backend is GPU/CUDA/Vulkan, enumerate available GPUs.
+    // cfg.n_gpus controls how many we actually use:
+    //   0 = auto (use all available)
+    //   1 = single GPU (classic path)
+    //   N = use N GPUs (clamped to available)
+    //
+    if (cfg.backend != Config::Backend::CPU) {
+        const size_t n_dev = ggml_backend_dev_count();
+        for (size_t i = 0; i < n_dev; ++i) {
+            ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+            if (!dev) continue;
+            if (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU) continue;
+
+            ggml_backend_t b = ggml_backend_dev_init(dev, nullptr);
+            if (!b) {
+                std::fprintf(stderr,
+                    "[sp-engine] Engine: failed to init GPU device %zu (%s)\n",
+                    i, ggml_backend_dev_name(dev));
+                continue;
+            }
+            size_t free_mem = 0, total_mem = 0;
+            ggml_backend_dev_memory(dev, &free_mem, &total_mem);
+            std::fprintf(stderr,
+                "[sp-engine] Engine: GPU %zu: %s — %.2f / %.2f GiB\n",
+                impl_->gpu_backends.size(),
+                ggml_backend_dev_description(dev),
+                free_mem / (1024.0 * 1024.0 * 1024.0),
+                total_mem / (1024.0 * 1024.0 * 1024.0));
+            impl_->gpu_backends.push_back(b);
+        }
+
+        // Clamp to requested count.
+        int want = cfg.n_gpus;
+        if (want == 0) want = (int)impl_->gpu_backends.size();  // auto = all
+        if (want <= 0) want = 1;
+        while ((int)impl_->gpu_backends.size() > want) {
+            ggml_backend_free(impl_->gpu_backends.back());
+            impl_->gpu_backends.pop_back();
+        }
+
+        if (impl_->gpu_backends.empty()) {
+            std::fprintf(stderr,
+                "[sp-engine] Engine: no GPU devices found; falling back to CPU\n");
+        } else {
+            impl_->backend = impl_->gpu_backends[0];  // primary = GPU 0
+        }
+    }
+
+    const bool multi_gpu = (impl_->gpu_backends.size() > 1);
+    if (multi_gpu) {
+        std::fprintf(stderr,
+            "[sp-engine] Engine: multi-GPU mode — %zu GPUs\n",
+            impl_->gpu_backends.size());
+    }
 
     impl_->model = Model::load(cfg.model_path);
     if (!impl_->model) return 2;
@@ -115,13 +176,29 @@ int Engine::load(const Config& cfg) {
     if (!impl_->tok) return 4;
 
     const int n_gpu_layers = (cfg.n_gpu_layers > 0) ? cfg.n_gpu_layers : N_GPU_LAYERS_ALL;
-    impl_->weights = LlamaWeights::load(*impl_->model, impl_->backend, n_gpu_layers);
+
+    // ── Weight loading ──────────────────────────────────────────────
+    if (multi_gpu) {
+        impl_->weights = LlamaWeights::load_multi_gpu(
+            *impl_->model, impl_->gpu_backends, n_gpu_layers);
+    } else {
+        impl_->weights = LlamaWeights::load(
+            *impl_->model, impl_->backend, n_gpu_layers);
+    }
     if (!impl_->weights) return 5;
 
+    // ── ForwardContext ───────────────────────────────────────────────
     PeSettings pe{cfg.pe_mode, cfg.pe_alpha, cfg.pe_tier};
-    impl_->fc = ForwardContext::create(*impl_->model, *impl_->weights,
-                                       /*ctx_size_bytes*/ 1024 * 1024 * 1024,
-                                       pe, impl_->backend);
+    if (multi_gpu) {
+        impl_->fc = ForwardContext::create_multi_gpu(
+            *impl_->model, *impl_->weights, impl_->gpu_backends,
+            /*ctx_size_bytes*/ 1024 * 1024 * 1024, pe);
+    } else {
+        impl_->fc = ForwardContext::create(
+            *impl_->model, *impl_->weights,
+            /*ctx_size_bytes*/ 1024 * 1024 * 1024,
+            pe, impl_->backend);
+    }
     if (!impl_->fc) return 6;
 
     impl_->loaded = true;

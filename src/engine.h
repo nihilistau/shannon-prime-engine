@@ -52,6 +52,21 @@ struct Config {
     Backend     backend = Backend::CPU;
     int         n_gpu_layers = 0;
 
+    // Multi-GPU sharding — distribute transformer layers across GPUs.
+    //
+    //   n_gpus = 0 → auto-detect all available GPUs (default)
+    //   n_gpus = 1 → single GPU (current behaviour, no sharding)
+    //   n_gpus > 1 → shard layers across that many GPUs
+    //
+    // Layer L is assigned to GPU[ L * n_gpus / n_layer ]. Non-layer
+    // tensors (tok_embd, output_norm, output) go to GPU 0 when fully
+    // offloaded, or stay CPU-mapped under partial offload.
+    //
+    // The scheduler handles cross-GPU copies transparently — when a
+    // tensor produced on GPU i is consumed by an op on GPU j, it gets
+    // an automatic copy node inserted.
+    int         n_gpus = 0;
+
     // Positional-encoding mode.
     enum class PeMode { Standard, PrimePe, PrimePeAlibi, AlibiOnly };
     PeMode      pe_mode  = PeMode::Standard;
@@ -144,6 +159,11 @@ inline void seed_config_from_env(Config& cfg) {
     if (cfg.s12_sys2.empty() || cfg.s12_sys2 == "hier") {
         if (const char* s = std::getenv("SP_ENGINE_S12_SYS2")) {
             cfg.s12_sys2 = s;
+        }
+    }
+    if (cfg.n_gpus == 0) {
+        if (const char* s = std::getenv("SP_ENGINE_N_GPUS")) {
+            cfg.n_gpus = std::atoi(s);
         }
     }
 }

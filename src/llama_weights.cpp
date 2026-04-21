@@ -32,7 +32,22 @@ struct LlamaWeights::Impl {
     // When we offloaded to a non-CPU backend, this holds the allocated
     // buffer so the tensor data stays alive for the Weights' lifetime.
     ggml_backend_buffer* backend_buf = nullptr;
+
+    // Multi-GPU: per-GPU ggml contexts and buffers. When populated, the
+    // single-GPU ctx/backend_buf above hold GPU 0's data and these vectors
+    // hold GPU 1..N-1. All contexts must be freed on destruction.
+    std::vector<ggml_context*>        gpu_ctxs;      // per-GPU tensor contexts [0..n_gpus-1]
+    std::vector<ggml_backend_buffer*> gpu_bufs;      // per-GPU backend buffers [0..n_gpus-1]
+
     ~Impl() {
+        // Multi-GPU cleanup (reverse order).
+        for (int i = (int)gpu_bufs.size() - 1; i >= 0; --i) {
+            if (gpu_bufs[i]) ggml_backend_buffer_free(gpu_bufs[i]);
+        }
+        for (int i = (int)gpu_ctxs.size() - 1; i >= 0; --i) {
+            if (gpu_ctxs[i]) ggml_free(gpu_ctxs[i]);
+        }
+        // Single-GPU / mmap cleanup.
         if (backend_buf) ggml_backend_buffer_free(backend_buf);
         if (ctx)         ggml_free(ctx);
         if (meta_ctx)    ggml_free(meta_ctx);
@@ -493,6 +508,289 @@ std::unique_ptr<LlamaWeights> LlamaWeights::load_backend_offload_(
         return nullptr;
     }
     return w;
+}
+
+// ------------------------------------------------------------------
+// Multi-GPU offload path.
+//
+// Same tensor-enumeration strategy as load_backend_offload_, but layer
+// tensors are spread across multiple GPU backends:
+//   layer L → gpu_backends[ L * n_gpus / n_layer_total ]
+// Non-layer tensors (tok_embd, output_norm, output, rope_freqs) go to
+// gpu_backends[0] when fully offloaded, or stay CPU-mapped otherwise.
+//
+// Each GPU gets its own ggml_context (tensor placeholders only) and
+// backend_buffer. The bind pass runs over ALL contexts so tok_embd /
+// layers[] etc. point at the correct GPU-resident tensors.
+// ------------------------------------------------------------------
+std::unique_ptr<LlamaWeights> LlamaWeights::load_multi_gpu_(
+        const Model& model,
+        const std::vector<ggml_backend_t>& gpu_backends,
+        int n_gpu_layers) {
+    auto w = std::unique_ptr<LlamaWeights>(new LlamaWeights());
+    w->arch_ = model.architecture();
+    const int n_layer_total = (int)model.n_layer();
+    const int n_gpus = (int)gpu_backends.size();
+    const bool full_offload = n_gpu_layers >= n_layer_total;
+
+    std::fprintf(stderr,
+        "[sp-engine] LlamaWeights::load_multi_gpu: %d GPUs, %d/%d layers offloaded\n",
+        n_gpus, std::min(n_gpu_layers, n_layer_total), n_layer_total);
+
+    // Pass 1: mmap to get tensor data.
+    ggml_context* mmap_ctx = nullptr;
+    gguf_init_params p1 = {};
+    p1.no_alloc = false;
+    p1.ctx      = &mmap_ctx;
+    gguf_context* mmap_gguf = gguf_init_from_file(model.path().c_str(), p1);
+    if (!mmap_gguf) {
+        std::fprintf(stderr,
+            "[sp-engine] LlamaWeights: failed to reopen %s (multi-gpu pass 1)\n",
+            model.path().c_str());
+        return nullptr;
+    }
+
+    // Collect tensor metadata + data pointers + target GPU assignment.
+    struct TensorInfo {
+        std::string name;
+        ggml_type   type;
+        int64_t     ne[GGML_MAX_DIMS];
+        int         n_dims;
+        size_t      n_bytes;
+        void*       src;
+        int         gpu_idx;   // -1 = CPU (not offloaded)
+    };
+    std::vector<TensorInfo> tensors;
+    const int64_t n_gguf_tensors = gguf_get_n_tensors(mmap_gguf);
+    tensors.reserve((size_t)n_gguf_tensors);
+
+    for (int64_t i = 0; i < n_gguf_tensors; ++i) {
+        const char* name = gguf_get_tensor_name(mmap_gguf, i);
+        ggml_tensor* t = ggml_get_tensor(mmap_ctx, name);
+        if (!t) continue;
+
+        TensorInfo ti;
+        ti.name   = name;
+        ti.type   = t->type;
+        ti.n_dims = ggml_n_dims(t);
+        for (int d = 0; d < GGML_MAX_DIMS; ++d) ti.ne[d] = t->ne[d];
+        ti.n_bytes = ggml_nbytes(t);
+        ti.src     = t->data;
+
+        // Assign GPU: parse layer index from "blk.N.xxx" names.
+        int layer = -1;
+        if (std::sscanf(ti.name.c_str(), "blk.%d.", &layer) == 1) {
+            if (layer < n_gpu_layers) {
+                // Distribute: layer L → gpu_backends[ L * n_gpus / n_layer_total ]
+                ti.gpu_idx = (layer * n_gpus) / n_layer_total;
+                if (ti.gpu_idx >= n_gpus) ti.gpu_idx = n_gpus - 1;
+            } else {
+                ti.gpu_idx = -1;  // beyond offload range → CPU
+            }
+        } else {
+            // Non-layer tensor: GPU 0 if full offload, else CPU.
+            ti.gpu_idx = full_offload ? 0 : -1;
+        }
+        tensors.push_back(std::move(ti));
+    }
+
+    // Count tensors per GPU for context sizing.
+    std::vector<int> tensors_per_gpu((size_t)n_gpus, 0);
+    int tensors_on_cpu = 0;
+    for (const auto& ti : tensors) {
+        if (ti.gpu_idx >= 0) tensors_per_gpu[(size_t)ti.gpu_idx]++;
+        else tensors_on_cpu++;
+    }
+    for (int g = 0; g < n_gpus; ++g) {
+        std::fprintf(stderr,
+            "[sp-engine] multi-GPU: GPU %d will hold %d tensors\n",
+            g, tensors_per_gpu[g]);
+    }
+    if (tensors_on_cpu > 0) {
+        std::fprintf(stderr,
+            "[sp-engine] multi-GPU: %d tensors remain CPU-mapped\n",
+            tensors_on_cpu);
+    }
+
+    // Pass 2: create per-GPU ggml contexts with tensor placeholders.
+    w->impl_->gpu_ctxs.resize((size_t)n_gpus, nullptr);
+    w->impl_->gpu_bufs.resize((size_t)n_gpus, nullptr);
+
+    for (int g = 0; g < n_gpus; ++g) {
+        if (tensors_per_gpu[g] == 0) continue;
+        const size_t ctx_mem = ggml_tensor_overhead() * ((size_t)tensors_per_gpu[g] + 4);
+        ggml_init_params gip = {};
+        gip.mem_size   = ctx_mem;
+        gip.mem_buffer = nullptr;
+        gip.no_alloc   = true;
+        w->impl_->gpu_ctxs[g] = ggml_init(gip);
+        if (!w->impl_->gpu_ctxs[g]) {
+            std::fprintf(stderr,
+                "[sp-engine] LlamaWeights: ggml_init failed for GPU %d\n", g);
+            ggml_free(mmap_ctx);
+            gguf_free(mmap_gguf);
+            return nullptr;
+        }
+    }
+
+    // Also create a "master" context for bind_tensors_ to walk — it needs
+    // ALL tensor names visible. We'll populate it with views/pointers after
+    // allocation. For now, use the approach of creating placeholder tensors
+    // in each GPU's context and then binding from them.
+    //
+    // bind_tensors_ walks a single ggml_context by name. Since tensors are
+    // split across GPU contexts, we create a thin master context that holds
+    // every tensor name → duplicated as a placeholder. After per-GPU
+    // allocation, we point each master tensor's data at the GPU tensor's
+    // buffer via ggml_backend_tensor_copy semantics. Actually, simpler:
+    // we run bind_tensors_ on each GPU context in sequence — each call
+    // binds whatever tensors it finds by name.
+    //
+    // Actually the cleanest: create placeholders in the per-GPU contexts,
+    // allocate per-GPU buffers, copy data in, then run bind on each.
+
+    // Create placeholders + track for later data copy.
+    struct PlacedTensor {
+        int         gpu_idx;
+        std::string name;
+        size_t      n_bytes;
+        void*       src;     // host mmap data
+    };
+    std::vector<PlacedTensor> placed;
+    placed.reserve(tensors.size());
+
+    for (const auto& ti : tensors) {
+        if (ti.gpu_idx < 0) continue;  // CPU tensors handled below
+        ggml_context* gctx = w->impl_->gpu_ctxs[ti.gpu_idx];
+
+        ggml_tensor* t;
+        if      (ti.n_dims == 1) t = ggml_new_tensor_1d(gctx, ti.type, ti.ne[0]);
+        else if (ti.n_dims == 2) t = ggml_new_tensor_2d(gctx, ti.type, ti.ne[0], ti.ne[1]);
+        else if (ti.n_dims == 3) t = ggml_new_tensor_3d(gctx, ti.type, ti.ne[0], ti.ne[1], ti.ne[2]);
+        else                     t = ggml_new_tensor_4d(gctx, ti.type, ti.ne[0], ti.ne[1], ti.ne[2], ti.ne[3]);
+        ggml_set_name(t, ti.name.c_str());
+
+        PlacedTensor pt;
+        pt.gpu_idx = ti.gpu_idx;
+        pt.name    = ti.name;
+        pt.n_bytes = ti.n_bytes;
+        pt.src     = ti.src;
+        placed.push_back(std::move(pt));
+    }
+
+    // Allocate per-GPU backend buffers.
+    for (int g = 0; g < n_gpus; ++g) {
+        if (!w->impl_->gpu_ctxs[g]) continue;
+        w->impl_->gpu_bufs[g] = ggml_backend_alloc_ctx_tensors(
+            w->impl_->gpu_ctxs[g], gpu_backends[g]);
+        if (!w->impl_->gpu_bufs[g]) {
+            std::fprintf(stderr,
+                "[sp-engine] LlamaWeights: alloc_ctx_tensors failed for GPU %d\n", g);
+            ggml_free(mmap_ctx);
+            gguf_free(mmap_gguf);
+            return nullptr;
+        }
+        const size_t buf_size = ggml_backend_buffer_get_size(w->impl_->gpu_bufs[g]);
+        std::fprintf(stderr,
+            "[sp-engine] multi-GPU: GPU %d buffer = %.2f MiB\n",
+            g, buf_size / (1024.0 * 1024.0));
+    }
+
+    // Copy tensor data from mmap into each GPU's buffer.
+    size_t total_copied = 0;
+    for (const auto& pt : placed) {
+        ggml_tensor* dst = ggml_get_tensor(w->impl_->gpu_ctxs[pt.gpu_idx], pt.name.c_str());
+        if (!dst) continue;
+        ggml_backend_tensor_set(dst, pt.src, 0, pt.n_bytes);
+        total_copied += pt.n_bytes;
+    }
+    std::fprintf(stderr,
+        "[sp-engine] multi-GPU: copied %.2f MiB to %d GPUs\n",
+        total_copied / (1024.0 * 1024.0), n_gpus);
+
+    // Handle CPU-resident tensors: keep them mmap-pointed in the master
+    // context. We need a master ctx for bind_tensors_. Create it now with
+    // ALL tensors — GPU tensors as views referencing GPU buffer data, CPU
+    // tensors referencing mmap data.
+    {
+        const size_t master_mem = ggml_tensor_overhead() * (tensors.size() + 16);
+        ggml_init_params gip = {};
+        gip.mem_size   = master_mem;
+        gip.mem_buffer = nullptr;
+        gip.no_alloc   = true;
+        w->impl_->ctx = ggml_init(gip);
+        if (!w->impl_->ctx) {
+            std::fprintf(stderr,
+                "[sp-engine] LlamaWeights: ggml_init failed (multi-gpu master ctx)\n");
+            ggml_free(mmap_ctx);
+            gguf_free(mmap_gguf);
+            return nullptr;
+        }
+    }
+
+    // Populate master context: create tensor placeholders and point data
+    // at the appropriate source (GPU buffer tensor data, or CPU mmap).
+    for (const auto& ti : tensors) {
+        ggml_tensor* t;
+        if      (ti.n_dims == 1) t = ggml_new_tensor_1d(w->impl_->ctx, ti.type, ti.ne[0]);
+        else if (ti.n_dims == 2) t = ggml_new_tensor_2d(w->impl_->ctx, ti.type, ti.ne[0], ti.ne[1]);
+        else if (ti.n_dims == 3) t = ggml_new_tensor_3d(w->impl_->ctx, ti.type, ti.ne[0], ti.ne[1], ti.ne[2]);
+        else                     t = ggml_new_tensor_4d(w->impl_->ctx, ti.type, ti.ne[0], ti.ne[1], ti.ne[2], ti.ne[3]);
+        ggml_set_name(t, ti.name.c_str());
+
+        if (ti.gpu_idx >= 0) {
+            // Point at the GPU-resident tensor's buffer slot.
+            ggml_tensor* gpu_t = ggml_get_tensor(w->impl_->gpu_ctxs[ti.gpu_idx], ti.name.c_str());
+            if (gpu_t) {
+                t->data   = gpu_t->data;
+                t->buffer = gpu_t->buffer;
+                t->view_src  = gpu_t->view_src;
+                t->view_offs = gpu_t->view_offs;
+            }
+        } else {
+            // CPU-mapped: point at mmap data.
+            t->data = ti.src;
+        }
+    }
+
+    // Retain mmap context if we have CPU-resident tensors.
+    if (!full_offload) {
+        w->impl_->meta_ctx = mmap_ctx;
+        w->impl_->gguf = mmap_gguf;
+    } else {
+        ggml_free(mmap_ctx);
+        gguf_free(mmap_gguf);
+    }
+
+    // Bind tensor names to struct fields (tok_embd, layers[], etc.).
+    if (!LlamaWeights::bind_tensors_(*w, w->impl_->ctx, model)) {
+        return nullptr;
+    }
+
+    return w;
+}
+
+// Public multi-GPU entry point.
+std::unique_ptr<LlamaWeights> LlamaWeights::load_multi_gpu(
+        const Model& model,
+        const std::vector<ggml_backend_t>& gpu_backends,
+        int n_gpu_layers) {
+    if (!supported_arch(model.architecture())) {
+        std::fprintf(stderr,
+            "[sp-engine] LlamaWeights: unsupported arch '%s'\n",
+            model.architecture().c_str());
+        return nullptr;
+    }
+    if (gpu_backends.empty()) {
+        std::fprintf(stderr,
+            "[sp-engine] LlamaWeights::load_multi_gpu: no GPU backends provided\n");
+        return nullptr;
+    }
+    // Single GPU: fall through to standard offload path.
+    if (gpu_backends.size() == 1) {
+        return load_backend_offload_(model, gpu_backends[0], n_gpu_layers);
+    }
+    return load_multi_gpu_(model, gpu_backends, n_gpu_layers);
 }
 
 // ------------------------------------------------------------------

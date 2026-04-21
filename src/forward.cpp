@@ -451,6 +451,84 @@ std::unique_ptr<ForwardContext> ForwardContext::create(const Model& model,
 }
 
 // ------------------------------------------------------------------
+// Multi-GPU variant of create().
+//
+// Delegates to create(model, weights, ctx_size, pe, gpu_backends[0]) for
+// all hparam/RoPE/model setup, then tears down the 2-backend scheduler
+// that create() installed and replaces it with an N+1 backend scheduler
+// covering [GPU0, GPU1, ..., GPUN-1, CPU].
+// ------------------------------------------------------------------
+std::unique_ptr<ForwardContext> ForwardContext::create_multi_gpu(
+        const Model& model,
+        const LlamaWeights& weights,
+        const std::vector<ggml_backend_t>& gpu_backends,
+        int ctx_size_bytes,
+        PeSettings pe) {
+    if (gpu_backends.empty()) {
+        std::fprintf(stderr, "[sp-engine] ForwardContext::create_multi_gpu: no GPU backends\n");
+        return nullptr;
+    }
+    // Single GPU: just use the standard path.
+    if (gpu_backends.size() == 1) {
+        return create(model, weights, ctx_size_bytes, pe, gpu_backends[0]);
+    }
+
+    // Build via the standard create (sets up all hparams, PrimePE, etc.
+    // using gpu_backends[0] as the primary backend).
+    auto fc = create(model, weights, ctx_size_bytes, pe, gpu_backends[0]);
+    if (!fc) return nullptr;
+
+    // Tear down the 2-backend scheduler that create() installed.
+    if (fc->impl_->backend_sched) {
+        ggml_backend_sched_free(fc->impl_->backend_sched);
+        fc->impl_->backend_sched = nullptr;
+    }
+    // Free the CPU backend that create() allocated for the old scheduler —
+    // we'll create a fresh one for the N+1 scheduler.
+    if (fc->impl_->cpu_backend && fc->impl_->owns_cpu_backend) {
+        ggml_backend_free(fc->impl_->cpu_backend);
+        fc->impl_->cpu_backend = nullptr;
+        fc->impl_->owns_cpu_backend = false;
+    }
+
+    // Build N+1 scheduler: [GPU0, GPU1, ..., GPUN-1, CPU].
+    const int n_gpus = (int)gpu_backends.size();
+    fc->impl_->cpu_backend = ggml_backend_init_by_type(
+        GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
+    fc->impl_->owns_cpu_backend = (fc->impl_->cpu_backend != nullptr);
+    if (!fc->impl_->cpu_backend) {
+        std::fprintf(stderr,
+            "[sp-engine] ForwardContext::create_multi_gpu: failed to init CPU backend\n");
+        return nullptr;
+    }
+
+    // Backends array: [GPU0, GPU1, ..., CPU] in priority order.
+    const int n_backends = n_gpus + 1;
+    std::vector<ggml_backend_t> backends((size_t)n_backends);
+    for (int i = 0; i < n_gpus; ++i) {
+        backends[i] = gpu_backends[i];
+    }
+    backends[n_gpus] = fc->impl_->cpu_backend;
+
+    fc->impl_->backend_sched = ggml_backend_sched_new(
+        backends.data(), nullptr, n_backends,
+        GGML_DEFAULT_GRAPH_SIZE,
+        /*parallel=*/false,
+        /*op_offload=*/true);
+    if (fc->impl_->backend_sched) {
+        std::fprintf(stderr,
+            "[sp-engine] ForwardContext: multi-GPU scheduler active "
+            "(%d GPUs + CPU fallback)\n", n_gpus);
+    } else {
+        std::fprintf(stderr,
+            "[sp-engine] ForwardContext: multi-GPU sched_new failed\n");
+        return nullptr;
+    }
+
+    return fc;
+}
+
+// ------------------------------------------------------------------
 // 3a: token-embedding lookup graph.
 //
 // input:  int32[n]     token IDs
