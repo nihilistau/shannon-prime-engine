@@ -19,9 +19,14 @@ extern "C" {
 }
 
 #include "ggml-backend.h"
+
+#include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <string>
+#include <vector>
 
 // RAII guard: owns an optional ggml_backend_t, frees on scope exit.
 // Implicitly convertible to ggml_backend_t so it drops into the
@@ -153,13 +158,6 @@ static int sp_default_n_gpu_layers() {
     }
     return sp::engine::N_GPU_LAYERS_ALL;
 }
-
-#include <algorithm>
-#include <cstdio>
-#include <cstdlib>
-#include <cstring>
-#include <string>
-#include <vector>
 
 static void usage(const char* prog) {
     std::fprintf(stderr,

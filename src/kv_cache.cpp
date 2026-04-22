@@ -18,7 +18,6 @@ extern "C" {
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <stdexcept>
 
 namespace sp::engine {
 
@@ -1126,6 +1125,7 @@ bool KvCache::read_gpu(int layer, int kv_len,
                                      d_V_out + off_elems);
             }
         }
+        cudaStreamSynchronize(s);
         return true;
     }
 

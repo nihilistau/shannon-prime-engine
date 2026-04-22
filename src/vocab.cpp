@@ -7,7 +7,6 @@
 #include "gguf.h"
 
 #include <cstdio>
-#include <sstream>
 
 namespace sp::engine {
 

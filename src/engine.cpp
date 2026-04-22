@@ -26,15 +26,6 @@
 namespace sp::engine {
 
 namespace {
-ggml_backend_t select_backend_from_cfg(const Config& cfg) {
-    if (cfg.backend == Config::Backend::CPU) return nullptr;
-    ggml_backend_t b = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_GPU, nullptr);
-    if (!b) {
-        std::fprintf(stderr,
-            "[sp-engine] Engine: requested GPU backend not registered; using CPU\n");
-    }
-    return b;
-}
 
 int argmax(const float* v, int n) {
     int best = 0;

@@ -30,6 +30,7 @@
 
 #pragma once
 
+#include <cstdio>
 #include <memory>
 #include <string>
 #include <vector>
