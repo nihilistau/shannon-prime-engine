@@ -423,9 +423,17 @@ std::unique_ptr<ForwardContext> ForwardContext::create(const Model& model,
                     external_backend,        // priority 0 — GPU
                     fc->impl_->cpu_backend   // priority 1 — CPU fallback
                 };
+                // Graph-size budget must cover the deepest supported model.
+                // qwen35moe needs ~40*256 = 10240 nodes (MoE + GDN ops);
+                // gemma3-12B hits ~48*45 = 2160 (over GGML_DEFAULT_GRAPH_SIZE).
+                // Use the same formula as forward_full's graph creation:
+                //   max(GGML_DEFAULT_GRAPH_SIZE, n_layer * 256).
+                const size_t sched_graph_size = std::max<size_t>(
+                    (size_t)GGML_DEFAULT_GRAPH_SIZE,
+                    (size_t)fc->impl_->n_layer * 256u);
                 fc->impl_->backend_sched = ggml_backend_sched_new(
                     backends, nullptr, 2,
-                    GGML_DEFAULT_GRAPH_SIZE,
+                    sched_graph_size,
                     /*parallel=*/false,
                     /*op_offload=*/true);
                 if (fc->impl_->backend_sched) {
@@ -510,15 +518,18 @@ std::unique_ptr<ForwardContext> ForwardContext::create_multi_gpu(
     }
     backends[n_gpus] = fc->impl_->cpu_backend;
 
+    const size_t mgpu_graph_size = std::max<size_t>(
+        (size_t)GGML_DEFAULT_GRAPH_SIZE,
+        (size_t)fc->impl_->n_layer * 256u);
     fc->impl_->backend_sched = ggml_backend_sched_new(
         backends.data(), nullptr, n_backends,
-        GGML_DEFAULT_GRAPH_SIZE,
+        mgpu_graph_size,
         /*parallel=*/false,
         /*op_offload=*/true);
     if (fc->impl_->backend_sched) {
         std::fprintf(stderr,
             "[sp-engine] ForwardContext: multi-GPU scheduler active "
-            "(%d GPUs + CPU fallback)\n", n_gpus);
+            "(%d GPUs + CPU fallback, graph_size=%zu)\n", n_gpus, mgpu_graph_size);
     } else {
         std::fprintf(stderr,
             "[sp-engine] ForwardContext: multi-GPU sched_new failed\n");
