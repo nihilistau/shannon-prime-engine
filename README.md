@@ -14,12 +14,15 @@ This repo is a sibling of:
   canonical core math library. Vendored here as a git submodule at
   `lib/shannon-prime/`.
 - [shannon-prime-llama](https://github.com/nihilistau/shannon-prime-llama)
-  — the llama.cpp post-decode hook (the "patch in" integration option).
+  — full engine integration into llama.cpp. The b8733 patch compiles the
+  entire SP stack into llama.dll/libllama.so. Includes an LM Studio runtime
+  builder. Validated: Qwen3.6-35B-A3B MoE at 26.92 tok/sec in LM Studio.
 
 **Option relationship:** this engine is the "own the data path" option.
 shannon-prime-llama is the "inherit llama.cpp's 30+ model architectures"
-option. They share 100% of the core math via the submodule; they serve
-different user stories.
+option. They share 100% of the core math via the submodule; the engine
+subsystems (KV cache manager, GDN state, backend kernels) are ported into
+both repos. They serve different user stories.
 
 ## Status
 
@@ -127,7 +130,7 @@ samples per slot).
 | 7a    | CUDA backend selection + weight offload (`SP_ENGINE_BACKEND=gpu`) | ✓ |
 | 7b    | GPU-resident ship cache (`create_gpu`, `read_gpu`, `write_gpu`) | ✓ |
 | 7c    | GPU-resident sqfree + hier cache (all three paths GPU-resident) | ✓ |
-| 7d    | Vulkan backend selection; release packaging | planned |
+| 7d    | Vulkan backend: dual-GPU validated (RTX 2060 K=0.9920/V=0.9730 + Intel UHD identical fidelity, cross-device 1.0000 correlation) | ✓ |
 | 5b-ii | Disk serialization (`--save-cache` / `--load-cache`, VHT2 v2 binary) | ✓ |
 | 5b-iii| Hot/cold tiered storage (`--cold`, `--cold-mb`, `--evict-keep`) | ✓ |
 | 5b-iv | Scheduler bridge partial offload (`--n-gpu-layers N` end-to-end) | ✓ |
@@ -141,6 +144,7 @@ samples per slot).
 | 9c    | Vendor patches: CUDA K-quant getrows + n_layer-scaled cgraph | ✓ |
 | 10a   | `Engine` library API: `load` / `generate` / `perplexity` wired end-to-end | ✓ |
 | 10b   | CLI `run` verb + per-verb `--n-gpu-layers` partial-offload + `SP_ENGINE_N_GPU_LAYERS` env | ✓ |
+| 11a   | LM Studio integration: full engine compiled into llama.dll via b8733 patch + build script | ✓ |
 
 **Architecture coverage.** Llama-3 family, Qwen 3 / 3.5 dense, Qwen
 3.6-35B-A3B (hybrid SSM+MoE, GGUF arch `qwen35moe`), Phi-3 / 3.1 / 4 (GGUF
