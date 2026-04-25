@@ -337,7 +337,7 @@ std::unique_ptr<KvCache> KvCache::create(int n_layer, int n_head_kv,
 
         // Attempt W sidecar auto-load: <model>.sp_hier_W.bin
         // Pre-computed W matrices eliminate cold-start calibration overhead.
-        // Binary format: [n_slots × skel_dim × pad_dim] fp16 row-major.
+        // Binary format: [n_slots × n_target × n_skeleton] fp16 row-major.
         // The sidecar is keyed by architecture (via model-pack) so one W
         // matrix set covers all models of the same arch.
         const char* env_w = std::getenv("SHANNON_PRIME_HIER_W_PATH");
@@ -345,10 +345,11 @@ std::unique_ptr<KvCache> KvCache::create(int n_layer, int n_head_kv,
             std::FILE* wf = std::fopen(env_w, "rb");
             if (wf) {
                 const auto& hp0 = kv->impl_->hier.predictors[0];
-                const int skel_dim = hp0.skel_dim;
-                const int pad  = kv->impl_->hier.pad_dim;
-                const int n_sl = kv->impl_->hier.n_slots;
-                const size_t expect = (size_t)n_sl * skel_dim * pad * sizeof(uint16_t);
+                const int n_skel = hp0.n_skeleton;
+                const int n_tgt  = hp0.n_target;
+                const int n_sl   = kv->impl_->hier.n_slots;
+                const size_t w_per_slot = (size_t)n_tgt * n_skel;
+                const size_t expect = (size_t)n_sl * w_per_slot * sizeof(uint16_t);
                 std::fseek(wf, 0, SEEK_END);
                 const long fsize = std::ftell(wf);
                 std::fseek(wf, 0, SEEK_SET);
@@ -356,16 +357,17 @@ std::unique_ptr<KvCache> KvCache::create(int n_layer, int n_head_kv,
                     // Read fp16 W matrices into each predictor
                     for (int s = 0; s < n_sl; ++s) {
                         auto& hp = kv->impl_->hier.predictors[s];
-                        if (hp.W_fp16 && hp.skel_dim * pad > 0) {
-                            std::fread(hp.W_fp16, sizeof(uint16_t),
-                                       (size_t)skel_dim * pad, wf);
+                        if (hp.W && w_per_slot > 0) {
+                            std::fread(hp.W, sizeof(uint16_t),
+                                       w_per_slot, wf);
+                            hp.calibrated = true;
                         }
                     }
                     kv->impl_->calibrated = true;
                     std::fprintf(stderr,
                         "[sp-engine] hier W sidecar loaded: %s "
                         "(%d slots, %dx%d fp16)\n",
-                        env_w, n_sl, skel_dim, pad);
+                        env_w, n_sl, n_tgt, n_skel);
                 } else {
                     std::fprintf(stderr,
                         "[sp-engine] hier W sidecar size mismatch "
