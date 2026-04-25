@@ -55,6 +55,50 @@ option(SP_ENGINE_BUILD_TESTS     "Build the engine's own unit tests"    ON)
 option(SP_ENGINE_BUILD_CLI       "Build the sp-engine CLI binary"       ON)
 option(SP_ENGINE_WITH_CUDA       "Enable CUDA backend for KV kernels"   OFF)
 option(SP_ENGINE_WITH_VULKAN     "Enable Vulkan backend for KV kernels" OFF)
+option(SP_ENGINE_FP8             "Enable FP8 (E4M3) KV cache quantization kernels" OFF)
+option(SP_ENGINE_FP4             "Enable FP4 (Blackwell sm_120+) KV cache quantization" OFF)
+option(SP_ENGINE_AUTO_PATCH      "Auto-apply vendor patches before build" ON)
+
+# --------------------------------------------------------------------
+# Auto-apply vendor patches (K-quant getrows, etc.)
+# Applies all *.patch files from patches/ to their respective vendor
+# submodules. Safe to re-run: git apply --check skips already-applied.
+# --------------------------------------------------------------------
+if(SP_ENGINE_AUTO_PATCH AND EXISTS ${CMAKE_SOURCE_DIR}/patches)
+    file(GLOB _SP_PATCHES "${CMAKE_SOURCE_DIR}/patches/*.patch")
+    foreach(_patch ${_SP_PATCHES})
+        get_filename_component(_patch_name ${_patch} NAME)
+        # Check if patch is already applied (dry-run)
+        execute_process(
+            COMMAND git apply --check --reverse ${_patch}
+            WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}/vendor/ggml
+            RESULT_VARIABLE _patch_applied
+            OUTPUT_QUIET ERROR_QUIET)
+        if(_patch_applied EQUAL 0)
+            message(STATUS "Patch already applied: ${_patch_name}")
+        else()
+            # Try to apply
+            execute_process(
+                COMMAND git apply --check ${_patch}
+                WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}/vendor/ggml
+                RESULT_VARIABLE _patch_check
+                OUTPUT_QUIET ERROR_QUIET)
+            if(_patch_check EQUAL 0)
+                execute_process(
+                    COMMAND git apply ${_patch}
+                    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}/vendor/ggml
+                    RESULT_VARIABLE _patch_result)
+                if(_patch_result EQUAL 0)
+                    message(STATUS "Applied patch: ${_patch_name}")
+                else()
+                    message(WARNING "Failed to apply patch: ${_patch_name}")
+                endif()
+            else()
+                message(STATUS "Patch cannot be applied (conflicts?): ${_patch_name}")
+            endif()
+        endif()
+    endforeach()
+endif()
 
 # --------------------------------------------------------------------
 # Core shannon-prime math library (submodule)
@@ -84,12 +128,42 @@ endif()
 if(SP_ENGINE_WITH_CUDA)
     enable_language(CUDA)
     if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-        set(CMAKE_CUDA_ARCHITECTURES 75)
+        # Default: Turing (sm_75). For Ada fp8 tensor cores add 89.
+        # For Blackwell fp4 tensor cores add 120.
+        set(_SP_CUDA_ARCHS "75")
+        if(SP_ENGINE_FP8)
+            # sm_89 = Ada Lovelace (fp8 tensor cores)
+            list(APPEND _SP_CUDA_ARCHS "89")
+        endif()
+        if(SP_ENGINE_FP4)
+            # sm_120 = Blackwell (fp4 tensor cores, requires CUDA >= 12.8)
+            list(APPEND _SP_CUDA_ARCHS "120")
+        endif()
+        set(CMAKE_CUDA_ARCHITECTURES ${_SP_CUDA_ARCHS})
     endif()
-    add_library(shannon_prime_cuda_backend STATIC
+
+    set(_SP_CUDA_SOURCES
         ${SP_CORE_DIR}/backends/cuda/shannon_prime_cuda.cu
         ${SP_CORE_DIR}/backends/cuda/shannon_prime_sqfree.cu
         ${SP_CORE_DIR}/backends/cuda/shannon_prime_hier.cu)
+
+    # FP8 quantization kernels (E4M3 for values, E5M2 for scales)
+    if(SP_ENGINE_FP8)
+        if(EXISTS ${SP_CORE_DIR}/backends/cuda/shannon_prime_fp8.cu)
+            list(APPEND _SP_CUDA_SOURCES
+                ${SP_CORE_DIR}/backends/cuda/shannon_prime_fp8.cu)
+        endif()
+    endif()
+
+    # FP4 quantization kernels (Blackwell MXFP4 micro-scaling)
+    if(SP_ENGINE_FP4)
+        if(EXISTS ${SP_CORE_DIR}/backends/cuda/shannon_prime_fp4.cu)
+            list(APPEND _SP_CUDA_SOURCES
+                ${SP_CORE_DIR}/backends/cuda/shannon_prime_fp4.cu)
+        endif()
+    endif()
+
+    add_library(shannon_prime_cuda_backend STATIC ${_SP_CUDA_SOURCES})
     target_include_directories(shannon_prime_cuda_backend PUBLIC
         ${SP_CORE_DIR}/backends/cuda
         ${SP_CORE_DIR}/core)
@@ -98,6 +172,13 @@ if(SP_ENGINE_WITH_CUDA)
         CUDA_SEPARABLE_COMPILATION ON
         CUDA_RESOLVE_DEVICE_SYMBOLS ON
         POSITION_INDEPENDENT_CODE ON)
+
+    if(SP_ENGINE_FP8)
+        target_compile_definitions(shannon_prime_cuda_backend PUBLIC SP_FP8=1)
+    endif()
+    if(SP_ENGINE_FP4)
+        target_compile_definitions(shannon_prime_cuda_backend PUBLIC SP_FP4=1)
+    endif()
 endif()
 
 # --------------------------------------------------------------------
@@ -134,6 +215,12 @@ target_link_libraries(sp_engine PUBLIC
 if(SP_ENGINE_WITH_CUDA)
     target_link_libraries(sp_engine PUBLIC shannon_prime_cuda_backend)
     target_compile_definitions(sp_engine PUBLIC SP_ENGINE_WITH_CUDA=1)
+    if(SP_ENGINE_FP8)
+        target_compile_definitions(sp_engine PUBLIC SP_FP8=1)
+    endif()
+    if(SP_ENGINE_FP4)
+        target_compile_definitions(sp_engine PUBLIC SP_FP4=1)
+    endif()
     # Host-side C++ sources in sp_engine include cuda_runtime.h (for
     # cudaMalloc, cudaMemcpyAsync, etc.) so they need the CUDA Toolkit
     # headers. Nvcc-compiled .cu files pick these up automatically; the
@@ -172,6 +259,12 @@ message(STATUS "Shannon-Prime Engine ${PROJECT_VERSION}")
 message(STATUS "  build type : ${CMAKE_BUILD_TYPE}")
 message(STATUS "  CUDA       : ${SP_ENGINE_WITH_CUDA}")
 message(STATUS "  Vulkan     : ${SP_ENGINE_WITH_VULKAN}")
+message(STATUS "  FP8 (E4M3) : ${SP_ENGINE_FP8}")
+message(STATUS "  FP4 (BW)   : ${SP_ENGINE_FP4}")
+message(STATUS "  auto-patch : ${SP_ENGINE_AUTO_PATCH}")
 message(STATUS "  CLI        : ${SP_ENGINE_BUILD_CLI}")
 message(STATUS "  tests      : ${SP_ENGINE_BUILD_TESTS}")
+if(SP_ENGINE_WITH_CUDA)
+    message(STATUS "  CUDA archs : ${CMAKE_CUDA_ARCHITECTURES}")
+endif()
 message(STATUS "")
