@@ -152,22 +152,9 @@ struct ForwardContext::Impl {
 
     // Unified alloc + compute path: routes through the scheduler when
     // partial offload is active, falls back to single-backend otherwise.
-    // pin_tensors: tensors to pin to the GPU backend AFTER reset (which
-    //              clears all tensor-backend IDs) but BEFORE alloc.
-    bool alloc_graph(ggml_cgraph* graph,
-                     const std::vector<ggml_tensor*>& pin_tensors = {}) {
+    bool alloc_graph(ggml_cgraph* graph) {
         if (backend_sched) {
             ggml_backend_sched_reset(backend_sched);
-            // Pin tensors to the GPU backend. Must happen AFTER reset
-            // (which memsets all IDs to -1) and BEFORE alloc (which reads
-            // them). Without this, externally-created input tensors
-            // (like cache past_K/V) have buffer_id=-1 and alloc asserts.
-            if (backend && !pin_tensors.empty()) {
-                for (auto* t : pin_tensors) {
-                    if (t) ggml_backend_sched_set_tensor_backend(
-                               backend_sched, t, backend);
-                }
-            }
             return ggml_backend_sched_alloc_graph(backend_sched, graph);
         }
         return ggml_gallocr_alloc_graph(allocr, graph);
@@ -2256,20 +2243,28 @@ bool ForwardContext::decode(int32_t token_id,
         ggml_build_forward_expand(graph, cpy_K[(size_t)L]);
         ggml_build_forward_expand(graph, cpy_V[(size_t)L]);
     }
-    // Collect tensors to pin to the GPU backend. These are all input/output
-    // tensors created with ggml_new_tensor_* that have no ->buffer set.
-    // The scheduler needs to know their backend to allocate them; without
-    // pinning, alloc_graph hits GGML_ASSERT(buffer_id >= 0).
-    std::vector<ggml_tensor*> pin_to_gpu;
-    if (impl_->backend_sched) {
-        pin_to_gpu = {ids, pos, mask, new_K_big, new_V_big};
+    // When the multi-backend scheduler is active, explicitly assign large
+    // input/output tensors to the GPU backend. Without this the scheduler
+    // can't determine which backend buffer owns them (their ->buffer is
+    // still NULL at this point) and ggml_gallocr_allocate_node aborts
+    // with GGML_ASSERT(buffer_id >= 0).
+    if (impl_->backend_sched && impl_->backend) {
+        auto assign = [&](ggml_tensor* t) {
+            if (t) ggml_backend_sched_set_tensor_backend(
+                       impl_->backend_sched, t, impl_->backend);
+        };
+        assign(ids);
+        assign(pos);
         if (freq_factors && freq_factors != impl_->model_rope_freqs)
-            pin_to_gpu.push_back(freq_factors);
-        if (mask_swa) pin_to_gpu.push_back(mask_swa);
-        if (past_K_big) pin_to_gpu.push_back(past_K_big);
-        if (past_V_big) pin_to_gpu.push_back(past_V_big);
+            assign(freq_factors);
+        assign(mask);
+        if (mask_swa) assign(mask_swa);
+        if (past_K_big) assign(past_K_big);
+        if (past_V_big) assign(past_V_big);
+        assign(new_K_big);
+        assign(new_V_big);
     }
-    if (!impl_->alloc_graph(graph, pin_to_gpu)) {
+    if (!impl_->alloc_graph(graph)) {
         std::fprintf(stderr, "[sp-engine] decode: gallocr failed (past_n=%d)\n", past_n);
         ggml_free(gctx); return false;
     }
