@@ -2243,6 +2243,27 @@ bool ForwardContext::decode(int32_t token_id,
         ggml_build_forward_expand(graph, cpy_K[(size_t)L]);
         ggml_build_forward_expand(graph, cpy_V[(size_t)L]);
     }
+    // When the multi-backend scheduler is active, explicitly assign large
+    // input/output tensors to the GPU backend. Without this the scheduler
+    // can't determine which backend buffer owns them (their ->buffer is
+    // still NULL at this point) and ggml_gallocr_allocate_node aborts
+    // with GGML_ASSERT(buffer_id >= 0).
+    if (impl_->backend_sched && impl_->backend) {
+        auto assign = [&](ggml_tensor* t) {
+            if (t) ggml_backend_sched_set_tensor_backend(
+                       impl_->backend_sched, t, impl_->backend);
+        };
+        assign(ids);
+        assign(pos);
+        if (freq_factors && freq_factors != impl_->model_rope_freqs)
+            assign(freq_factors);
+        assign(mask);
+        if (mask_swa) assign(mask_swa);
+        if (past_K_big) assign(past_K_big);
+        if (past_V_big) assign(past_V_big);
+        assign(new_K_big);
+        assign(new_V_big);
+    }
     if (!impl_->alloc_graph(graph)) {
         std::fprintf(stderr, "[sp-engine] decode: gallocr failed (past_n=%d)\n", past_n);
         ggml_free(gctx); return false;
