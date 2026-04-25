@@ -36,10 +36,10 @@ class Model;
 
 // Narrow view of the positional-encoding knobs. Kept as a tiny struct
 // so ForwardContext::create stays call-site-light (most callers pass
-// the default = Standard RoPE, no ALiBi).
+// the default = PrimePe lattice-aligned RoPE, α=0.17).
 struct PeSettings {
-    Config::PeMode pe_mode  = Config::PeMode::Standard;
-    float          pe_alpha = 0.0f;
+    Config::PeMode pe_mode  = Config::PeMode::PrimePe;
+    float          pe_alpha = 0.17f;
     int            pe_tier  = 0;
 };
 
