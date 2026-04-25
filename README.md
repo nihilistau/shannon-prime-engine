@@ -14,15 +14,26 @@ This repo is a sibling of:
   canonical core math library. Vendored here as a git submodule at
   `lib/shannon-prime/`.
 - [shannon-prime-llama](https://github.com/nihilistau/shannon-prime-llama)
-  — full engine integration into llama.cpp. The b8733 patch compiles the
-  entire SP stack into llama.dll/libllama.so. Includes an LM Studio runtime
-  builder. Validated: Qwen3.6-35B-A3B MoE at 26.92 tok/sec in LM Studio.
+  — full engine integration into llama.cpp. The b8861 patch (LM Studio
+  v2.14.0) compiles the entire SP stack into llama.dll/libllama.so. Includes
+  an LM Studio runtime builder. Validated: Qwen3.6-35B-A3B MoE at 26.92
+  tok/sec in LM Studio.
+- [shannon-prime-comfyui](https://github.com/nihilistau/shannon-prime-comfyui)
+  — 16 ComfyUI custom nodes for video (Wan 2.x), image (Flux), audio
+  (Stable Audio), and TTS (Voxtral 4B). Block-skip caching for diffusion
+  models, VHT2 KV compression for autoregressive models.
+
+**Voxtral TTS forks** with integrated Shannon-Prime VHT2 KV compression:
+[ComfyUI-FL-VoxtralTTS](https://github.com/nihilistau/ComfyUI-FL-VoxtralTTS) (Python),
+[voxtral-mini-realtime-rs](https://github.com/nihilistau/voxtral-mini-realtime-rs) (Rust),
+[voxtral-tts.c](https://github.com/nihilistau/voxtral-tts.c) (C).
 
 **Option relationship:** this engine is the "own the data path" option.
 shannon-prime-llama is the "inherit llama.cpp's 30+ model architectures"
 option. They share 100% of the core math via the submodule; the engine
 subsystems (KV cache manager, GDN state, backend kernels) are ported into
-both repos. They serve different user stories.
+both repos. They serve different user stories. The ComfyUI integration
+extends the same VHT2 math to generative media (video, image, audio).
 
 ## Status
 
