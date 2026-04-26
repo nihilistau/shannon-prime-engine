@@ -52,11 +52,11 @@ inline constexpr int N_GPU_LAYERS_ALL = 9999;
 class Model;
 
 enum class LlamaLayerKind : int {
-    STANDARD     = 0,   // attn (Wq/Wk/Wv/Wo) + dense FFN (gate/up/down). All non-qwen35moe archs.
-    MOE_ATTN     = 1,   // qwen35moe full-attention layers: standard Q/K/V/O + multi-section RoPE,
-                        //                                   MoE FFN instead of dense.
-    MOE_GDN      = 2,   // qwen35moe gated-deltanet layers: ssm_* + attn_qkv/attn_gate input projs,
-                        //                                   MoE FFN instead of dense.
+    STANDARD     = 0,   // attn (Wq/Wk/Wv/Wo) + dense FFN (gate/up/down). All non-hybrid archs.
+    MOE_ATTN     = 1,   // hybrid full-attention layers (qwen35moe/qwen35): Q/K/V/O + mRoPE,
+                        //   MoE FFN (qwen35moe) or dense FFN (qwen35).
+    MOE_GDN      = 2,   // hybrid gated-deltanet layers: ssm_* + attn_qkv/attn_gate,
+                        //   MoE FFN (qwen35moe) or dense FFN (qwen35).
 };
 
 struct LlamaLayer {

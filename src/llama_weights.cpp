@@ -66,7 +66,7 @@ ggml_context* LlamaWeights::ctx() const { return impl_->ctx; }
 static bool supported_arch(const std::string& a) {
     static const std::unordered_set<std::string> ok = {
         "llama", "qwen2", "qwen3", "mistral3", "phi3", "granite", "gemma3",
-        "qwen35moe"
+        "qwen35moe", "qwen35"
     };
     return ok.count(a) != 0;
 }
@@ -124,17 +124,18 @@ bool LlamaWeights::bind_tensors_(LlamaWeights& w, ggml_context* tctx,
         return std::string(buf);
     };
 
-    // Arch-specific dispatch. qwen35moe has two layer types within the
-    // same model, both of which replace the dense FFN with an MoE bank;
-    // phi3 has STANDARD layers but with fused QKV + packed SwiGLU FFN;
-    // other archs are uniform classic standard layers.
+    // Arch-specific dispatch. qwen35moe and qwen35 are hybrid archs
+    // with two layer types (GDN + attention); qwen35moe uses MoE FFN,
+    // qwen35 uses dense FFN. phi3 has STANDARD layers with fused QKV +
+    // packed SwiGLU FFN; other archs are uniform classic standard layers.
     const std::string& arch = model.architecture();
-    const bool is_qwen_moe  = (arch == "qwen35moe");
-    const bool is_phi3      = (arch == "phi3");
+    const bool is_hybrid_gdn = (arch == "qwen35moe" || arch == "qwen35");
+    const bool is_moe        = (arch == "qwen35moe");
+    const bool is_phi3       = (arch == "phi3");
     int full_attn_interval = 1;
-    if (is_qwen_moe) {
+    if (is_hybrid_gdn) {
         full_attn_interval =
-            (int)model.get_i64("qwen35moe.full_attention_interval", 4);
+            (int)model.get_i64(arch + ".full_attention_interval", 4);
     }
 
     for (int i = 0; i < n_layer; ++i) {
@@ -143,7 +144,7 @@ bool LlamaWeights::bind_tensors_(LlamaWeights& w, ggml_context* tctx,
         // Pre-norm is always present.
         L.attn_norm = bind_req(layer_name(i, "attn_norm.weight"));
 
-        if (is_qwen_moe) {
+        if (is_hybrid_gdn) {
             const bool attn_layer = is_qwen_moe_attn_layer(i, full_attn_interval);
             L.kind = attn_layer ? LlamaLayerKind::MOE_ATTN : LlamaLayerKind::MOE_GDN;
 
@@ -173,18 +174,26 @@ bool LlamaWeights::bind_tensors_(LlamaWeights& w, ggml_context* tctx,
                 L.ssm_out     = bind_req(layer_name(i, "ssm_out.weight"));
             }
 
-            // MoE FFN (both layer types): router, expert bank, + shared expert.
-            L.ffn_gate_inp       = bind_req(layer_name(i, "ffn_gate_inp.weight"));
-            L.ffn_gate_exps      = bind_req(layer_name(i, "ffn_gate_exps.weight"));
-            L.ffn_up_exps        = bind_req(layer_name(i, "ffn_up_exps.weight"));
-            L.ffn_down_exps      = bind_req(layer_name(i, "ffn_down_exps.weight"));
-            L.ffn_gate_inp_shexp = bind_opt(layer_name(i, "ffn_gate_inp_shexp.weight"));
-            L.ffn_gate_shexp     = bind_opt(layer_name(i, "ffn_gate_shexp.weight"));
-            L.ffn_up_shexp       = bind_opt(layer_name(i, "ffn_up_shexp.weight"));
-            L.ffn_down_shexp     = bind_opt(layer_name(i, "ffn_down_shexp.weight"));
+            if (is_moe) {
+                // MoE FFN (both layer types): router, expert bank, + shared expert.
+                L.ffn_gate_inp       = bind_req(layer_name(i, "ffn_gate_inp.weight"));
+                L.ffn_gate_exps      = bind_req(layer_name(i, "ffn_gate_exps.weight"));
+                L.ffn_up_exps        = bind_req(layer_name(i, "ffn_up_exps.weight"));
+                L.ffn_down_exps      = bind_req(layer_name(i, "ffn_down_exps.weight"));
+                L.ffn_gate_inp_shexp = bind_opt(layer_name(i, "ffn_gate_inp_shexp.weight"));
+                L.ffn_gate_shexp     = bind_opt(layer_name(i, "ffn_gate_shexp.weight"));
+                L.ffn_up_shexp       = bind_opt(layer_name(i, "ffn_up_shexp.weight"));
+                L.ffn_down_shexp     = bind_opt(layer_name(i, "ffn_down_shexp.weight"));
+            } else {
+                // Dense FFN (qwen35 non-MoE): standard SwiGLU gate/up/down.
+                L.ffn_gate = bind_req(layer_name(i, "ffn_gate.weight"));
+                L.ffn_up   = bind_req(layer_name(i, "ffn_up.weight"));
+                L.ffn_down = bind_req(layer_name(i, "ffn_down.weight"));
+                L.ffn_norm = bind_opt(layer_name(i, "ffn_norm.weight"));
+            }
 
-            // post_attention_norm is present in qwen35moe too (ties the
-            // hidden state through a second RMSNorm before the MoE FFN).
+            // post_attention_norm is present in hybrid archs (ties the
+            // hidden state through a second RMSNorm before the FFN).
             L.attn_post_norm = bind_opt(layer_name(i, "post_attention_norm.weight"));
 
             if (!L.attn_norm
@@ -192,11 +201,12 @@ bool LlamaWeights::bind_tensors_(LlamaWeights& w, ggml_context* tctx,
                 || (!attn_layer && (!L.gdn_qkv || !L.gdn_gate || !L.ssm_conv1d
                                     || !L.ssm_a || !L.ssm_alpha || !L.ssm_beta
                                     || !L.ssm_dt || !L.ssm_norm || !L.ssm_out))
-                || !L.ffn_gate_inp || !L.ffn_gate_exps || !L.ffn_up_exps
-                || !L.ffn_down_exps) {
+                || (is_moe && (!L.ffn_gate_inp || !L.ffn_gate_exps
+                               || !L.ffn_up_exps || !L.ffn_down_exps))
+                || (!is_moe && (!L.ffn_gate || !L.ffn_up || !L.ffn_down))) {
                 std::fprintf(stderr,
-                    "[sp-engine] LlamaWeights: qwen35moe layer %d (%s) missing required tensor(s)\n",
-                    i, attn_layer ? "attn" : "gdn");
+                    "[sp-engine] LlamaWeights: %s layer %d (%s) missing required tensor(s)\n",
+                    arch.c_str(), i, attn_layer ? "attn" : "gdn");
                 return false;
             }
             continue;

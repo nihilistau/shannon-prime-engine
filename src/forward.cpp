@@ -98,23 +98,19 @@ struct ForwardContext::Impl {
     KvCache* cache  = nullptr;
     int      kv_pos = 0;
 
-    // Hybrid-arch companion (qwen35moe): bound GdnStateCache for the
-    // recurrent state of GDN layers. Non-owning; null for pure-attention
-    // archs. Phase 3 reads/writes this alongside `cache` inside the
-    // forward builder, dispatched on LlamaLayer::kind.
+    // Hybrid-arch companion (qwen35moe / qwen35): bound GdnStateCache
+    // for the recurrent state of GDN layers. Non-owning; null for
+    // pure-attention archs.
     class GdnStateCache* gdn_state = nullptr;
 
-    // ---- qwen35moe MoE + mRoPE hparams (zero/empty for other archs) --
-    // When `is_moe` is true, forward_full dispatches per-layer based on
-    // LlamaLayer::kind: standard-attention layers take the MOE_ATTN
-    // path (mRoPE + build_moe_ffn), the rest take the GDN scaffold
-    // (MOE_GDN). `rope_sections` is the 4-entry [t, h, w, extra] split
-    // used by ggml_rope_multi; for a text-only model the caller writes
-    // the same token position into all 4 per-token slots of pos_mrope,
-    // reducing mRoPE to standard RoPE. `rope_mode_mrope` =
-    // GGML_ROPE_TYPE_MROPE (8) for qwen35moe — mRoPE already implies
-    // NeoX-style interleaving internally; ORing in NEOX yields mode=10
-    // which the ggml CPU rope kernel rejects as an unknown type.
+    // ---- Hybrid GDN arch hparams (qwen35moe + qwen35) ----------------
+    // is_hybrid_gdn: true for any arch with GDN + attention layers.
+    // is_moe:        true only when the FFN is MoE (qwen35moe).
+    // When is_hybrid_gdn is true, forward_full dispatches per-layer
+    // based on LlamaLayer::kind: MOE_ATTN layers take the attention +
+    // mRoPE path, MOE_GDN layers take the GDN scaffold. The FFN after
+    // each block is MoE when is_moe=true, dense SwiGLU when false.
+    bool  is_hybrid_gdn       = false;
     bool  is_moe              = false;
     int   rope_sections[GGML_MROPE_SECTIONS] = {0, 0, 0, 0};
     int   rope_mode_mrope     = GGML_ROPE_TYPE_MROPE;
@@ -123,13 +119,13 @@ struct ForwardContext::Impl {
     bool  norm_topk_prob      = false;
     float expert_weights_scale = 1.0f;
 
-    // ---- qwen35moe Gated DeltaNet hparams (MOE_GDN layers) ----------
-    // Mirrors what cli/main.cpp's smoke test reads from the GGUF.
-    //   conv_kernel    = qwen35moe.ssm.conv_kernel      (4)
-    //   d_state        = qwen35moe.ssm.state_size       (128) — per-head Q/K dim
-    //   n_group        = qwen35moe.ssm.group_count      (16)  — num Q/K heads
-    //   num_v_heads    = qwen35moe.ssm.time_step_rank   (32)
-    //   d_inner        = qwen35moe.ssm.inner_size       (4096) — V output width
+    // ---- Gated DeltaNet hparams (MOE_GDN layers) ----------------------
+    // Read from <arch>.ssm.* keys — works for both qwen35moe and qwen35.
+    //   conv_kernel    = <arch>.ssm.conv_kernel      (4)
+    //   d_state        = <arch>.ssm.state_size       (128) — per-head Q/K dim
+    //   n_group        = <arch>.ssm.group_count      (16)  — num Q/K heads
+    //   num_v_heads    = <arch>.ssm.time_step_rank   (32)
+    //   d_inner        = <arch>.ssm.inner_size       (4096) — V output width
     //   head_v_dim     = d_inner / num_v_heads          (128)
     //   conv_channels  = d_inner + 2 * n_group * d_state (8192)
     //   head_qk_dim    = d_state                         (128)
@@ -295,18 +291,23 @@ std::unique_ptr<ForwardContext> ForwardContext::create(const Model& model,
         fc->impl_->ffn_gelu = (a == "gemma" || a == "gemma2" || a == "gemma3");
     }
 
-    // qwen35moe MoE + mRoPE hparams. These stay zero/default for any
-    // arch that isn't qwen35moe, and `is_moe` gates the dispatch.
-    if (model.architecture() == "qwen35moe") {
-        fc->impl_->is_moe             = true;
-        fc->impl_->n_expert           = (int)model.get_i64("qwen35moe.expert_count", 0);
-        fc->impl_->n_expert_used      = (int)model.get_i64("qwen35moe.expert_used_count", 0);
-        fc->impl_->norm_topk_prob     =      model.get_i64("qwen35moe.expert_gating_func.norm_topk_prob",
-                                                           model.get_i64("qwen35moe.norm_topk_prob", 0)) != 0;
-        // expert_weights_scale: default 1.0 if key missing. Qwen families
-        // typically ship 1.0; DeepSeek-style archs scale by a global.
-        fc->impl_->expert_weights_scale = (float)model.get_f64(
-            "qwen35moe.expert_weights_scale", 1.0);
+    // Hybrid GDN arch setup (qwen35moe + qwen35). These stay zero/default
+    // for any arch that isn't a hybrid, and `is_hybrid_gdn` gates dispatch.
+    // Hybrid GDN arch setup: qwen35moe (MoE FFN) and qwen35 (dense FFN).
+    const std::string& arch = model.architecture();
+    const bool is_hybrid = (arch == "qwen35moe" || arch == "qwen35");
+    if (is_hybrid) {
+        fc->impl_->is_hybrid_gdn      = true;
+        fc->impl_->is_moe             = (arch == "qwen35moe");
+
+        if (fc->impl_->is_moe) {
+            fc->impl_->n_expert           = (int)model.get_i64(arch + ".expert_count", 0);
+            fc->impl_->n_expert_used      = (int)model.get_i64(arch + ".expert_used_count", 0);
+            fc->impl_->norm_topk_prob     =      model.get_i64(arch + ".expert_gating_func.norm_topk_prob",
+                                                               model.get_i64(arch + ".norm_topk_prob", 0)) != 0;
+            fc->impl_->expert_weights_scale = (float)model.get_f64(
+                arch + ".expert_weights_scale", 1.0);
+        }
 
         // mRoPE rotation layout: GGML_ROPE_TYPE_MROPE (=8) is a standalone
         // rope-type value, not a bitmask — the CPU kernel switches on it
@@ -321,7 +322,7 @@ std::unique_ptr<ForwardContext> ForwardContext::create(const Model& model,
         // load-bearing only when/if image tokens enter. Still, ggml
         // requires sum(sections) == n_rot/2; fall back to a single
         // full-width section if the GGUF key is missing.
-        std::vector<int32_t> secs = model.get_i32_array("qwen35moe.rope.dimension_sections");
+        std::vector<int32_t> secs = model.get_i32_array(arch + ".rope.dimension_sections");
         for (int i = 0; i < GGML_MROPE_SECTIONS; ++i) fc->impl_->rope_sections[i] = 0;
         if ((int)secs.size() == GGML_MROPE_SECTIONS) {
             for (int i = 0; i < GGML_MROPE_SECTIONS; ++i) {
@@ -333,15 +334,12 @@ std::unique_ptr<ForwardContext> ForwardContext::create(const Model& model,
             fc->impl_->rope_sections[0] = fc->impl_->n_rot / 2;
         }
 
-        // GDN (linear-attention) hparams for MOE_GDN layers. The same
-        // numbers also feed cli/main.cpp's GdnStateCache sizing — we
-        // re-read them here so forward_full doesn't need to reach into
-        // the cache object to build the compute graph.
-        const int conv_kernel   = (int)model.get_i64("qwen35moe.ssm.conv_kernel",    4);
-        const int d_state       = (int)model.get_i64("qwen35moe.ssm.state_size",     128);
-        const int n_group       = (int)model.get_i64("qwen35moe.ssm.group_count",    16);
-        const int num_v_heads   = (int)model.get_i64("qwen35moe.ssm.time_step_rank", 32);
-        const int d_inner       = (int)model.get_i64("qwen35moe.ssm.inner_size",     4096);
+        // GDN (linear-attention) hparams for MOE_GDN layers.
+        const int conv_kernel   = (int)model.get_i64(arch + ".ssm.conv_kernel",    4);
+        const int d_state       = (int)model.get_i64(arch + ".ssm.state_size",     128);
+        const int n_group       = (int)model.get_i64(arch + ".ssm.group_count",    16);
+        const int num_v_heads   = (int)model.get_i64(arch + ".ssm.time_step_rank", 32);
+        const int d_inner       = (int)model.get_i64(arch + ".ssm.inner_size",     4096);
         fc->impl_->gdn_conv_kernel   = conv_kernel;
         fc->impl_->gdn_conv_channels = d_inner + 2 * n_group * d_state;
         fc->impl_->gdn_num_v_heads   = num_v_heads;
@@ -973,6 +971,7 @@ static ggml_tensor* build_block_moe_attn(ggml_context* gctx,
                                           int   n_expert_used,
                                           bool  norm_topk_prob,
                                           float expert_weights_scale, float attn_logit_softcap,
+                                          bool  is_moe = true,
                                           ggml_tensor** k_capture = nullptr,
                                           ggml_tensor** v_capture = nullptr) {
     // Qwen3-Next gated attention.
@@ -998,32 +997,47 @@ static ggml_tensor* build_block_moe_attn(ggml_context* gctx,
     const size_t ele_q = ggml_type_size(GGML_TYPE_F32);         // Q/K/V are f32 after mul_mat
 
     // --- Attention -------------------------------------------------
+    // Detect whether this arch uses gated attention (wq is 2× wider than
+    // n_head*head_dim) or standard attention (wq is exactly n_head*head_dim).
+    // Qwen3.6-35B-A3B (qwen35moe) uses gated Q; Qwen3.5-4B (qwen35) may not.
+    const bool gated_q = (L.wq->ne[1] == 2 * (int64_t)n_head * head_dim);
+
     ggml_tensor* xa = ggml_rms_norm(gctx, x, rms_eps);
     xa = ggml_mul(gctx, xa, L.attn_norm);
 
-    ggml_tensor* Q_full = ggml_mul_mat(gctx, L.wq, xa);   // [2*head_dim*n_head, n]
+    ggml_tensor* Q_full = ggml_mul_mat(gctx, L.wq, xa);   // [wq_dim, n]
     if (L.bq) Q_full = ggml_add(gctx, Q_full, L.bq);
     ggml_tensor* K = ggml_mul_mat(gctx, L.wk, xa);
     if (L.bk) K = ggml_add(gctx, K, L.bk);
     ggml_tensor* V = ggml_mul_mat(gctx, L.wv, xa);
     if (L.bv) V = ggml_add(gctx, V, L.bv);
 
-    // Reshape Q_full to [2*head_dim, n_head, n], then split the
-    // innermost axis into the Q half (offset 0) and the gate half
-    // (offset head_dim). The views are non-contiguous along dim 0 so
-    // we cont() them before further ops; rms_norm and rope_multi both
-    // require contiguous input along the rotated axis.
-    Q_full = ggml_reshape_3d(gctx, Q_full, 2 * head_dim, n_head, n);
-    ggml_tensor* Q = ggml_view_3d(gctx, Q_full,
-                                  head_dim, n_head, n,
-                                  Q_full->nb[1], Q_full->nb[2],
-                                  0);
-    ggml_tensor* Gate = ggml_view_3d(gctx, Q_full,
-                                     head_dim, n_head, n,
-                                     Q_full->nb[1], Q_full->nb[2],
-                                     (size_t)head_dim * ele_q);
-    Q    = ggml_cont(gctx, Q);
-    Gate = ggml_cont(gctx, Gate);
+    // --- Q split: gated vs standard ---
+    // Qwen3-Next 35B (qwen35moe) uses gated attention: wq is 2× wider
+    // and the upper half is a sigmoid gate that modulates the attention
+    // output. Smaller variants like qwen35 may use standard GQA where
+    // wq is exactly n_head * head_dim wide with no gate.
+    ggml_tensor* Q    = nullptr;
+    ggml_tensor* Gate = nullptr;
+
+    if (gated_q) {
+        // Gated path: reshape to [2*head_dim, n_head, n], split into
+        // Q half (offset 0) and gate half (offset head_dim).
+        Q_full = ggml_reshape_3d(gctx, Q_full, 2 * head_dim, n_head, n);
+        Q = ggml_view_3d(gctx, Q_full,
+                         head_dim, n_head, n,
+                         Q_full->nb[1], Q_full->nb[2],
+                         0);
+        Gate = ggml_view_3d(gctx, Q_full,
+                            head_dim, n_head, n,
+                            Q_full->nb[1], Q_full->nb[2],
+                            (size_t)head_dim * ele_q);
+        Q    = ggml_cont(gctx, Q);
+        Gate = ggml_cont(gctx, Gate);
+    } else {
+        // Standard GQA: Q is n_head * head_dim wide, no gate.
+        Q = ggml_reshape_3d(gctx, Q_full, head_dim, n_head, n);
+    }
 
     K = ggml_reshape_3d(gctx, K, head_dim, n_head_kv, n);
     V = ggml_reshape_3d(gctx, V, head_dim, n_head_kv, n);
@@ -1064,10 +1078,13 @@ static ggml_tensor* build_block_moe_attn(ggml_context* gctx,
                                             1.0f / sqrtf((float)head_dim),
                                             0.0f, attn_logit_softcap);
     ggml_flash_attn_ext_set_prec(attn, GGML_PREC_F32);
-    // attn comes back as [head_dim, n_head, n]. Apply the sigmoid gate
-    // element-wise before the wo projection.
-    ggml_tensor* gate_sig = ggml_sigmoid(gctx, Gate);
-    attn = ggml_mul(gctx, attn, gate_sig);
+    // attn comes back as [head_dim, n_head, n]. If gated Q, apply the
+    // sigmoid gate element-wise before the wo projection; otherwise pass
+    // through unchanged.
+    if (Gate) {
+        ggml_tensor* gate_sig = ggml_sigmoid(gctx, Gate);
+        attn = ggml_mul(gctx, attn, gate_sig);
+    }
     attn = ggml_reshape_2d(gctx, attn, n_embd_q, n);
 
     ggml_tensor* y1 = ggml_mul_mat(gctx, L.wo, attn);
@@ -1075,25 +1092,33 @@ static ggml_tensor* build_block_moe_attn(ggml_context* gctx,
 
     x = ggml_add(gctx, x, y1);
 
-    // --- MoE FFN ---------------------------------------------------
-    // In qwen35moe, `attn_post_norm` is the FFN pre-norm (not a
-    // sandwich norm on y1). If it's absent for some reason, skip the
-    // extra norm and feed the residual straight into the MoE block.
+    // --- FFN (MoE or dense) ------------------------------------------
+    // `attn_post_norm` is the FFN pre-norm (not a sandwich norm on y1).
+    // If it's absent, skip the extra norm and feed the residual straight in.
     ggml_tensor* xb = x;
     if (L.attn_post_norm) {
         xb = ggml_rms_norm(gctx, x, rms_eps);
         xb = ggml_mul(gctx, xb, L.attn_post_norm);
     }
-    ggml_tensor* moe = build_moe_ffn(gctx, xb, L,
-                                      n_expert, n_expert_used,
-                                      norm_topk_prob, expert_weights_scale);
+    ggml_tensor* ffn_out;
+    if (is_moe) {
+        ffn_out = build_moe_ffn(gctx, xb, L,
+                                n_expert, n_expert_used,
+                                norm_topk_prob, expert_weights_scale);
+    } else {
+        // Dense SwiGLU FFN (qwen35 non-MoE hybrid).
+        ggml_tensor* gate = ggml_mul_mat(gctx, L.ffn_gate, xb);
+        ggml_tensor* up   = ggml_mul_mat(gctx, L.ffn_up,   xb);
+        gate = ggml_silu(gctx, gate);
+        ffn_out = ggml_mul_mat(gctx, L.ffn_down, ggml_mul(gctx, gate, up));
+    }
 
-    x = ggml_add(gctx, x, moe);
+    x = ggml_add(gctx, x, ffn_out);
     return x;
 }
 
 // ------------------------------------------------------------------
-// qwen35moe Gated-DeltaNet layer builder (Phase 3c-bis).
+// Hybrid Gated-DeltaNet layer builder (Phase 3c-bis).
 //
 // Implements the real Qwen3-Next linear-attention block against the
 // bound weights:
@@ -1142,7 +1167,8 @@ static ggml_tensor* build_block_gdn(ggml_context* gctx,
                                      int   n_expert,
                                      int   n_expert_used,
                                      bool  norm_topk_prob,
-                                     float expert_weights_scale) {
+                                     float expert_weights_scale,
+                                     bool  is_moe = true) {
     const int qk_dim = num_qk_heads * head_qk_dim;  // 2048
     const int v_dim  = num_v_heads  * head_v_dim;   // 4096
     const size_t ele = ggml_type_size(GGML_TYPE_F32);
@@ -1189,14 +1215,19 @@ static ggml_tensor* build_block_gdn(ggml_context* gctx,
 
     // --- Input-dependent gates (g, beta) --------------------------
     // dt = softplus(ssm_alpha @ xa + ssm_dt_bias)     [num_v_heads, n]
-    // g  = -exp(ssm_a) * dt                           [num_v_heads, n]
+    // g  = ssm_a * dt                                 [num_v_heads, n]
     // beta = sigmoid(ssm_beta @ xa)                   [num_v_heads, n]
+    //
+    // ssm_a is stored in the GGUF as -exp(A_log) — the conversion from
+    // HuggingFace to GGUF applies the negation and exp in
+    // convert_hf_to_gguf.py. So ssm_a is already negative, and we
+    // multiply it directly with softplus(alpha + dt_bias) to get a
+    // negative gate (→ exp(g) < 1 → decay). Do NOT exponentiate again.
     ggml_tensor* alpha_raw = ggml_mul_mat(gctx, L.ssm_alpha, xa);   // [num_v_heads, n]
     ggml_tensor* dt_raw    = ggml_add(gctx, alpha_raw, L.ssm_dt);   // broadcast [num_v_heads]
     ggml_tensor* dt_sp     = ggml_softplus(gctx, dt_raw);
 
-    ggml_tensor* neg_exp_a = ggml_scale(gctx, ggml_exp(gctx, L.ssm_a), -1.0f); // [num_v_heads]
-    ggml_tensor* g         = ggml_mul(gctx, dt_sp, neg_exp_a);      // broadcast over n
+    ggml_tensor* g         = ggml_mul(gctx, dt_sp, L.ssm_a);        // broadcast over n
     // Reshape to 4D [1, num_v_heads, n, 1] — non-KDA mode (scalar g per head).
     g = ggml_reshape_4d(gctx, g, 1, num_v_heads, n, 1);
 
@@ -1260,17 +1291,32 @@ static ggml_tensor* build_block_gdn(ggml_context* gctx,
 
     x = ggml_add(gctx, x, y1);
 
-    // --- MoE FFN (identical to build_block_moe_attn) -------------
+    // --- FFN (MoE or dense, same as build_block_moe_attn) ----------
     ggml_tensor* xb = x;
     if (L.attn_post_norm) {
         xb = ggml_rms_norm(gctx, x, rms_eps);
         xb = ggml_mul(gctx, xb, L.attn_post_norm);
     }
-    ggml_tensor* moe = build_moe_ffn(gctx, xb, L,
-                                      n_expert, n_expert_used,
-                                      norm_topk_prob, expert_weights_scale);
+    ggml_tensor* ffn_out;
+    if (is_moe) {
+        ffn_out = build_moe_ffn(gctx, xb, L,
+                                n_expert, n_expert_used,
+                                norm_topk_prob, expert_weights_scale);
+    } else {
+        // Dense SwiGLU FFN (qwen35 non-MoE hybrid).
+        // For GDN layers the pre-norm is attn_post_norm (already applied
+        // above) or ffn_norm if present. If neither, xb == x (no norm).
+        if (!L.attn_post_norm && L.ffn_norm) {
+            xb = ggml_rms_norm(gctx, x, rms_eps);
+            xb = ggml_mul(gctx, xb, L.ffn_norm);
+        }
+        ggml_tensor* gate = ggml_mul_mat(gctx, L.ffn_gate, xb);
+        ggml_tensor* up   = ggml_mul_mat(gctx, L.ffn_up,   xb);
+        gate = ggml_silu(gctx, gate);
+        ffn_out = ggml_mul_mat(gctx, L.ffn_down, ggml_mul(gctx, gate, up));
+    }
 
-    x = ggml_add(gctx, x, moe);
+    x = ggml_add(gctx, x, ffn_out);
     return x;
 }
 
@@ -1422,13 +1468,13 @@ bool ForwardContext::forward_full(const std::vector<int32_t>& token_ids,
     // write the same token position into all four per-token slots, so
     // mRoPE collapses to standard RoPE.
     ggml_tensor* pos_mrope = nullptr;
-    if (impl_->is_moe) {
+    if (impl_->is_hybrid_gdn) {
         pos_mrope = ggml_new_tensor_1d(gctx, GGML_TYPE_I32,
                                        (int64_t)(GGML_MROPE_SECTIONS * n));
         ggml_set_input(pos_mrope);
     }
 
-    // qwen35moe GDN: per-layer recurrent state I/O. Each MOE_GDN layer
+    // Hybrid GDN: per-layer recurrent state I/O. Each MOE_GDN layer
     // owns a (conv_state_in, ssm_state_in) pair the graph reads from
     // before its delta-rule step, and a (conv_state_out, ssm_state_out)
     // pair the graph writes its new state to. forward_full round-trips
@@ -1442,7 +1488,7 @@ bool ForwardContext::forward_full(const std::vector<int32_t>& token_ids,
     std::vector<ggml_tensor*> gdn_conv_state_out((size_t)impl_->n_layer, nullptr);
     std::vector<ggml_tensor*> gdn_ssm_state_out ((size_t)impl_->n_layer, nullptr);
     const bool have_gdn_shapes =
-        impl_->is_moe && impl_->gdn_conv_channels > 0 &&
+        impl_->is_hybrid_gdn && impl_->gdn_conv_channels > 0 &&
         impl_->gdn_conv_kernel > 1 && impl_->gdn_head_v_dim > 0 &&
         impl_->gdn_num_v_heads > 0;
     if (have_gdn_shapes) {
@@ -1529,6 +1575,7 @@ bool ForwardContext::forward_full(const std::vector<int32_t>& token_ids,
                                       impl_->rms_norm_eps,
                                       impl_->n_expert, impl_->n_expert_used,
                                       impl_->norm_topk_prob, impl_->expert_weights_scale, impl_->attn_logit_softcapping,
+                                      impl_->is_moe,
                                       capture ? &k_cap : nullptr,
                                       capture ? &v_cap : nullptr);
             break;
@@ -1554,7 +1601,8 @@ bool ForwardContext::forward_full(const std::vector<int32_t>& token_ids,
                                  impl_->gdn_head_qk_dim,
                                  impl_->rms_norm_eps,
                                  impl_->n_expert, impl_->n_expert_used,
-                                 impl_->norm_topk_prob, impl_->expert_weights_scale);
+                                 impl_->norm_topk_prob, impl_->expert_weights_scale,
+                                 impl_->is_moe);
             if (conv_out) { ggml_set_output(conv_out); gdn_conv_state_out[(size_t)i] = conv_out; }
             if (ssm_out)  { ggml_set_output(ssm_out);  gdn_ssm_state_out[(size_t)i]  = ssm_out;  }
             break;
