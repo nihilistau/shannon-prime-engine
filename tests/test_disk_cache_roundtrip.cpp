@@ -273,6 +273,90 @@ int main() {
 #endif
     }
 
+    // --- Property 4: progressive partial load (v3 band-major format) -----
+    // Saved files use the new v3 layout. load_from_disk_partial(max_bands=2)
+    // should reconstruct only bands 0+1, leaving bands 2+3 zeroed in the
+    // cache. read() then produces partial-fidelity vectors that:
+    //   - are NOT byte-equal to ref_K/ref_V (some coefficients are now zero)
+    //   - are NOT all-zero (band 0 / band 1 carried real signal)
+    //   - have non-zero correlation with ref_K/ref_V (energy concentration
+    //     in early bands means partial reconstruction tracks the original)
+    {
+        auto cache = KvCache::create(n_layer, n_head_kv, head_dim, max_seq, cfg);
+        if (!cache) {
+            std::fprintf(stderr, "disk_cache: partial-load KvCache::create() returned null\n");
+            return 1;
+        }
+
+        const int max_bands = 2;   // K is 5/5/4/3 → bands 2 and 3 zeroed
+        const int loaded = cache->load_from_disk_partial(prefix, model_hash, max_bands);
+        if (loaded != n_pos) {
+            std::fprintf(stderr,
+                "disk_cache: load_from_disk_partial returned %d (expected n_pos=%d)\n",
+                loaded, n_pos);
+            return 1;
+        }
+
+        for (int il = 0; il < n_layer; ++il) {
+            std::vector<float> K_partial, V_partial;
+            if (!cache->read(il, n_pos, K_partial, V_partial)) {
+                std::fprintf(stderr, "disk_cache: post-partial-load read() failed at layer %d\n", il);
+                return 1;
+            }
+
+            // Sub-property A: NOT byte-equal to the full-fidelity reference
+            //   (because bands 2-3 were zeroed and inverse-VHT2 mixes them
+            //   into every output position)
+            if (exactly_equal(K_partial, ref_K[il])) {
+                std::fprintf(stderr,
+                    "disk_cache: layer %d K partial-load matched full reference exactly — "
+                    "bands 2-3 didn't get zeroed\n", il);
+                return 1;
+            }
+
+            // Sub-property B: NOT all-zero (bands 0+1 carried real signal)
+            bool any_nonzero = false;
+            for (float v : K_partial) {
+                if (std::fabs(v) > 1e-6f) { any_nonzero = true; break; }
+            }
+            if (!any_nonzero) {
+                std::fprintf(stderr,
+                    "disk_cache: layer %d K partial-load returned all-zero — "
+                    "bands 0+1 didn't reconstruct\n", il);
+                return 1;
+            }
+
+            // Sub-property C: bounded magnitude. Partial reconstruction
+            //   should be in the same order of magnitude as the full
+            //   reference — not exploding or near-zero. We only check
+            //   that the max absolute value is finite and within 4× of
+            //   the reference's max. Tighter quantitative guarantees
+            //   (correlation, energy retention) depend on input signal
+            //   distribution and are out of scope for this scaffold-
+            //   layer test; fidelity validation lives in the calibration
+            //   suite where we control the input distribution.
+            float max_partial = 0.0f, max_ref = 0.0f;
+            for (size_t i = 0; i < K_partial.size(); ++i) {
+                float ap = std::fabs(K_partial[i]);
+                float ar = std::fabs(ref_K[il][i]);
+                if (ap > max_partial) max_partial = ap;
+                if (ar > max_ref)     max_ref     = ar;
+            }
+            if (!std::isfinite(max_partial)) {
+                std::fprintf(stderr,
+                    "disk_cache: layer %d K partial-load contains non-finite values\n", il);
+                return 1;
+            }
+            if (max_ref > 1e-6f && max_partial > 4.0f * max_ref) {
+                std::fprintf(stderr,
+                    "disk_cache: layer %d K partial-load magnitude exploded "
+                    "(max_partial=%.4f vs max_ref=%.4f)\n",
+                    il, max_partial, max_ref);
+                return 1;
+            }
+        }
+    }
+
     // --- Cleanup --------------------------------------------------------
     std::error_code ec;
     fs::remove_all(tmp_dir, ec);

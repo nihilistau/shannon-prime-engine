@@ -1628,6 +1628,35 @@ int KvCache::load_from_disk(const std::string& prefix, uint64_t expected_hash) {
     return rc;
 }
 
+int KvCache::load_from_disk_partial(const std::string& prefix,
+                                     uint64_t expected_hash,
+                                     int max_bands) {
+    // Currently only the shadow (ship) cache has v3 / partial support.
+    // sqfree and hier still use v2 per-vec layout — partial reads on
+    // those routes are deferred to follow-up work. Fall back to a full
+    // load with a one-shot warning.
+    if (impl_->hier_inited || impl_->sq_inited) {
+        std::fprintf(stderr,
+            "[sp-engine] load_from_disk_partial: %s cache uses v2 layout; "
+            "max_bands=%d ignored, falling back to full load\n",
+            impl_->hier_inited ? "hierarchical" : "sqfree", max_bands);
+        return load_from_disk(prefix, expected_hash);
+    }
+    if (!impl_->shadow_inited) {
+        std::fprintf(stderr,
+            "[sp-engine] load_from_disk_partial: no cache initialised\n");
+        return -1;
+    }
+    int rc = sp_shadow_cache_load_partial(&impl_->shadow, prefix.c_str(),
+                                          expected_hash, max_bands);
+    if (rc >= 0) {
+        std::fprintf(stderr,
+            "[sp-engine] cache loaded (partial): shadow n_pos=%d max_bands=%d "
+            "prefix=%s\n", rc, max_bands, prefix.c_str());
+    }
+    return rc;
+}
+
 // ════════════════════════════════════════════════════════════════════
 // DualKvCache — System 1↔2 entropy-gated dual cache
 // ════════════════════════════════════════════════════════════════════
