@@ -15,3 +15,12 @@ add_test(NAME gguf_loader COMMAND test_gguf_loader)
 add_executable(test_disk_cache_roundtrip test_disk_cache_roundtrip.cpp)
 target_link_libraries(test_disk_cache_roundtrip PRIVATE sp_engine)
 add_test(NAME disk_cache_roundtrip COMMAND test_disk_cache_roundtrip)
+
+# Disk-partial-load IO bench. NOT registered with ctest (it's a bench,
+# not a pass/fail test); built so it's available to run manually.
+# Usage: ./build/bin/Release/bench_disk_partial [--runs 5] [--pos 2048]
+# Output: CSV to stdout with bytes_read, wall_ms, bandwidth per config.
+# See tests/bench_disk_partial.cpp for the cold-cache instructions
+# (RAMMap on Windows, drop_caches on Linux).
+add_executable(bench_disk_partial bench_disk_partial.cpp)
+target_link_libraries(bench_disk_partial PRIVATE sp_engine)
