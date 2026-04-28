@@ -4,7 +4,7 @@
 //   * KvCache::save_to_disk(prefix, n_pos, model_hash)
 //   * KvCache::load_from_disk(prefix, expected_hash) -> n_pos
 //
-// Two properties under test:
+// Three properties under test:
 //
 //   1. ROUND-TRIP EXACTNESS. After write -> read -> save -> destroy ->
 //      create -> load -> read, the second read must equal the first
@@ -12,14 +12,16 @@
 //      here — we're testing that disk serialisation preserves the
 //      compressed state. No tolerance.
 //
-//   2. MODEL-HASH GUARD (warn-only behaviour). load_from_disk with a
-//      wrong hash currently logs "[sp-disk] model hash mismatch" but
-//      still returns n_pos. The C-level loader in shannon_prime.c
-//      treats mismatch as a warning ("same as Archimedes"), which
-//      contradicts the API doc in kv_cache.h that says mismatch
-//      returns -1. This test pins down current behaviour so the
-//      divergence is visible. If the C core gets a strict mode (or
-//      switches to hard-fail on mismatch) this test must be updated.
+//   2. MODEL-HASH GUARD (strict by default). load_from_disk with a
+//      wrong hash returns -1 — matches the API doc in kv_cache.h:
+//      143-147. The earlier "warn-only" behaviour was a divergence
+//      that allowed silent corruption when a user loaded a cache
+//      against the wrong model; that's now a hard error.
+//
+//   3. MODEL-HASH GUARD ESCAPE HATCH. With SP_DISK_HASH_STRICT=0 in
+//      the environment, the loader logs the mismatch warning and
+//      returns n_pos anyway, preserving the original Archimedes-style
+//      behaviour for advanced callers who know what they're doing.
 //
 // Reconstruction-fidelity validation (does read() produce values close
 // to write() inputs?) is the calibration suite's job, not this test's.
@@ -36,6 +38,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdint>
+#include <cstdlib>     // setenv / unsetenv / _putenv_s
 #include <cstring>
 #include <filesystem>
 #include <string>
@@ -212,18 +215,10 @@ int main() {
         }
     }
 
-    // --- Property 2: model-hash mismatch path -----------------------------
-    // The C-level loader currently warns and continues. This is a
-    // deliberate design choice ("same as Archimedes") that contradicts the
-    // C++ API doc. Until that's reconciled, the test pins the current
-    // behaviour: load returns n_pos, and stderr will contain the
-    // "[sp-disk] model hash mismatch" line. If either changes (strict
-    // mode added, fail-on-mismatch flipped to default), this test fails
-    // loudly and we revisit the contract.
-    //
-    // FIXME(disk-cache): reconcile API doc vs impl. Either change the doc
-    // to "warn only" or change the impl to return -1 on mismatch and
-    // expose a strict_hash=false override for the warn-only callers.
+    // --- Property 2: model-hash mismatch is rejected (strict default) ----
+    // The C-level loader is strict by default after the API/impl divergence
+    // was resolved — wrong hash returns -1, matching kv_cache.h:143-147.
+    // This blocks silent corruption from a cross-model load.
     {
         auto cache = KvCache::create(n_layer, n_head_kv, head_dim, max_seq, cfg);
         if (!cache) {
@@ -232,13 +227,50 @@ int main() {
         }
         const uint64_t bad_hash = model_hash ^ 0x1ULL;
         const int rc = cache->load_from_disk(prefix, bad_hash);
-        if (rc != n_pos) {
+        if (rc != -1) {
             std::fprintf(stderr,
                 "disk_cache: load_from_disk with wrong hash returned %d "
-                "(expected %d under current warn-only behaviour — see FIXME)\n",
+                "(expected -1 under default strict mode)\n", rc);
+            return 1;
+        }
+    }
+
+    // --- Property 3: SP_DISK_HASH_STRICT=0 escape hatch -------------------
+    // Advanced callers can opt into the original Archimedes-style warn-only
+    // behaviour by setting SP_DISK_HASH_STRICT=0 in the env. The loader
+    // logs the mismatch and proceeds. We test this is still functional so
+    // any future regression in the env-var handling fails loudly here.
+    {
+        // Set the env var BEFORE create+load so the subsequent load
+        // path picks it up.
+#if defined(_WIN32)
+        _putenv_s("SP_DISK_HASH_STRICT", "0");
+#else
+        setenv("SP_DISK_HASH_STRICT", "0", 1);
+#endif
+
+        auto cache = KvCache::create(n_layer, n_head_kv, head_dim, max_seq, cfg);
+        if (!cache) {
+            std::fprintf(stderr, "disk_cache: escape-hatch KvCache::create() returned null\n");
+            return 1;
+        }
+        const uint64_t bad_hash = model_hash ^ 0x1ULL;
+        const int rc = cache->load_from_disk(prefix, bad_hash);
+        if (rc != n_pos) {
+            std::fprintf(stderr,
+                "disk_cache: with SP_DISK_HASH_STRICT=0, load returned %d "
+                "(expected n_pos=%d — escape hatch should warn-only)\n",
                 rc, n_pos);
             return 1;
         }
+
+        // Clear the env var so it doesn't leak to other tests in the same
+        // ctest run.
+#if defined(_WIN32)
+        _putenv_s("SP_DISK_HASH_STRICT", "");
+#else
+        unsetenv("SP_DISK_HASH_STRICT");
+#endif
     }
 
     // --- Cleanup --------------------------------------------------------
