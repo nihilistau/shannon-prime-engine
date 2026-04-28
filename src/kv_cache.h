@@ -146,6 +146,23 @@ public:
     // created with matching dimensions.
     int load_from_disk(const std::string& prefix, uint64_t expected_hash);
 
+    // Progressive partial load: read only the first `max_bands` bands
+    // from the per-band-major v3 disk format. Higher bands are zeroed
+    // in the in-memory cache so subsequent read() calls produce
+    // partial-fidelity reconstruction (band 0 alone gets ~30% corr,
+    // bands 0+1 get ~85%, full reconstruction is ~99% — model-dependent).
+    //
+    // max_bands clamps into [0, n_bands]; INT_MAX = full read.
+    // Requires v3-format files (written by save_to_disk() since
+    // shannon-prime v0.16+); v2 files are read fully and max_bands is
+    // ignored. Currently only supported on the shadow (ship) cache —
+    // sqfree and hier paths still use v2 layout.
+    //
+    // Returns the number of positions loaded, or -1 on error.
+    int load_from_disk_partial(const std::string& prefix,
+                                uint64_t expected_hash,
+                                int max_bands);
+
     // --- diagnostics / introspection ---
     int  n_layer()           const;
     int  n_head_kv()         const;
