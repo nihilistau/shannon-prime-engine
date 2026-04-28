@@ -1,0 +1,252 @@
+// Shannon-Prime Engine — disk cache save/load round-trip smoke test.
+//
+// Validates the compressed-KV disk-tier scaffold (kv_cache.h):
+//   * KvCache::save_to_disk(prefix, n_pos, model_hash)
+//   * KvCache::load_from_disk(prefix, expected_hash) -> n_pos
+//
+// Two properties under test:
+//
+//   1. ROUND-TRIP EXACTNESS. After write -> read -> save -> destroy ->
+//      create -> load -> read, the second read must equal the first
+//      bit-for-bit. The compressor's lossy reconstruction is irrelevant
+//      here — we're testing that disk serialisation preserves the
+//      compressed state. No tolerance.
+//
+//   2. MODEL-HASH GUARD (warn-only behaviour). load_from_disk with a
+//      wrong hash currently logs "[sp-disk] model hash mismatch" but
+//      still returns n_pos. The C-level loader in shannon_prime.c
+//      treats mismatch as a warning ("same as Archimedes"), which
+//      contradicts the API doc in kv_cache.h that says mismatch
+//      returns -1. This test pins down current behaviour so the
+//      divergence is visible. If the C core gets a strict mode (or
+//      switches to hard-fail on mismatch) this test must be updated.
+//
+// Reconstruction-fidelity validation (does read() produce values close
+// to write() inputs?) is the calibration suite's job, not this test's.
+// Without a calibrated banded quantiser, fidelity numbers reflect band
+// mistuning, not the disk path. This smoke test stays scoped to the
+// disk-tier scaffold.
+//
+// CPU-only by design. Disk I/O is host-side regardless of backend, so
+// the round-trip property holds for the GPU path with the same code.
+
+#include "engine.h"
+#include "kv_cache.h"
+
+#include <cmath>
+#include <cstdio>
+#include <cstdint>
+#include <cstring>
+#include <filesystem>
+#include <string>
+#include <vector>
+
+namespace fs = std::filesystem;
+
+// Deterministic K/V test pattern. Each (layer, position, head, dim) gets
+// a unique value derived from a smooth phase function — keeps the input
+// in-distribution for a banded quantiser so reconstruction error is
+// bounded by quantisation noise rather than out-of-band saturation.
+static float test_value(int layer, int pos, int head, int d, int head_dim) {
+    const float phase = 0.013f * static_cast<float>(layer)
+                      + 0.071f * static_cast<float>(pos)
+                      + 0.029f * static_cast<float>(head)
+                      + (2.0f * 3.14159265f / static_cast<float>(head_dim))
+                            * static_cast<float>(d);
+    return 0.4f * std::sin(phase);
+}
+
+static void fill_layer(int layer, int n_head_kv, int head_dim,
+                       int pos_offset, int n_tokens,
+                       std::vector<float>& K, std::vector<float>& V) {
+    K.resize(static_cast<size_t>(n_tokens) * n_head_kv * head_dim);
+    V.resize(K.size());
+    for (int q = 0; q < n_tokens; ++q) {
+        for (int h = 0; h < n_head_kv; ++h) {
+            for (int d = 0; d < head_dim; ++d) {
+                const size_t i = (static_cast<size_t>(q) * n_head_kv + h) * head_dim + d;
+                K[i] = test_value(layer, pos_offset + q, h,         d, head_dim);
+                // V uses a different head offset so save/load swaps would show.
+                V[i] = test_value(layer, pos_offset + q, h + 1000, d, head_dim);
+            }
+        }
+    }
+}
+
+static float max_abs_diff(const std::vector<float>& a, const std::vector<float>& b) {
+    if (a.size() != b.size()) return 1e30f;
+    float m = 0.0f;
+    for (size_t i = 0; i < a.size(); ++i) {
+        const float d = std::fabs(a[i] - b[i]);
+        if (d > m) m = d;
+    }
+    return m;
+}
+
+static bool exactly_equal(const std::vector<float>& a, const std::vector<float>& b) {
+    if (a.size() != b.size()) return false;
+    return std::memcmp(a.data(), b.data(), a.size() * sizeof(float)) == 0;
+}
+
+int main() {
+    using namespace sp::engine;
+
+    // --- Fixture dimensions ------------------------------------------------
+    // Picked so total disk footprint is small (~few KB) and exercises >1
+    // layer + multiple heads + a typical SP-supported head_dim.
+    constexpr int n_layer    = 2;
+    constexpr int n_head_kv  = 4;
+    constexpr int head_dim   = 128;
+    constexpr int max_seq    = 32;
+    constexpr int n_pos      = 16;       // write [0, 16)
+    const     uint64_t model_hash = 0xDEADBEEFCAFEBABEULL;
+
+    Config cfg;
+    cfg.n_ctx        = max_seq;
+    cfg.k_bits_csv   = "5,5,4,3";
+    cfg.v_bits_csv   = "3";
+    cfg.residual_bits = 3;
+    // Ship path: mobius=true (default), sqfree=false, hierarchical=false.
+    // Pure CPU — no backend selection needed for KvCache::create().
+
+    // --- Reference write + read ------------------------------------------
+    // Capture what `read()` produces immediately after writing — this is
+    // what `read()` MUST reproduce after the disk round-trip.
+
+    std::vector<std::vector<float>> ref_K(n_layer);  // [layer][flat]
+    std::vector<std::vector<float>> ref_V(n_layer);
+    std::vector<std::vector<float>> in_K(n_layer);   // for fidelity check
+    std::vector<std::vector<float>> in_V(n_layer);
+
+    {
+        auto cache = KvCache::create(n_layer, n_head_kv, head_dim, max_seq, cfg);
+        if (!cache) {
+            std::fprintf(stderr, "disk_cache: KvCache::create() returned null\n");
+            return 1;
+        }
+
+        for (int il = 0; il < n_layer; ++il) {
+            fill_layer(il, n_head_kv, head_dim, /*pos_offset=*/0, n_pos,
+                       in_K[il], in_V[il]);
+            if (!cache->write(il, /*pos_offset=*/0, n_pos,
+                              in_K[il].data(), in_V[il].data())) {
+                std::fprintf(stderr, "disk_cache: write() failed at layer %d\n", il);
+                return 1;
+            }
+        }
+
+        for (int il = 0; il < n_layer; ++il) {
+            if (!cache->read(il, n_pos, ref_K[il], ref_V[il])) {
+                std::fprintf(stderr, "disk_cache: read() failed at layer %d\n", il);
+                return 1;
+            }
+        }
+
+        // Sanity check: at least some non-trivial output. If the read path
+        // returned all zeros (e.g., a bug zeroed the output buffer), every
+        // round-trip would trivially "pass". Catch that.
+        bool nonzero_seen = false;
+        for (int il = 0; il < n_layer && !nonzero_seen; ++il) {
+            for (float v : ref_K[il]) {
+                if (std::fabs(v) > 1e-6f) { nonzero_seen = true; break; }
+            }
+        }
+        if (!nonzero_seen) {
+            std::fprintf(stderr, "disk_cache: read() produced all-zero output — broken pipeline\n");
+            return 1;
+        }
+
+        // --- Save -------------------------------------------------------
+        // tmp prefix — clean up at the end regardless of pass/fail.
+        const fs::path tmp_dir = fs::temp_directory_path() / "sp_engine_disk_test";
+        fs::create_directories(tmp_dir);
+        const std::string prefix = (tmp_dir / "kv").string();
+
+        const int rc = cache->save_to_disk(prefix, n_pos, model_hash);
+        if (rc != 0) {
+            std::fprintf(stderr, "disk_cache: save_to_disk returned %d\n", rc);
+            return 1;
+        }
+
+        // Cache destroyed here as `cache` goes out of scope.
+    }
+
+    // --- Reload pass: fresh cache, load, read, compare -------------------
+    const fs::path tmp_dir = fs::temp_directory_path() / "sp_engine_disk_test";
+    const std::string prefix = (tmp_dir / "kv").string();
+
+    {
+        auto cache = KvCache::create(n_layer, n_head_kv, head_dim, max_seq, cfg);
+        if (!cache) {
+            std::fprintf(stderr, "disk_cache: post-load KvCache::create() returned null\n");
+            return 1;
+        }
+
+        const int loaded = cache->load_from_disk(prefix, model_hash);
+        if (loaded != n_pos) {
+            std::fprintf(stderr,
+                "disk_cache: load_from_disk returned %d (expected n_pos=%d)\n",
+                loaded, n_pos);
+            return 1;
+        }
+
+        // Property 1: round-trip exactness.
+        for (int il = 0; il < n_layer; ++il) {
+            std::vector<float> K_out, V_out;
+            if (!cache->read(il, n_pos, K_out, V_out)) {
+                std::fprintf(stderr, "disk_cache: post-load read() failed at layer %d\n", il);
+                return 1;
+            }
+            if (!exactly_equal(ref_K[il], K_out)) {
+                std::fprintf(stderr,
+                    "disk_cache: layer %d K round-trip differs (max-abs=%.6e)\n",
+                    il, max_abs_diff(ref_K[il], K_out));
+                return 1;
+            }
+            if (!exactly_equal(ref_V[il], V_out)) {
+                std::fprintf(stderr,
+                    "disk_cache: layer %d V round-trip differs (max-abs=%.6e)\n",
+                    il, max_abs_diff(ref_V[il], V_out));
+                return 1;
+            }
+        }
+    }
+
+    // --- Property 2: model-hash mismatch path -----------------------------
+    // The C-level loader currently warns and continues. This is a
+    // deliberate design choice ("same as Archimedes") that contradicts the
+    // C++ API doc. Until that's reconciled, the test pins the current
+    // behaviour: load returns n_pos, and stderr will contain the
+    // "[sp-disk] model hash mismatch" line. If either changes (strict
+    // mode added, fail-on-mismatch flipped to default), this test fails
+    // loudly and we revisit the contract.
+    //
+    // FIXME(disk-cache): reconcile API doc vs impl. Either change the doc
+    // to "warn only" or change the impl to return -1 on mismatch and
+    // expose a strict_hash=false override for the warn-only callers.
+    {
+        auto cache = KvCache::create(n_layer, n_head_kv, head_dim, max_seq, cfg);
+        if (!cache) {
+            std::fprintf(stderr, "disk_cache: hash-guard KvCache::create() returned null\n");
+            return 1;
+        }
+        const uint64_t bad_hash = model_hash ^ 0x1ULL;
+        const int rc = cache->load_from_disk(prefix, bad_hash);
+        if (rc != n_pos) {
+            std::fprintf(stderr,
+                "disk_cache: load_from_disk with wrong hash returned %d "
+                "(expected %d under current warn-only behaviour — see FIXME)\n",
+                rc, n_pos);
+            return 1;
+        }
+    }
+
+    // --- Cleanup --------------------------------------------------------
+    std::error_code ec;
+    fs::remove_all(tmp_dir, ec);
+    // Best-effort; CI tmp cleanup will sweep the rest.
+
+    std::printf("disk_cache_roundtrip: OK (n_layer=%d, n_head_kv=%d, head_dim=%d, n_pos=%d)\n",
+                n_layer, n_head_kv, head_dim, n_pos);
+    return 0;
+}
