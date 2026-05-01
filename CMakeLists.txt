@@ -55,6 +55,8 @@ option(SP_ENGINE_BUILD_TESTS     "Build the engine's own unit tests"    ON)
 option(SP_ENGINE_BUILD_CLI       "Build the sp-engine CLI binary"       ON)
 option(SP_ENGINE_WITH_CUDA       "Enable CUDA backend for KV kernels"   OFF)
 option(SP_ENGINE_WITH_VULKAN     "Enable Vulkan backend for KV kernels" OFF)
+option(SP_ENGINE_WITH_HEXAGON    "Enable Hexagon DSP backend (cDSP / FastRPC)" ON)
+option(SP_ENGINE_HEXAGON_FASTRPC "Link real Qualcomm FastRPC libs (Android+SDK only)" OFF)
 option(SP_ENGINE_FP8             "Enable FP8 (E4M3) KV cache quantization kernels" OFF)
 option(SP_ENGINE_FP4             "Enable FP4 (Blackwell sm_120+) KV cache quantization" OFF)
 option(SP_ENGINE_AUTO_PATCH      "Auto-apply vendor patches before build" ON)
@@ -182,6 +184,51 @@ if(SP_ENGINE_WITH_CUDA)
 endif()
 
 # --------------------------------------------------------------------
+# Hexagon DSP backend: SP-banded KV cache compress/decompress on cDSP
+#
+# Two-mode build:
+#   - Stub mode  (SP_ENGINE_HEXAGON_FASTRPC=OFF):
+#       Compiles shannon_prime_hexagon.c WITHOUT defining SP_HEXAGON_FASTRPC.
+#       Every entry point returns -1/NULL with a one-shot diagnostic.
+#       Forward dispatch falls through to ggml CPU naturally. No SDK needed.
+#   - Real FastRPC (SP_ENGINE_HEXAGON_FASTRPC=ON):
+#       Defines SP_HEXAGON_FASTRPC + adds qaic-generated stubs + links
+#       libcdsprpc.so. Android arm64 only. Requires Qualcomm Hexagon SDK 5.x.
+#       Wired separately when SDK is available — not in this stub-mode
+#       configuration.
+# --------------------------------------------------------------------
+if(SP_ENGINE_WITH_HEXAGON)
+    set(_SP_HEXAGON_SOURCES
+        ${SP_CORE_DIR}/backends/hexagon/shannon_prime_hexagon.c)
+    add_library(shannon_prime_hexagon_backend STATIC ${_SP_HEXAGON_SOURCES})
+    target_include_directories(shannon_prime_hexagon_backend PUBLIC
+        ${SP_CORE_DIR}/backends/hexagon
+        ${SP_CORE_DIR}/core)
+    target_link_libraries(shannon_prime_hexagon_backend PUBLIC shannon_prime_core)
+    target_compile_features(shannon_prime_hexagon_backend PUBLIC c_std_11)
+    set_property(TARGET shannon_prime_hexagon_backend PROPERTY POSITION_INDEPENDENT_CODE ON)
+    if(SP_ENGINE_HEXAGON_FASTRPC)
+        # Real FastRPC path — requires Hexagon SDK on the include/link paths.
+        # Caller sets HEXAGON_SDK_ROOT to point at /c/Qualcomm/Hexagon_SDK/5.x.x.x
+        if(NOT HEXAGON_SDK_ROOT)
+            message(FATAL_ERROR
+                "SP_ENGINE_HEXAGON_FASTRPC=ON requires HEXAGON_SDK_ROOT to be set "
+                "(e.g. -DHEXAGON_SDK_ROOT=C:/Qualcomm/Hexagon_SDK/5.5.6.0)")
+        endif()
+        target_compile_definitions(shannon_prime_hexagon_backend PUBLIC SP_HEXAGON_FASTRPC=1)
+        target_include_directories(shannon_prime_hexagon_backend PUBLIC
+            ${HEXAGON_SDK_ROOT}/incs
+            ${HEXAGON_SDK_ROOT}/incs/stddef
+            ${HEXAGON_SDK_ROOT}/ipc/fastrpc/rpcmem/inc)
+        # libcdsprpc is on-device only; we dlopen at runtime in stub fallback,
+        # but explicit link when SDK target requires it. Caller passes -ldl.
+        message(STATUS "Shannon-Prime Hexagon: real FastRPC mode (SDK=${HEXAGON_SDK_ROOT})")
+    else()
+        message(STATUS "Shannon-Prime Hexagon: stub mode (no SDK; backend returns -1 fallback)")
+    endif()
+endif()
+
+# --------------------------------------------------------------------
 # ggml (submodule) — MIT-licensed compute graph + GGUF loader + matmul
 # Disable the bits we don't need so the engine binary stays lean.
 # --------------------------------------------------------------------
@@ -207,11 +254,25 @@ add_library(sp_engine STATIC
     src/tokenizer.cpp
     src/llama_weights.cpp
     src/forward.cpp
-    src/prime_pe.cpp)
+    src/prime_pe.cpp
+    src/http_server.cpp
+    vendor/cpp-httplib/httplib.cpp)
 target_include_directories(sp_engine PUBLIC src)
+target_include_directories(sp_engine PUBLIC ${CMAKE_SOURCE_DIR}/vendor/cpp-httplib)
+# httplib needs winsock on Windows; pthread on POSIX (already implicit).
+if(WIN32)
+    target_link_libraries(sp_engine PUBLIC ws2_32 crypt32)
+endif()
 target_link_libraries(sp_engine PUBLIC
     shannon_prime_core
     ggml)
+if(SP_ENGINE_WITH_HEXAGON)
+    target_link_libraries(sp_engine PUBLIC shannon_prime_hexagon_backend)
+    target_compile_definitions(sp_engine PUBLIC SP_ENGINE_WITH_HEXAGON=1)
+    if(SP_ENGINE_HEXAGON_FASTRPC)
+        target_compile_definitions(sp_engine PUBLIC SP_HEXAGON_FASTRPC=1)
+    endif()
+endif()
 if(SP_ENGINE_WITH_CUDA)
     target_link_libraries(sp_engine PUBLIC shannon_prime_cuda_backend)
     target_compile_definitions(sp_engine PUBLIC SP_ENGINE_WITH_CUDA=1)
@@ -259,6 +320,7 @@ message(STATUS "Shannon-Prime Engine ${PROJECT_VERSION}")
 message(STATUS "  build type : ${CMAKE_BUILD_TYPE}")
 message(STATUS "  CUDA       : ${SP_ENGINE_WITH_CUDA}")
 message(STATUS "  Vulkan     : ${SP_ENGINE_WITH_VULKAN}")
+message(STATUS "  Hexagon    : ${SP_ENGINE_WITH_HEXAGON} (FastRPC=${SP_ENGINE_HEXAGON_FASTRPC})")
 message(STATUS "  FP8 (E4M3) : ${SP_ENGINE_FP8}")
 message(STATUS "  FP4 (BW)   : ${SP_ENGINE_FP4}")
 message(STATUS "  auto-patch : ${SP_ENGINE_AUTO_PATCH}")
