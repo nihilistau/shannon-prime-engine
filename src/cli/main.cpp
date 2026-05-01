@@ -8,6 +8,7 @@
 #include "forward.h"
 #include "gdn_state.h"
 #include "gguf_loader.h"
+#include "http_server.h"
 #include "kv_cache.h"
 #include "llama_weights.h"
 #include "prime_pe.h"
@@ -1540,6 +1541,67 @@ int main(int argc, char** argv) {
         if (gr != 0) return gr;
         std::printf("%s\n", out.c_str());
         return 0;
+    }
+
+    // Phase 3.7: serve — bring up an OpenAI-compatible HTTP server backed
+    // by Engine::generate. Drop-in replacement for the llama.cpp server
+    // that the FastAPI proxy (lms_custom_proxy.py) currently routes to
+    // on phone:8082.
+    //
+    //   sp-engine serve --model <gguf> [--host 0.0.0.0] [--port 8082]
+    //                   [--name <model-id>]
+    //
+    // Listens on host:port, blocks until Ctrl-C. Endpoints:
+    //   GET  /health                  health check
+    //   GET  /v1/models               list loaded model
+    //   POST /v1/chat/completions     chat (non-streaming, ChatML template)
+    //   POST /v1/completions          raw prompt (non-streaming)
+    if (cmd == "serve") {
+        sp::engine::Config rcfg;
+        sp::engine::seed_config_from_env(rcfg);
+        if (const char* env = std::getenv("SP_ENGINE_BACKEND")) {
+            if (std::strcmp(env, "gpu") == 0 || std::strcmp(env, "cuda") == 0) {
+                rcfg.backend = sp::engine::Config::Backend::CUDA;
+            } else if (std::strcmp(env, "vulkan") == 0) {
+                rcfg.backend = sp::engine::Config::Backend::Vulkan;
+            }
+        }
+        std::string host = "0.0.0.0";
+        int port = 8082;
+        std::string model_id;
+        for (int i = 2; i < argc; ++i) {
+            std::string a = argv[i];
+            if      (a == "--model" && i + 1 < argc) rcfg.model_path = argv[++i];
+            else if (a == "--ctx"   && i + 1 < argc) rcfg.n_ctx      = std::atoi(argv[++i]);
+            else if (a == "--host"  && i + 1 < argc) host             = argv[++i];
+            else if (a == "--port"  && i + 1 < argc) port             = std::atoi(argv[++i]);
+            else if (a == "--name"  && i + 1 < argc) model_id         = argv[++i];
+            else if (a.size() >= 2 && a[0] == '-' && a[1] == '-') {
+                std::fprintf(stderr, "serve: unknown flag %s\n", a.c_str()); return 2;
+            }
+        }
+        if (rcfg.model_path.empty()) {
+            std::fprintf(stderr, "serve requires --model <path.gguf>\n"); return 1;
+        }
+        if (model_id.empty()) {
+            // Use the basename of the GGUF as the public model id.
+            std::string p = rcfg.model_path;
+            size_t slash = p.find_last_of("/\\");
+            std::string base = (slash == std::string::npos) ? p : p.substr(slash + 1);
+            size_t dot = base.rfind('.');
+            model_id = (dot == std::string::npos) ? base : base.substr(0, dot);
+        }
+        std::fprintf(stderr, "[sp-engine:serve] loading %s ...\n", rcfg.model_path.c_str());
+        sp::engine::Engine engine;
+        int lr = engine.load(rcfg);
+        if (lr != 0) {
+            std::fprintf(stderr, "[sp-engine:serve] engine.load failed (%d)\n", lr);
+            return lr;
+        }
+        std::fprintf(stderr, "[sp-engine:serve] model loaded; binding HTTP server\n");
+        sp::engine::HttpServer server;
+        server.bind(&engine, model_id);
+        return server.listen_and_serve(host, port);
     }
 
     // Flag parser — extracts known flags and stashes positional args in `rest`.
