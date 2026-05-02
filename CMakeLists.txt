@@ -341,6 +341,8 @@ if(SP_ENGINE_WITH_QNN)
     target_link_libraries(sp_engine PUBLIC shannon_prime_qnn_backend)
     target_compile_definitions(sp_engine PUBLIC SP_ENGINE_WITH_QNN=1)
     target_include_directories(sp_engine PUBLIC ${SP_CORE_DIR}/backends/qnn_aihub/sp_qnn_runner)
+    # Phase 5: V69 QNN context-binary driver (load AI Hub-compiled .bins).
+    target_sources(sp_engine PRIVATE src/qnn_bin_driver.cpp)
 endif()
 if(SP_ENGINE_WITH_CUDA)
     target_link_libraries(sp_engine PUBLIC shannon_prime_cuda_backend)

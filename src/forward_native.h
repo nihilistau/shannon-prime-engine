@@ -68,6 +68,26 @@ struct ForwardNativeLayer {
     const void*  ffn_up   = nullptr;  sp_dtype ffn_up_dtype   = sp_dtype::UNDEFINED;
     const void*  ffn_down = nullptr;  sp_dtype ffn_down_dtype = sp_dtype::UNDEFINED;
 
+    // ─── Phase 4.13: HTP weight matmul dispatch ──────────────────────
+    // When the QNN HTP backend is active, ForwardNativeContext dequants
+    // the seven dense weight matmuls (Q/K/V/O + gate/up/down) from
+    // their GGUF dtype to fp16 ONCE at bind time, transposed to QNN's
+    // [K, N] expected layout (vs the GGUF-native [N, K] order), and
+    // optionally allocates them in rpcmem-ION via sp_qnn_alloc_persistent
+    // so HTP reads them without per-call marshal copies. matmul_fp32_lhs
+    // prefers mm_dispatch + the matching *_fp16 pointer over the CPU
+    // sp_matmul_f32_q5k path.
+    //
+    // Layout: each *_fp16 buffer is [K, N] row-major fp16. K = input
+    // feature dim (n_embd or n_ff), N = output feature dim. N*K*2 bytes.
+    const uint16_t* wq_fp16       = nullptr;
+    const uint16_t* wk_fp16       = nullptr;
+    const uint16_t* wv_fp16       = nullptr;
+    const uint16_t* wo_fp16       = nullptr;
+    const uint16_t* ffn_gate_fp16 = nullptr;
+    const uint16_t* ffn_up_fp16   = nullptr;
+    const uint16_t* ffn_down_fp16 = nullptr;
+
     // ─── Optional backend dispatch hooks ─────────────────────────────
     // The CPU layer step uses sp_matmul_f32 internally for the per-head
     // KQ matmul. When a heterogeneous backend (QNN HTP, Hexagon, etc.)
@@ -87,6 +107,18 @@ struct ForwardNativeLayer {
                                      float* scores);        // [n_seq, n_kv_total]
     kq_dispatch_fn_t kq_dispatch          = nullptr;
     void*            kq_dispatch_userdata = nullptr;
+
+    // Generic weight matmul dispatch. Computes out[M, N] = lhs[M, K] @ W[K, N]
+    // where W is the fp16 weight (already transposed to [K, N] layout
+    // at bind time, matching QNN's MatMul expectation). Returns 0 on
+    // success, non-zero → caller falls through to CPU sp_matmul_f32.
+    typedef int (*mm_dispatch_fn_t)(void* userdata,
+                                     const float*    lhs,    // [M, K] fp32
+                                     const uint16_t* W_fp16, // [K, N] fp16
+                                     int M, int K, int N,
+                                     float* out);            // [M, N] fp32
+    mm_dispatch_fn_t mm_dispatch          = nullptr;
+    void*            mm_dispatch_userdata = nullptr;
 };
 
 // ─────────────────────────────────────────────────────────────────

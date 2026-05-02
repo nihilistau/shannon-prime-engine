@@ -15,6 +15,10 @@
 #include "tokenizer.h"
 #include "vocab.h"
 
+#if defined(SP_ENGINE_WITH_QNN)
+#include "qnn_bin_driver.h"
+#endif
+
 extern "C" {
 #include "shannon_prime.h"
 }
@@ -1491,6 +1495,46 @@ int main(int argc, char** argv) {
         std::printf("  status: pre-alpha, full forward+decode with ship/sqfree/hierarchical cache\n");
         return 0;
     }
+
+#if defined(SP_ENGINE_WITH_QNN)
+    // Phase 5.0: prefill bench against AI Hub-compiled V69 .bins,
+    // mirroring lib/shannon-prime/backends/qnn_aihub/sp_qnn_runner/
+    // test_sp_qnn_prefill_batch.c — but called from sp-engine so the
+    // same load+exec lifecycle runs from inside the engine binary.
+    //   sp-engine qnn_bin_bench [--n-chunks N] split1 split2 split3 split4
+    if (cmd == "qnn_bin_bench") {
+        int n_chunks = 3;
+        std::vector<std::string> splits;
+        for (int i = 2; i < argc; ++i) {
+            std::string a = argv[i];
+            if (a == "--n-chunks" && i + 1 < argc) n_chunks = std::atoi(argv[++i]);
+            else splits.emplace_back(std::move(a));
+        }
+        if (splits.size() != 4) {
+            std::fprintf(stderr,
+                "qnn_bin_bench: expects exactly 4 split paths, got %zu\n",
+                splits.size());
+            return 1;
+        }
+        return sp::engine::qnn_bin_prefill_bench(splits, n_chunks);
+    }
+
+    // Phase 5.1: schema dump for the .bins. Prints input/output
+    // tensor name+dtype+rank+dims for each split — needed to identify
+    // which input is tokens, which is position_ids, which is residual,
+    // which is KV cache, before wiring real prompts in Phase 5.2.
+    //   sp-engine qnn_bin_schema split1 [split2 ...]
+    if (cmd == "qnn_bin_schema") {
+        std::vector<std::string> splits;
+        for (int i = 2; i < argc; ++i) splits.emplace_back(argv[i]);
+        if (splits.empty()) {
+            std::fprintf(stderr,
+                "qnn_bin_schema: expects at least 1 split path\n");
+            return 1;
+        }
+        return sp::engine::qnn_bin_schema_dump(splits);
+    }
+#endif  // SP_ENGINE_WITH_QNN
 
     // `run` is dispatched here (before the global flag parser) so its
     // verb-local flags — --n-predict in particular — aren't rejected as
