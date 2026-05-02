@@ -195,14 +195,61 @@ static std::string gen_chatcmpl_id() {
     return out;
 }
 
-// Strip Qwen ChatML end-of-turn tokens from the model's output. The
-// model emits "<|im_end|>" when it considers its turn done; we don't
-// want that in the user-facing content.
+// Strip end-of-turn / special tokens from the model's output. We strip
+// at the EARLIEST occurrence of any known stop token so the user never
+// sees ChatML/EOS markers or model-emitted role-prefixes that come from
+// the chat template "leaking" past the assistant's natural stop.
+//
+// Stops we catch:
+//   <|im_end|>      — Qwen ChatML end-of-turn
+//   <|endoftext|>   — generic EOS in many model vocabs
+//   \nHuman:        — some models continue into a fake user turn
+//   \n\nUser:       — same idea
+//   \n\nuser:       — case variant
+//
+// Also catches partial-prefix at the very end of `s` (when generation
+// truncates mid-token because n_predict ran out, e.g. "...today? <|im").
 static std::string strip_chatml_tail(const std::string& s) {
-    const std::string end = "<|im_end|>";
-    size_t pos = s.find(end);
-    if (pos != std::string::npos) return s.substr(0, pos);
-    return s;
+    static const char* const stops[] = {
+        "<|im_end|>",
+        "<|endoftext|>",
+        "<|end_of_text|>",
+        "\nHuman:",
+        "\n\nUser:",
+        "\n\nuser:",
+        nullptr
+    };
+    // Pass 1: find the earliest complete-stop occurrence; strip from there.
+    std::string out = s;
+    size_t earliest = std::string::npos;
+    for (size_t i = 0; stops[i]; ++i) {
+        const size_t pos = out.find(stops[i]);
+        if (pos != std::string::npos && pos < earliest) earliest = pos;
+    }
+    if (earliest != std::string::npos) out = out.substr(0, earliest);
+
+    // Pass 2: strip partial-prefix at the very end. The model may emit a
+    // truncated special token (e.g. "<|im_" when n_predict ran out) just
+    // before a different complete stop — pass 1 cuts at the complete stop
+    // but leaves the partial behind. Walk longest-prefix-first so we
+    // never under-strip.
+    bool changed;
+    do {
+        changed = false;
+        for (size_t i = 0; stops[i]; ++i) {
+            const std::string stop = stops[i];
+            for (size_t k = stop.size() - 1; k > 0; --k) {
+                if (out.size() < k) continue;
+                if (out.compare(out.size() - k, k, stop, 0, k) == 0) {
+                    out = out.substr(0, out.size() - k);
+                    changed = true;
+                    break;
+                }
+            }
+            if (changed) break;
+        }
+    } while (changed);
+    return out;
 }
 
 } // anon
