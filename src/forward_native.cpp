@@ -267,40 +267,42 @@ int forward_native_attention(const ForwardNativeLayer&   layer,
     const float scale = 1.0f / std::sqrt((float)head_dim);
     const int n_kv_total = n_pos_full;
 
-    // Scratch for K_rows (head_dim × n_kv_total fp32) and scores
-    // (n_seq × n_kv_total) per head. Allocated once before the
-    // head loop, reused.
-    std::vector<float> K_full((size_t)n_kv_total * head_dim);
-    std::vector<float> V_full((size_t)n_kv_total * head_dim);
+    // Scratch for scores + mask. K_full/V_full are now lazily
+    // materialised only on the calibration pass and the fused-path
+    // fallback (sqfree/hier/GPU caches), so the common shadow-cache
+    // case allocates 0 bytes for K_full/V_full and skips the full
+    // [n_kv_total, head_dim, n_head_kv] decompress entirely.
     std::vector<float> scores((size_t)n_seq * n_kv_total);
     std::vector<float> mask_buf((size_t)n_seq * n_kv_total, 0.0f);
-
-    // ── Decompress full K/V history once for this layer ──────────
-    // KvCache::read returns flat layout K_all[(p * n_head_kv + hk) * head_dim + d].
-    // We do one decompress (running VHT2 inverse + dequant on every band)
-    // then per-head gather in the loop below — far cheaper than calling
-    // read() per head, and a single arena-friendly allocation.
-    //
-    // Calibration pass: skip decompress; alias K_all/V_all to the local
-    // just-computed K/V. They share the [n_seq, n_head_kv, head_dim]
-    // layout the head-loop gather expects, and n_pos_past was zero so
-    // n_kv_total == n_seq below.
+    std::vector<float> K_full;
+    std::vector<float> V_full;
     std::vector<float> K_all_owned, V_all_owned;
-    const float* K_all_ptr;
-    const float* V_all_ptr;
-    if (kv.calibrate_pass) {
-        K_all_ptr = K;
-        V_all_ptr = V;
-    } else {
-        if (!kv.kv->read(kv.layer_idx, n_kv_total, K_all_owned, V_all_owned)) {
+    const float* K_all_ptr = nullptr;
+    const float* V_all_ptr = nullptr;
+    bool fallback_inited = false;
+    auto ensure_fallback = [&]() {
+        if (fallback_inited) return true;
+        if (kv.calibrate_pass) {
+            // Calibration pass: K/V from local just-computed buffers.
+            // Layout already matches kv->read's [n_kv_total, n_head_kv,
+            // head_dim] flat — n_pos_past was 0 so n_kv_total == n_seq.
+            K_all_ptr = K;
+            V_all_ptr = V;
+        } else if (kv.kv->read(kv.layer_idx, n_kv_total,
+                                K_all_owned, V_all_owned)) {
+            K_all_ptr = K_all_owned.data();
+            V_all_ptr = V_all_owned.data();
+        } else {
             std::fprintf(stderr,
                 "[sp_native] attn: KvCache::read failed (layer=%d kv_len=%d)\n",
                 kv.layer_idx, n_kv_total);
-            return -1;
+            return false;
         }
-        K_all_ptr = K_all_owned.data();
-        V_all_ptr = V_all_owned.data();
-    }
+        K_full.assign((size_t)n_kv_total * head_dim, 0.0f);
+        V_full.assign((size_t)n_kv_total * head_dim, 0.0f);
+        fallback_inited = true;
+        return true;
+    };
 
     // Causal mask: for each query position (n_pos_past + s), block
     // out future positions. Mask is +0 where allowed, -INF where
@@ -318,23 +320,6 @@ int forward_native_attention(const ForwardNativeLayer&   layer,
     for (int h = 0; h < n_head; ++h) {
         const int hk = h / gqa_ratio;     // shared-KV head index
 
-        // Strided gather from K_all/V_all (flat [n_kv_total, n_head_kv,
-        // head_dim] layout) into per-head contiguous K_full/V_full
-        // [n_kv_total, head_dim]. K_all has already been decompressed
-        // (VHT2 inverse + band dequant) by the read() above — except
-        // on the calibration pass where K_all aliases the local
-        // just-computed K (fp32, no compression).
-        for (int p = 0; p < n_kv_total; ++p) {
-            const float* k_src = K_all_ptr
-                + (size_t)(p * n_head_kv + hk) * head_dim;
-            const float* v_src = V_all_ptr
-                + (size_t)(p * n_head_kv + hk) * head_dim;
-            std::memcpy(K_full.data() + (size_t)p * head_dim,
-                        k_src, (size_t)head_dim * sizeof(float));
-            std::memcpy(V_full.data() + (size_t)p * head_dim,
-                        v_src, (size_t)head_dim * sizeof(float));
-        }
-
         // Q for this head: [n_seq, head_dim] view into Q.
         // We need a contiguous Q_h buffer for the matmul.
         std::vector<float> Q_h((size_t)n_seq * head_dim);
@@ -346,75 +331,110 @@ int forward_native_attention(const ForwardNativeLayer&   layer,
                         q_src, (size_t)head_dim * sizeof(float));
         }
 
-        // scores[n_seq, n_kv_total] = Q_h[n_seq, head_dim] @
-        //                              K_full[n_kv_total, head_dim]^T
-        //
-        // Dispatch order (first hit wins):
-        //   1. HVX fused decompress+matmul on cDSP — reads compressed
-        //      K bytes directly out of the hexagon cache, runs the
-        //      fused decompress+matmul kernel from Phase 1.6 (1.79×
-        //      prefill speedup measured on S22U). Skipped during
-        //      calibration pass since hex_cache hasn't been written
-        //      with the calibrated bytes yet.
-        //   2. layer.kq_dispatch — generic backend hook (QNN HTP via
-        //      sp_llama_qnn_matmul_dispatch).
-        //   3. CPU sp_matmul_f32 — correctness floor.
-        // ── Phase 1.6 fused decompress+matmul (CPU) ─────────────
-        // Reads packed K bytes directly out of the shadow cache slot
-        // and runs band_dequantize → mobius/var unreorder → VHT2
-        // self-inverse → dot per K row. Matches llama_sp_fused_kq.cpp
-        // (the validated CPU path that produced the 3.58× spec-decode
-        // win on S22U). Skipped on calibration pass (cache hasn't been
-        // written yet).
+        // ── KQ matmul: Phase 1.6 fused decompress+matmul (CPU) ──
+        // Per-row decompress directly out of the shadow cache slot
+        // (band_dequantize → mobius/var unreorder → VHT2 self-inverse)
+        // → dot against every Q row. Compressed K bytes (~10× smaller
+        // than fp32) stay in L2; ALU-bound rather than bandwidth-bound.
+        // Same algorithm as llama_sp_fused_kq.cpp (the validated CPU
+        // path that produced the 3.58× spec-decode win on S22U).
+        // Skipped on the calibration pass since the cache hasn't been
+        // written with the calibrated bytes yet — falls through to
+        // sp_matmul_f32 against the local K.
         int kq_rc = -1;
         if (!kv.calibrate_pass && kv.kv) {
-            // KvCache::kq_fused_cpu writes scores[(q,kv)] in [n_q, n_kv]
-            // row-major. n_q = n_seq, n_kv = n_kv_total. That's exactly
-            // what sp_matmul_f32(Q_h, K_full, n_seq, hd, n_kv_total,
-            // scores) produces — drop-in.
             if (kv.kv->kq_fused_cpu(kv.layer_idx, hk, n_kv_total,
                                     Q_h.data(), n_seq,
                                     scores.data())) {
                 kq_rc = 0;
             }
         }
-        if (kq_rc != 0 && layer.kq_dispatch) {
-            kq_rc = layer.kq_dispatch(layer.kq_dispatch_userdata,
-                                       Q_h.data(), K_full.data(),
-                                       n_seq, head_dim, n_kv_total,
-                                       scores.data());
-        }
         if (kq_rc != 0) {
-            sp_matmul_f32(Q_h.data(), K_full.data(),
-                          n_seq, head_dim, n_kv_total, scores.data());
+            // Fallback: materialise K_full from kv->read (or local K
+            // on calibration), then run sp_matmul / kq_dispatch.
+            if (!ensure_fallback()) return -1;
+            for (int p = 0; p < n_kv_total; ++p) {
+                const float* k_src = K_all_ptr
+                    + (size_t)(p * n_head_kv + hk) * head_dim;
+                std::memcpy(K_full.data() + (size_t)p * head_dim,
+                            k_src, (size_t)head_dim * sizeof(float));
+            }
+            if (layer.kq_dispatch) {
+                kq_rc = layer.kq_dispatch(layer.kq_dispatch_userdata,
+                                           Q_h.data(), K_full.data(),
+                                           n_seq, head_dim, n_kv_total,
+                                           scores.data());
+            }
+            if (kq_rc != 0) {
+                sp_matmul_f32(Q_h.data(), K_full.data(),
+                              n_seq, head_dim, n_kv_total, scores.data());
+            }
         }
 
         // Softmax with scale + mask, row-wise over n_kv_total.
         sp_softmax_f32_rows(scores.data(), mask_buf.data(),
                             n_kv_total, n_seq, scale, scores.data());
 
-        // attn_h[n_seq, head_dim] = scores[n_seq, n_kv_total] @
-        //                            V_full[n_kv_total, head_dim]
-        // V is stored [n_kv_total, head_dim] row-major — to use
-        // sp_matmul (which does rhs[n, k]^T) we need rhs in [head_dim,
-        // n_kv_total] layout. We've stored V_full row-major as
-        // [n_kv_total, head_dim] which gives lhs[m, k] semantics;
-        // for the second matmul lhs is scores[n_seq, n_kv_total] and
-        // we want out = scores @ V where V is [n_kv_total, head_dim].
-        // sp_matmul interprets rhs as [n, k]^T so we'd need V
-        // reshaped to [head_dim, n_kv_total]. Easier: write a small
-        // direct loop here — it's only n_seq × head_dim × n_kv_total
-        // ops per head and the V dequant is the dominant cost anyway.
-        for (int s = 0; s < n_seq; ++s) {
-            for (int d = 0; d < head_dim; ++d) {
-                double acc = 0.0;
-                for (int p = 0; p < n_kv_total; ++p) {
-                    acc += (double)scores[(size_t)s * n_kv_total + p]
-                         * (double)V_full[(size_t)p * head_dim + d];
+        // ── V dot: Phase 1.6 fused decompress+accumulate (CPU) ──
+        // Symmetric to kq_fused_cpu. Per-row decompress V bytes from
+        // the shadow cache slot, accumulate into attn_out scaled by
+        // the softmax weights for every Q row before moving to the
+        // next position. attn_out[s, h*hd + d] gets the result.
+        // Skipped on calibration pass (uses local V_full instead).
+        bool v_done = false;
+        if (!kv.calibrate_pass && kv.kv) {
+            // Zero this head's slice of attn_out before the
+            // accumulating fused dot.
+            for (int s = 0; s < n_seq; ++s) {
+                std::memset(attn_out + (size_t)s * n_q_dim
+                                     + (size_t)h * head_dim,
+                            0, (size_t)head_dim * sizeof(float));
+            }
+            // v_dot_fused_cpu writes into a contiguous [n_q, head_dim]
+            // buffer. Our attn_out is [n_seq, n_q_dim] strided, so we
+            // use a small scratch and scatter-back. For the common
+            // n_seq=1 (decode) case, scratch is the head's slice
+            // directly — no scatter cost.
+            if (n_seq == 1) {
+                if (kv.kv->v_dot_fused_cpu(kv.layer_idx, hk, n_kv_total,
+                                            scores.data(), 1,
+                                            attn_out + (size_t)h * head_dim)) {
+                    v_done = true;
                 }
-                // Write into attn_out[s, h*head_dim + d]
-                attn_out[(size_t)s * n_q_dim
-                       + (size_t)h * head_dim + d] = (float)acc;
+            } else {
+                std::vector<float> attn_h((size_t)n_seq * head_dim, 0.0f);
+                if (kv.kv->v_dot_fused_cpu(kv.layer_idx, hk, n_kv_total,
+                                            scores.data(), n_seq,
+                                            attn_h.data())) {
+                    for (int s = 0; s < n_seq; ++s) {
+                        std::memcpy(attn_out + (size_t)s * n_q_dim
+                                              + (size_t)h * head_dim,
+                                    attn_h.data() + (size_t)s * head_dim,
+                                    (size_t)head_dim * sizeof(float));
+                    }
+                    v_done = true;
+                }
+            }
+        }
+        if (!v_done) {
+            // Fallback: materialise V_full and run the manual dot.
+            if (!ensure_fallback()) return -1;
+            for (int p = 0; p < n_kv_total; ++p) {
+                const float* v_src = V_all_ptr
+                    + (size_t)(p * n_head_kv + hk) * head_dim;
+                std::memcpy(V_full.data() + (size_t)p * head_dim,
+                            v_src, (size_t)head_dim * sizeof(float));
+            }
+            for (int s = 0; s < n_seq; ++s) {
+                for (int d = 0; d < head_dim; ++d) {
+                    double acc = 0.0;
+                    for (int p = 0; p < n_kv_total; ++p) {
+                        acc += (double)scores[(size_t)s * n_kv_total + p]
+                             * (double)V_full[(size_t)p * head_dim + d];
+                    }
+                    attn_out[(size_t)s * n_q_dim
+                           + (size_t)h * head_dim + d] = (float)acc;
+                }
             }
         }
     }

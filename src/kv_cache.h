@@ -198,6 +198,21 @@ public:
                       const float* q_vec, int n_q,
                       float* scores) const;
 
+    // Symmetric fused V dot: attn_out[q, d] += sum_p weights[q, p] * V[p, d].
+    // For each kv position in [0, n_kv): read packed bytes from the V slot,
+    // decompress one V row (sp_band_dequantize → VHT2 self-inverse — V has
+    // no Möbius / variance reorder by design), accumulate into attn_out
+    // for every Q row before moving to the next position. attn_out must
+    // be zeroed by the caller. Same memory-bandwidth-saving rationale as
+    // kq_fused_cpu — V's compressed bytes (~1 byte per dim with 3-bit
+    // flat) are 16× smaller than fp32, kept in L2.
+    //
+    // weights : [n_q, n_kv] row-major (the softmax-of-scaled-scores).
+    // attn_out: [n_q, head_dim] row-major, accumulated in place.
+    bool v_dot_fused_cpu(int layer, int head_kv, int n_kv,
+                          const float* weights, int n_q,
+                          float* attn_out) const;
+
     // --- Cauchy reset system (decode-chain causal stability) ---
     //
     // Layers:

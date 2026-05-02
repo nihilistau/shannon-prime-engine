@@ -319,6 +319,49 @@ bool KvCache::kq_fused_cpu(int layer, int head_kv, int n_kv,
     return true;
 }
 
+bool KvCache::v_dot_fused_cpu(int layer, int head_kv, int n_kv,
+                               const float* weights, int n_q,
+                               float* attn_out) const {
+    if (!impl_) return false;
+    if (!impl_->shadow_inited) return false;
+    if (layer < 0 || layer >= impl_->n_layer) return false;
+    if (head_kv < 0 || head_kv >= impl_->n_head_kv) return false;
+    if (n_kv <= 0 || n_q <= 0 || !weights || !attn_out) return false;
+
+    const sp_shadow_cache_t* sc = &impl_->shadow;
+    const int hd       = sc->config.head_dim;
+    const int n_heads  = sc->config.n_heads_kv;
+    const int slot     = layer * n_heads + head_kv;
+    const uint8_t* v_archive = sc->v_cache[slot];
+    if (!v_archive) return false;
+
+    const sp_band_config_t* bc = &sc->v_bands;
+    const int per_pos = bc->total_bytes;
+
+    std::vector<float> v_row((size_t)hd);
+
+    // V has no Möbius / variance reorder (config + layout match the
+    // ship-path V write: VHT2 → flat 3-bit quant, no reorder). Just
+    // band_dequantize + VHT2 self-inverse and we're back to original.
+    for (int kv = 0; kv < n_kv; ++kv) {
+        const uint8_t* src = v_archive + (size_t)kv * (size_t)per_pos;
+        sp_band_dequantize(src, v_row.data(), bc);
+        sp_vht2_forward_f32(v_row.data(), hd);
+
+        // attn_out[q, d] += weights[q, kv] * v_row[d]
+        // Outer over Q rows so v_row stays hot in regs / L1.
+        for (int q = 0; q < n_q; ++q) {
+            const float w = weights[(size_t)q * (size_t)n_kv + (size_t)kv];
+            if (w == 0.0f) continue;
+            float* out_row = attn_out + (size_t)q * (size_t)hd;
+            for (int d = 0; d < hd; ++d) {
+                out_row[d] += w * v_row[d];
+            }
+        }
+    }
+    return true;
+}
+
 std::string KvCache::describe() const {
     const char* mode = impl_->hierarchical ? "hierarchical" :
                        impl_->sqfree       ? "sqfree"       : "shadow";
