@@ -28,6 +28,32 @@ uint64_t now_us() {
                steady_clock::now().time_since_epoch()).count();
 }
 
+// fp16 buffer stats — min/max/abs-mean/finite-count. Used to bisect
+// where saturation begins along the split chain.
+struct ResStats {
+    float vmin, vmax, abs_mean;
+    size_t n_total, n_inf, n_nan;
+};
+inline ResStats fp16_stats(const uint8_t* bytes, size_t bytes_len) {
+    const size_t n = bytes_len / 2;
+    const uint16_t* p = (const uint16_t*)bytes;
+    ResStats r{1e30f, -1e30f, 0.0f, n, 0, 0};
+    double accum = 0.0;
+    size_t finite = 0;
+    for (size_t i = 0; i < n; ++i) {
+        const float f = sp_fp16_to_fp32(p[i]);
+        if (std::isnan(f)) { r.n_nan++; continue; }
+        if (std::isinf(f)) { r.n_inf++; continue; }
+        if (f < r.vmin) r.vmin = f;
+        if (f > r.vmax) r.vmax = f;
+        accum += std::fabs((double)f);
+        finite++;
+    }
+    r.abs_mean = finite ? (float)(accum / (double)finite) : 0.0f;
+    if (finite == 0) { r.vmin = 0.0f; r.vmax = 0.0f; }
+    return r;
+}
+
 // Per-split state: handle, n_in/n_out, owned input/output buffers,
 // and the residual-stream tensor index (matched by rank=3 + the
 // canonical [1, ar, hidden] shape Qwen3-4B exports use).
@@ -195,19 +221,35 @@ int qnn_bin_prefill_bench(const std::vector<std::string>& split_paths,
     size_t host_residual_size = 0;
     std::vector<uint64_t> chunk_total_us((size_t)n_chunks, 0);
 
-    auto carry_residual = [&](Split& src) {
+    auto carry_residual = [&](Split& src, const char* tag) {
         if (src.residual_out_idx < 0) return;
         const size_t sz = src.out_sz[src.residual_out_idx];
         if (host_residual.size() < sz) host_residual.resize(sz);
         std::memcpy(host_residual.data(),
                     src.out_bufs[src.residual_out_idx], sz);
         host_residual_size = sz;
+        const ResStats st = fp16_stats(host_residual.data(), sz);
+        std::fprintf(stderr,
+            "  [%s] residual: min=%.3g max=%.3g abs_mean=%.3g inf=%zu nan=%zu\n",
+            tag, st.vmin, st.vmax, st.abs_mean, st.n_inf, st.n_nan);
     };
     auto inject_residual = [&](Split& dst) {
         if (dst.residual_in_idx < 0) return;
         if (host_residual_size != dst.in_sz[dst.residual_in_idx]) return;
         std::memcpy(dst.in_bufs[dst.residual_in_idx],
                     host_residual.data(), host_residual_size);
+        // Optional override: fill residual with a uniform fp16 value
+        // chosen by SP_QNN_BIN_RES_OVERRIDE (parses as a float).
+        // Use this to test "does split 2 actually read the residual?".
+        if (const char* v = std::getenv("SP_QNN_BIN_RES_OVERRIDE")) {
+            const float f = std::strtof(v, nullptr);
+            const uint16_t fp16 = sp_fp32_to_fp16(f);
+            uint16_t* p = (uint16_t*)dst.in_bufs[dst.residual_in_idx];
+            const size_t n = host_residual_size / 2;
+            for (size_t i = 0; i < n; ++i) p[i] = fp16;
+            std::fprintf(stderr,
+                "  [override] residual filled with %g (%zu fp16)\n", f, n);
+        }
     };
 
     int rc = 0;
@@ -223,14 +265,14 @@ int qnn_bin_prefill_bench(const std::vector<std::string>& split_paths,
         if (!load_split(split_paths[0], a)) { rc = -3; break; }
         load_us[0] = now_us() - t;
         if (!exec_split(a, &exec_us[0])) { rc = -4; break; }
-        carry_residual(a);
+        carry_residual(a, "split1");
 
         t = now_us();
         if (!load_split(split_paths[1], b)) { rc = -3; break; }
         load_us[1] = now_us() - t;
         inject_residual(b);
         if (!exec_split(b, &exec_us[1])) { rc = -4; break; }
-        carry_residual(b);
+        carry_residual(b, "split2");
 
         free_split(a);
         free_split(b);
@@ -241,7 +283,7 @@ int qnn_bin_prefill_bench(const std::vector<std::string>& split_paths,
         load_us[2] = now_us() - t;
         inject_residual(a);
         if (!exec_split(a, &exec_us[2])) { rc = -4; break; }
-        carry_residual(a);
+        carry_residual(a, "split3");
 
         t = now_us();
         if (!load_split(split_paths[3], b)) { rc = -3; break; }
@@ -364,18 +406,38 @@ void build_position_ids(int n_positions, int n_freq_pairs,
 // [0, q] which pointed at PAST junk slots → fp16-saturated logits.
 void build_causal_mask(int ar, int cl, int n_real_tokens, int past_len,
                         std::vector<uint16_t>& mask_out) {
-    const uint16_t neg_inf_fp16 = sp_fp32_to_fp16(-1.0e30f);
+    // SP_QNN_BIN_MASK_FINITE=1 uses fp16 most-negative-finite (~-65504)
+    // instead of -inf. AIMET-quantized attention may handle finite better
+    // through the int16 activation path. Default ON since past-Claude's
+    // notes + Genie configs both use the finite convention.
+    static const bool use_finite = []() {
+        const char* v = std::getenv("SP_QNN_BIN_MASK_FINITE");
+        return !v || v[0] != '0';   // default ON
+    }();
+    const uint16_t neg_inf_fp16 = use_finite
+        ? (uint16_t)0xFBFF                  // -65504, most-neg finite fp16
+        : sp_fp32_to_fp16(-1.0e30f);        // saturates to -inf
     const uint16_t zero_fp16    = sp_fp32_to_fp16(0.0f);
     mask_out.assign((size_t)ar * cl, neg_inf_fp16);
     const int past_max = cl - ar;            // past buffer width
     const int past_off = past_max - past_len; // offset to first meaningful past
-    const int last_q   = n_real_tokens > ar ? ar : n_real_tokens;
+    // SP_QNN_BIN_MASK_FULL_AR: when "1", mask covers ALL ar query
+    // rows causally (good when padded slots are repeats of real tokens).
+    // When "0" (the default), only allow attention for real query
+    // positions [0, n_real_tokens) — padded q slots stay all -inf.
+    // Genie/HF convention is to mask padded query rows; the .bin's
+    // post-attention norm then doesn't pool garbage from those rows.
+    static const bool full_ar = []() {
+        const char* v = std::getenv("SP_QNN_BIN_MASK_FULL_AR");
+        return v && v[0] == '1';
+    }();
+    const int last_q = full_ar
+        ? ar
+        : (n_real_tokens > ar ? ar : n_real_tokens);
     for (int q = 0; q < last_q; ++q) {
-        // Meaningful past positions [past_off, past_max).
         for (int k = past_off; k < past_max && k < cl; ++k) {
             mask_out[(size_t)q * cl + k] = zero_fp16;
         }
-        // Current chunk [past_max, past_max + q] — causal.
         for (int k = past_max; k <= past_max + q && k < cl; ++k) {
             mask_out[(size_t)q * cl + k] = zero_fp16;
         }
@@ -412,6 +474,18 @@ int qnn_bin_generate_one(const std::vector<std::string>& split_paths,
     const int n_freq_pairs = head_dim / 2;
     std::vector<uint16_t> pos_cos, pos_sin;
     build_position_ids(ar, n_freq_pairs, rope_base, pos_cos, pos_sin);
+    // Diagnostic override: SP_QNN_BIN_NOROPE=1 sets cos=1,sin=0 →
+    // RoPE becomes identity. Bisects "is divergence from RoPE
+    // encoding or from past_KV quant decode?".
+    if (const char* v = std::getenv("SP_QNN_BIN_NOROPE")) {
+        if (v[0] == '1') {
+            std::fprintf(stderr,
+                "[qnn_bin] SP_QNN_BIN_NOROPE=1 — cos=1, sin=0 (no rotation)\n");
+            const uint16_t one_fp16 = sp_fp32_to_fp16(1.0f);
+            std::fill(pos_cos.begin(), pos_cos.end(), one_fp16);
+            std::fill(pos_sin.begin(), pos_sin.end(), (uint16_t)0);
+        }
+    }
 
     const int n_real = (int)prompt_tokens.size();
     const int n_real_clamped = n_real > ar ? ar : n_real;
@@ -425,8 +499,35 @@ int qnn_bin_generate_one(const std::vector<std::string>& split_paths,
     // First chunk: no history.
     build_causal_mask(ar, cl, n_real_clamped, /*past_len=*/0, attn_mask);
 
-    std::vector<int32_t> input_ids((size_t)ar, 0);
-    for (int i = 0; i < n_real_clamped; ++i) input_ids[(size_t)i] = prompt_tokens[(size_t)i];
+    // SP_QNN_BIN_PAD_TOKEN env: pad token id for slots beyond
+    // n_real_clamped. Default 151643 (Qwen3 endoftext / pad_token).
+    // Genie configs use this convention. Set to "last" to fall back
+    // to repeating the last real token (the previous default).
+    int32_t pad_id = 151643;
+    if (const char* v = std::getenv("SP_QNN_BIN_PAD_TOKEN")) {
+        if (std::strcmp(v, "last") == 0 && n_real_clamped > 0) {
+            pad_id = prompt_tokens[(size_t)(n_real_clamped - 1)];
+        } else {
+            const long parsed = std::strtol(v, nullptr, 10);
+            if (parsed > 0) pad_id = (int32_t)parsed;
+        }
+    }
+    std::vector<int32_t> input_ids((size_t)ar, pad_id);
+    for (int i = 0; i < n_real_clamped; ++i) {
+        input_ids[(size_t)i] = prompt_tokens[(size_t)i];
+    }
+    // SP_QNN_BIN_INPUT_TOKEN: override every input_ids slot with this
+    // single token id. Useful to compare embedding lookup behavior
+    // across token IDs (e.g. SP_QNN_BIN_INPUT_TOKEN=0 vs 100 vs 1000).
+    if (const char* v = std::getenv("SP_QNN_BIN_INPUT_TOKEN")) {
+        const long parsed = std::strtol(v, nullptr, 10);
+        if (parsed >= 0) {
+            std::fill(input_ids.begin(), input_ids.end(), (int32_t)parsed);
+            std::fprintf(stderr,
+                "[qnn_bin] SP_QNN_BIN_INPUT_TOKEN=%ld — all 128 slots\n",
+                parsed);
+        }
+    }
 
     // ── SPLIT 1: input_ids → embedding ──────────────────────────
     Split s1;
@@ -443,12 +544,32 @@ int qnn_bin_generate_one(const std::vector<std::string>& split_paths,
     std::memcpy(s1.in_bufs[(size_t)s1_input_ids_idx],
                 input_ids.data(), s1.in_sz[(size_t)s1_input_ids_idx]);
 
+    // Pre-fill output buffer with a marker pattern (0xCD bytes) so we
+    // can tell if exec() actually wrote to our host buffer or just
+    // wrote to a device-side buffer that didn't copy back.
+    if (s1.residual_out_idx >= 0) {
+        std::memset(s1.out_bufs[(size_t)s1.residual_out_idx], 0xCD,
+                    s1.out_sz[(size_t)s1.residual_out_idx]);
+    }
+
     uint64_t exec_us = 0;
     if (!exec_split(s1, &exec_us)) {
         std::fprintf(stderr, "[qnn_bin] split 1 exec failed\n");
         free_split(s1); sp_qnn_shutdown(); return -4;
     }
     std::fprintf(stderr, "[qnn_bin] split 1 exec: %.1f ms\n", exec_us / 1000.0);
+
+    // Count how many bytes still equal 0xCD (i.e., were NOT written
+    // by the .bin's exec).
+    if (s1.residual_out_idx >= 0) {
+        const uint8_t* p = (const uint8_t*)s1.out_bufs[(size_t)s1.residual_out_idx];
+        const size_t   n = s1.out_sz[(size_t)s1.residual_out_idx];
+        size_t unwritten = 0;
+        for (size_t i = 0; i < n; ++i) if (p[i] == 0xCD) ++unwritten;
+        std::fprintf(stderr,
+            "[qnn_bin] split 1 unwritten bytes (still 0xCD): %zu / %zu (%.2f%%)\n",
+            unwritten, n, 100.0 * (double)unwritten / (double)n);
+    }
 
     // Carry the embedding (residual) buffer.
     std::vector<uint8_t> residual;
@@ -461,6 +582,11 @@ int qnn_bin_generate_one(const std::vector<std::string>& split_paths,
         residual.assign(sz, 0);
         std::memcpy(residual.data(),
                     s1.out_bufs[(size_t)s1.residual_out_idx], sz);
+        const ResStats st = fp16_stats(residual.data(), residual.size());
+        std::fprintf(stderr,
+            "[qnn_bin] split 1 residual: min=%.3g max=%.3g abs_mean=%.3g "
+            "inf=%zu nan=%zu n=%zu\n",
+            st.vmin, st.vmax, st.abs_mean, st.n_inf, st.n_nan, st.n_total);
     }
     free_split(s1);
 
@@ -540,6 +666,12 @@ int qnn_bin_generate_one(const std::vector<std::string>& split_paths,
             residual.assign(sz, 0);
             std::memcpy(residual.data(),
                         s.out_bufs[(size_t)s.residual_out_idx], sz);
+            const ResStats st = fp16_stats(residual.data(), residual.size());
+            std::fprintf(stderr,
+                "[qnn_bin] %s residual: min=%.3g max=%.3g abs_mean=%.3g "
+                "inf=%zu nan=%zu n=%zu\n",
+                path.c_str(),
+                st.vmin, st.vmax, st.abs_mean, st.n_inf, st.n_nan, st.n_total);
         }
 
         // For split 4: pick argmax(logits[last_real_position]).

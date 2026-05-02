@@ -23,6 +23,66 @@ was likely measured with llama.cpp / ggml / thread-pool state
 polluting HTP working memory; the standalone driver doesn't have
 that overhead, so the chain fits.
 
+## Update 2026-05-02 — root cause identified: the .bins are broken
+
+After landing per-split residual instrumentation in `qnn_bin_driver.cpp`
+and rerunning all three diagnostic env-gates plus a residual-override
+sweep, the actual bug is upstream of every wiring choice we considered:
+
+**Split 1 (just `input_ids → embedding` Gather) produces saturated +
+NaN output in BOTH the bench and the run paths**, with identical
+statistics regardless of token id, load pattern, or any other input:
+
+```
+[qnn_bin] split 1 residual: min=-0.0158 max=6.54e+04 abs_mean=1.35e+04
+                            inf=0 nan=38528 n=327680
+```
+
+- max ≈ 65504 = fp16 saturation
+- abs_mean ≈ 13500 (real embeddings have abs_mean ~0.05)
+- ~12% of values are NaN
+- Confirmed identical in `qnn_bin_bench` (load 1+2 swap pattern, the
+  validated 104 t/s path) and `qnn_bin_run` (one-at-a-time pattern)
+- Confirmed identical for tokens 0, 100, 1000, 10000, 151643
+- 0.10% of output bytes never overwritten by exec (small, irrelevant)
+
+**Split 2's output is invariant to its residual_in.** A residual-override
+sweep filled residual_in with uniform fp16 (0.0, 0.5, 1.0, 100.0):
+
+```
+RES=0.0   → split2 abs_mean=0.596
+RES=0.5   → split2 abs_mean=0.597
+RES=1.0   → split2 abs_mean=0.597
+RES=100.0 → split2 abs_mean=0.597
+```
+
+Split 3, run identically, DOES respond to its input (output scales
+linearly with residual). So the wiring for residual handoff IS
+correct end-to-end (sp_qnn binds clientBuf to host buffer per-call,
+verified at sp_qnn.c:698-712); split 2's .bin just appears to be
+swallowing its residual_in tensor and producing some saturation-
+denoised constant via its trailing RMSNorm.
+
+The 104 t/s benchmark was measuring throughput only; it never
+validated output correctness. The .bins were never validated end-to-end
+because Genie can't load all 4 on V69 (QNN_CONTEXT_ERROR_RESOURCE_LIMIT
+5005, the 1.5 GB HTP working memory ceiling), and AI Hub's profile job
+only times execution.
+
+**The fix is re-export.** The current 4-bin export from
+`qwen3_4b_v69_export.py` produces .bins with broken Gather/embedding
+or broken AIMET dequant scales. Likely causes:
+- AIMET calibration data was wrong (the `submit_w4a16.py` pattern uses
+  random standard-normal calibration, which is not representative for
+  Gather op range estimation)
+- The Genie wrapper hijack pattern bypassed some required AI Hub export
+  step that normally pre-bakes the embedding scale
+
+The 36-layer-per-bin re-export (NUM_LAYERS_PER_SPLIT=1) the user
+suggested would also pick up a fresh embedding split. With proper
+calibration data (real Qwen3 token sequences instead of random noise)
+the embedding scale should be correct.
+
 ## What's broken (Phase 5.2 — `qnn_bin_run`)
 
 Same .bins, real prompt input, real tokenizer (Qwen2.5-Coder GGUF
