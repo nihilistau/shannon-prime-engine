@@ -317,6 +317,7 @@ add_library(sp_engine STATIC
     src/sp_tensor.cpp
     src/sp_quant.cpp
     src/sp_kernels_cpu.cpp
+    src/sp_threadpool.cpp
     src/forward_native.cpp
     src/forward_native_context.cpp
     vendor/cpp-httplib/httplib.cpp)

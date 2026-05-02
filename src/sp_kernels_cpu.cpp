@@ -3,6 +3,7 @@
 
 #include "sp_kernels_cpu.h"
 #include "sp_quant.h"
+#include "sp_threadpool.h"
 
 #include <cmath>
 #include <cstdio>
@@ -199,33 +200,55 @@ void sp_rope_f32(float* x, int head_dim, int n_heads, int n_pos,
 //
 // out[i, j] = dot(lhs[i, :], rhs[j, :])
 
+// Single-row matmul slice (used as the inner kernel of the
+// threaded path and the single-thread fallback).
+static inline void matmul_f32_row(const float* lh, const float* rhs,
+                                   int k, int n, float* op) {
+    for (int j = 0; j < n; ++j) {
+        const float* rh = rhs + (size_t)j * k;
+        double acc = 0.0;
+#if SP_HAS_NEON
+        int p = 0;
+        float32x4_t v_acc = vdupq_n_f32(0.0f);
+        for (; p + 4 <= k; p += 4) {
+            float32x4_t v_l = vld1q_f32(lh + p);
+            float32x4_t v_r = vld1q_f32(rh + p);
+            v_acc = vfmaq_f32(v_acc, v_l, v_r);
+        }
+        float partial[4];
+        vst1q_f32(partial, v_acc);
+        acc = (double)(partial[0] + partial[1] + partial[2] + partial[3]);
+        for (; p < k; ++p) acc += (double)lh[p] * (double)rh[p];
+#else
+        for (int p = 0; p < k; ++p) acc += (double)lh[p] * (double)rh[p];
+#endif
+        op[j] = (float)acc;
+    }
+}
+
 void sp_matmul_f32(const float* lhs, const float* rhs,
                    int m, int k, int n, float* out) {
-    for (int i = 0; i < m; ++i) {
-        const float* lh = lhs + (size_t)i * k;
-        float*       op = out + (size_t)i * n;
-        for (int j = 0; j < n; ++j) {
-            const float* rh = rhs + (size_t)j * k;
-            // Inner dot product.
-            double acc = 0.0;
-#if SP_HAS_NEON
-            int p = 0;
-            float32x4_t v_acc = vdupq_n_f32(0.0f);
-            for (; p + 4 <= k; p += 4) {
-                float32x4_t v_l = vld1q_f32(lh + p);
-                float32x4_t v_r = vld1q_f32(rh + p);
-                v_acc = vfmaq_f32(v_acc, v_l, v_r);
-            }
-            float partial[4];
-            vst1q_f32(partial, v_acc);
-            acc = (double)(partial[0] + partial[1] + partial[2] + partial[3]);
-            for (; p < k; ++p) acc += (double)lh[p] * (double)rh[p];
-#else
-            for (int p = 0; p < k; ++p) acc += (double)lh[p] * (double)rh[p];
-#endif
-            op[j] = (float)acc;
+    const int nt = sp_threadpool_n_threads();
+    if (nt <= 1 || m < nt) {
+        // Single-threaded: skip the parallel_for plumbing entirely.
+        for (int i = 0; i < m; ++i) {
+            matmul_f32_row(lhs + (size_t)i * k, rhs, k, n,
+                           out + (size_t)i * n);
         }
+        return;
     }
+    // Partition output ROWS [0, m) across threads. Each thread writes
+    // a contiguous slice — no false sharing on output cache lines as
+    // long as `n * sizeof(float)` is comfortably > 64B (typically true).
+    sp_parallel_for([&](int tid) {
+        const int rows_per = (m + nt - 1) / nt;
+        const int i_start = tid * rows_per;
+        const int i_end   = (i_start + rows_per > m) ? m : i_start + rows_per;
+        for (int i = i_start; i < i_end; ++i) {
+            matmul_f32_row(lhs + (size_t)i * k, rhs, k, n,
+                           out + (size_t)i * n);
+        }
+    });
 }
 
 // ──────────────────────────────────────────────────────────────────
@@ -237,6 +260,38 @@ void sp_matmul_f32(const float* lhs, const float* rhs,
 // rows. That gives us O(m) reuse of every dequant — much better than
 // dequanting per-(m,j) pair.
 
+// Per-output-column slice: dequant row j of W, dot against all m
+// LHS rows. Used as the inner kernel for both threaded and
+// single-threaded paths.
+static inline void matmul_q5k_col(const float* lhs,
+                                   const sp_block_q5_K* row_blocks,
+                                   int m, int k, int n, int j,
+                                   int blocks_per_row,
+                                   float* row_scratch,
+                                   float* out) {
+    sp_dequant_q5_K_to_f32(row_blocks, row_scratch, (size_t)blocks_per_row);
+    for (int i = 0; i < m; ++i) {
+        const float* lh = lhs + (size_t)i * k;
+        double acc = 0.0;
+#if SP_HAS_NEON
+        int p = 0;
+        float32x4_t v_acc = vdupq_n_f32(0.0f);
+        for (; p + 4 <= k; p += 4) {
+            float32x4_t v_l = vld1q_f32(lh + p);
+            float32x4_t v_r = vld1q_f32(row_scratch + p);
+            v_acc = vfmaq_f32(v_acc, v_l, v_r);
+        }
+        float partial[4];
+        vst1q_f32(partial, v_acc);
+        acc = (double)(partial[0] + partial[1] + partial[2] + partial[3]);
+        for (; p < k; ++p) acc += (double)lh[p] * (double)row_scratch[p];
+#else
+        for (int p = 0; p < k; ++p) acc += (double)lh[p] * (double)row_scratch[p];
+#endif
+        out[(size_t)i * n + j] = (float)acc;
+    }
+}
+
 void sp_matmul_f32_q5k(const float* lhs, const void* rhs_q5k,
                        int m, int k, int n, float* out) {
     if (k % SP_QK_K != 0) {
@@ -246,40 +301,35 @@ void sp_matmul_f32_q5k(const float* lhs, const void* rhs_q5k,
     }
     const int blocks_per_row = k / SP_QK_K;
     const auto* blocks_base  = (const sp_block_q5_K*)rhs_q5k;
+    const int nt = sp_threadpool_n_threads();
 
-    // Scratch for one dequantized row. 4 KB at k=4096 — fits in L1
-    // easily. Allocated on stack via std::malloc to avoid VLA issues
-    // on MSVC; small and freed at function exit.
-    std::vector<float> row_scratch((size_t)k);
-
-    for (int j = 0; j < n; ++j) {
-        const sp_block_q5_K* row_blocks =
-            blocks_base + (size_t)j * blocks_per_row;
-        sp_dequant_q5_K_to_f32(row_blocks, row_scratch.data(),
-                               (size_t)blocks_per_row);
-
-        for (int i = 0; i < m; ++i) {
-            const float* lh = lhs + (size_t)i * k;
-            const float* rh = row_scratch.data();
-            double acc = 0.0;
-#if SP_HAS_NEON
-            int p = 0;
-            float32x4_t v_acc = vdupq_n_f32(0.0f);
-            for (; p + 4 <= k; p += 4) {
-                float32x4_t v_l = vld1q_f32(lh + p);
-                float32x4_t v_r = vld1q_f32(rh + p);
-                v_acc = vfmaq_f32(v_acc, v_l, v_r);
-            }
-            float partial[4];
-            vst1q_f32(partial, v_acc);
-            acc = (double)(partial[0] + partial[1] + partial[2] + partial[3]);
-            for (; p < k; ++p) acc += (double)lh[p] * (double)rh[p];
-#else
-            for (int p = 0; p < k; ++p) acc += (double)lh[p] * (double)rh[p];
-#endif
-            out[(size_t)i * n + j] = (float)acc;
+    if (nt <= 1 || n < nt) {
+        // Single-threaded: one shared scratch row.
+        std::vector<float> row_scratch((size_t)k);
+        for (int j = 0; j < n; ++j) {
+            matmul_q5k_col(lhs,
+                           blocks_base + (size_t)j * blocks_per_row,
+                           m, k, n, j, blocks_per_row,
+                           row_scratch.data(), out);
         }
+        return;
     }
+    // Partition output COLUMNS [0, n) across threads. Each thread
+    // owns its own dequant scratch row (one fp32 row per thread —
+    // ~16 KB at k=4096 × 4 threads = 64 KB total, well under L1
+    // pressure even per-core).
+    sp_parallel_for([&](int tid) {
+        std::vector<float> row_scratch((size_t)k);
+        const int cols_per = (n + nt - 1) / nt;
+        const int j_start = tid * cols_per;
+        const int j_end   = (j_start + cols_per > n) ? n : j_start + cols_per;
+        for (int j = j_start; j < j_end; ++j) {
+            matmul_q5k_col(lhs,
+                           blocks_base + (size_t)j * blocks_per_row,
+                           m, k, n, j, blocks_per_row,
+                           row_scratch.data(), out);
+        }
+    });
 }
 
 }  // namespace sp::engine
