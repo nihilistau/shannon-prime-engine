@@ -3,6 +3,7 @@
 
 #include "forward_native.h"
 
+#include "kv_cache.h"          // KvCache — SP-banded compress/decompress
 #include "sp_kernels_cpu.h"
 #include "sp_quant.h"
 #include "sp_tensor.h"
@@ -125,13 +126,17 @@ int forward_native_attention(const ForwardNativeLayer&   layer,
     const int head_dim   = hp.head_dim;
     const int n_q_dim    = n_head * head_dim;        // Q feature width
     const int n_kv_dim   = n_head_kv * head_dim;     // K/V feature width
-    const int n_pos_past = kv.n_pos;
+    const int n_pos_past = kv.n_pos_past;
     const int n_pos_full = n_pos_past + n_seq;
 
-    if (n_pos_full > kv.max_seq) {
+    if (!kv.kv) {
+        std::fprintf(stderr, "[sp_native] attn: kv.kv is null\n");
+        return -1;
+    }
+    if (n_pos_full > kv.kv->max_seq()) {
         std::fprintf(stderr,
             "[sp_native] attn: kv overflow (have %d, need %d)\n",
-            kv.max_seq, n_pos_full);
+            kv.kv->max_seq(), n_pos_full);
         return -1;
     }
 
@@ -199,27 +204,20 @@ int forward_native_attention(const ForwardNativeLayer&   layer,
     sp_rope_f32(K, head_dim, n_head_kv, n_seq, pos,
                 hp.n_rot, hp.rope_freq_base, hp.rope_freq_scale);
 
-    // ── Append K/V to cache ──────────────────────────────────────
-    // Cache layout: [head_dim, n_head_kv, max_seq] fp16. Per
-    // position p: cache[k][p][h][d] = K_post_rope[seq_idx][h][d].
-    for (int s = 0; s < n_seq; ++s) {
-        const int p = n_pos_past + s;
-        for (int h = 0; h < n_head_kv; ++h) {
-            const float* k_src = K + (size_t)s * n_kv_dim + (size_t)h * head_dim;
-            const float* v_src = V + (size_t)s * n_kv_dim + (size_t)h * head_dim;
-            uint16_t* k_dst = kv.k_cache
-                + (size_t)p * n_head_kv * head_dim
-                + (size_t)h * head_dim;
-            uint16_t* v_dst = kv.v_cache
-                + (size_t)p * n_head_kv * head_dim
-                + (size_t)h * head_dim;
-            for (int d = 0; d < head_dim; ++d) {
-                k_dst[d] = sp_fp32_to_fp16(k_src[d]);
-                v_dst[d] = sp_fp32_to_fp16(v_src[d]);
-            }
-        }
+    // ── Append K/V to cache (SP-banded compression) ──────────────
+    // K/V are laid out [n_seq, n_head_kv, head_dim] row-major — i.e.
+    // K[(s * n_head_kv + h) * head_dim + d]. This matches KvCache::write's
+    // K_flat layout exactly, so we hand the buffer through.
+    //
+    // Compression happens INSIDE write(): VHT2 → Möbius reorder → band
+    // quantize. ~10× memory savings vs fp16 slabs. The per-layer state
+    // (compressed bytes) lives in kv.kv (the engine's KvCache).
+    if (!kv.kv->write(kv.layer_idx, n_pos_past, n_seq, K, V)) {
+        std::fprintf(stderr,
+            "[sp_native] attn: KvCache::write failed (layer=%d pos=%d n=%d)\n",
+            kv.layer_idx, n_pos_past, n_seq);
+        return -1;
     }
-    kv.n_pos = n_pos_full;
 
     // ── Attention compute (per-head loop) ────────────────────────
     // Allocate per-head intermediates from the arena. Reused per head.
@@ -237,6 +235,19 @@ int forward_native_attention(const ForwardNativeLayer&   layer,
     std::vector<float> scores((size_t)n_seq * n_kv_total);
     std::vector<float> mask_buf((size_t)n_seq * n_kv_total, 0.0f);
 
+    // ── Decompress full K/V history once for this layer ──────────
+    // KvCache::read returns flat layout K_all[(p * n_head_kv + hk) * head_dim + d].
+    // We do one decompress (running VHT2 inverse + dequant on every band)
+    // then per-head gather in the loop below — far cheaper than calling
+    // read() per head, and a single arena-friendly allocation.
+    std::vector<float> K_all, V_all;
+    if (!kv.kv->read(kv.layer_idx, n_kv_total, K_all, V_all)) {
+        std::fprintf(stderr,
+            "[sp_native] attn: KvCache::read failed (layer=%d kv_len=%d)\n",
+            kv.layer_idx, n_kv_total);
+        return -1;
+    }
+
     // Causal mask: for each query position (n_pos_past + s), block
     // out future positions. Mask is +0 where allowed, -INF where
     // blocked, ADDED to scores before softmax.
@@ -253,19 +264,19 @@ int forward_native_attention(const ForwardNativeLayer&   layer,
     for (int h = 0; h < n_head; ++h) {
         const int hk = h / gqa_ratio;     // shared-KV head index
 
-        // Build K_full[head_dim, n_kv_total] and V_full likewise from
-        // the fp16 cache for this KV head, dequanting back to fp32.
+        // Strided gather from K_all/V_all (flat [n_kv_total, n_head_kv,
+        // head_dim] layout) into per-head contiguous K_full/V_full
+        // [n_kv_total, head_dim]. K_all has already been decompressed
+        // (VHT2 inverse + band dequant) by the read() above.
         for (int p = 0; p < n_kv_total; ++p) {
-            const uint16_t* k_src = kv.k_cache
-                + (size_t)p * n_head_kv * head_dim
-                + (size_t)hk * head_dim;
-            const uint16_t* v_src = kv.v_cache
-                + (size_t)p * n_head_kv * head_dim
-                + (size_t)hk * head_dim;
-            for (int d = 0; d < head_dim; ++d) {
-                K_full[(size_t)p * head_dim + d] = sp_fp16_to_fp32(k_src[d]);
-                V_full[(size_t)p * head_dim + d] = sp_fp16_to_fp32(v_src[d]);
-            }
+            const float* k_src = K_all.data()
+                + (size_t)(p * n_head_kv + hk) * head_dim;
+            const float* v_src = V_all.data()
+                + (size_t)(p * n_head_kv + hk) * head_dim;
+            std::memcpy(K_full.data() + (size_t)p * head_dim,
+                        k_src, (size_t)head_dim * sizeof(float));
+            std::memcpy(V_full.data() + (size_t)p * head_dim,
+                        v_src, (size_t)head_dim * sizeof(float));
         }
 
         // Q for this head: [n_seq, head_dim] view into Q.

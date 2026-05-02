@@ -4,6 +4,7 @@
 
 #include "forward_native.h"
 #include "gguf_loader.h"
+#include "kv_cache.h"
 #include "llama_weights.h"
 #include "sp_kernels_cpu.h"
 #include "sp_quant.h"
@@ -287,10 +288,13 @@ struct ForwardNativeContext::Impl {
     // Per-layer bound views.
     std::vector<ForwardNativeLayer> layers_bound;
 
-    // Per-layer KV state. Each layer owns max_seq * n_head_kv * head_dim
-    // fp16 K and V slabs.
+    // Per-layer KV state. The KvCache object owns the SP-banded
+    // compressed storage (VHT2 + Möbius + band quantize on write,
+    // inverse on read). One KvCache shared across all layers; the
+    // per-layer ForwardNativeKv is a thin pointer-pair binding the
+    // cache + layer_idx + n_pos_past for each layer call.
+    std::unique_ptr<KvCache>     kvcache;
     std::vector<ForwardNativeKv> kv;
-    std::vector<uint16_t>        kv_storage;  // owned: K then V per layer
 
     // LM head + final norm pointers.
     const ggml_tensor* tok_embd    = nullptr;
@@ -447,16 +451,43 @@ std::unique_ptr<ForwardNativeContext> ForwardNativeContext::create(
     }
 #endif
 
-    // Allocate KV storage for all layers. Per layer: max_seq * n_head_kv
-    // * head_dim fp16 each for K and V.
-    const size_t per_layer_kv = (size_t)I.max_seq * I.hp.n_head_kv * I.hp.head_dim;
-    I.kv_storage.assign((size_t)I.n_layer * 2 * per_layer_kv, 0);
+    // Allocate compressed KV cache (Shannon-Prime SP-banded ship path:
+    // VHT2 + Möbius + band quantize on write, inverse on read).
+    // ~10× memory savings vs the fp16 slab path, and the underlying
+    // sp_shadow_cache_t is the same primitive that lights up the HVX
+    // fused decompress+matmul kernel on cDSP (Phase 1.6 leapfrog).
+    {
+        Config cfg;
+        cfg.sqfree        = false;
+        cfg.spinor        = false;
+        cfg.mobius        = true;
+        cfg.k_bits_csv    = "5,5,4,3";
+        cfg.v_bits_csv    = "3";
+        cfg.residual_bits = 3;
+        cfg.hierarchical  = false;
+        // Allow env override of compression aggressiveness without
+        // rewiring the engine's main Config plumbing.
+        if (const char* s = std::getenv("SP_NATIVE_K_BITS")) cfg.k_bits_csv = s;
+        if (const char* s = std::getenv("SP_NATIVE_V_BITS")) cfg.v_bits_csv = s;
+
+        I.kvcache = KvCache::create(I.n_layer, I.hp.n_head_kv, I.hp.head_dim,
+                                     I.max_seq, cfg);
+        if (!I.kvcache) {
+            std::fprintf(stderr,
+                "[sp_native] context: KvCache::create failed\n");
+            return nullptr;
+        }
+        std::fprintf(stderr,
+            "[sp_native] kv: SP-banded cache (n_layer=%d n_head_kv=%d "
+            "head_dim=%d max_seq=%d) — %s\n",
+            I.n_layer, I.hp.n_head_kv, I.hp.head_dim, I.max_seq,
+            I.kvcache->describe().c_str());
+    }
     I.kv.resize(I.n_layer);
     for (int L = 0; L < I.n_layer; ++L) {
-        I.kv[L].k_cache = I.kv_storage.data() + (size_t)L * 2 * per_layer_kv;
-        I.kv[L].v_cache = I.kv_storage.data() + (size_t)L * 2 * per_layer_kv + per_layer_kv;
-        I.kv[L].max_seq = I.max_seq;
-        I.kv[L].n_pos   = 0;
+        I.kv[L].kv         = I.kvcache.get();
+        I.kv[L].layer_idx  = L;
+        I.kv[L].n_pos_past = 0;
     }
 
     // Top-level pointers.
@@ -508,7 +539,27 @@ int ForwardNativeContext::max_seq()   const { return impl_->max_seq; }
 
 void ForwardNativeContext::reset() {
     auto& I = *impl_;
-    for (auto& kv : I.kv) kv.n_pos = 0;
+    // Drop the SP-banded cache and re-create it. The cache owns
+    // calibration state + compressed bytes; cheaper / safer than
+    // adding a public clear() to KvCache for now.
+    if (I.kvcache) {
+        Config cfg;
+        cfg.sqfree        = false;
+        cfg.spinor        = false;
+        cfg.mobius        = true;
+        cfg.k_bits_csv    = "5,5,4,3";
+        cfg.v_bits_csv    = "3";
+        cfg.residual_bits = 3;
+        if (const char* s = std::getenv("SP_NATIVE_K_BITS")) cfg.k_bits_csv = s;
+        if (const char* s = std::getenv("SP_NATIVE_V_BITS")) cfg.v_bits_csv = s;
+        I.kvcache = KvCache::create(I.n_layer, I.hp.n_head_kv, I.hp.head_dim,
+                                     I.max_seq, cfg);
+    }
+    for (int L = 0; L < I.n_layer; ++L) {
+        I.kv[L].kv         = I.kvcache.get();
+        I.kv[L].layer_idx  = L;
+        I.kv[L].n_pos_past = 0;
+    }
     I.n_pos = 0;
 }
 
@@ -525,6 +576,10 @@ static int run_layers(ForwardNativeContext::Impl& I,
 
     for (int L = 0; L < I.n_layer; ++L) {
         I.arena.reset();
+        // Stamp current sequence offset for this layer's call. All
+        // layers see the same n_pos_past — they all advance in lock
+        // step through the cache.
+        I.kv[L].n_pos_past = I.n_pos;
         int rc = forward_native_layer(I.layers_bound[L], I.hp,
                                        x_io, pos, n_seq,
                                        I.kv[L], I.arena, x_next.data());
