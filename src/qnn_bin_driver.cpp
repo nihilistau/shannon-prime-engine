@@ -104,8 +104,15 @@ void print_io(const char* label,
                 infos[i].dims[d],
                 d + 1 == infos[i].rank ? "" : ", ");
         }
-        std::fprintf(stderr, "] bytes=%zu%s\n",
-            tensor_bytes(infos[i]),
+        std::fprintf(stderr, "] bytes=%zu",
+            tensor_bytes(infos[i]));
+        if (infos[i].quant_encoding != 0) {
+            std::fprintf(stderr, " quant{enc=%u scale=%.6g offset=%d}",
+                (unsigned)infos[i].quant_encoding,
+                (double)infos[i].quant_scale,
+                (int)infos[i].quant_offset);
+        }
+        std::fprintf(stderr, "%s\n",
             (int)i == residual_idx ? "  ← residual" : "");
     }
 }
@@ -683,22 +690,27 @@ int qnn_bin_generate_one(const std::vector<std::string>& split_paths,
                 free_split(s); return -3;
             }
             // logits shape [1, 128, vocab]; bytes = 1 * 128 * vocab * 2.
+            // CRITICAL: the .bin declares dtype=1046 = QNN_DATATYPE_UFIXED_POINT_16,
+            // not fp16! Output is uint16 with per-tensor scale+offset
+            // (which we don't currently expose from sp_qnn_tensor_info).
+            // For argmax, dequant is monotonic linear (scale > 0), so
+            // argmax over uint16 == argmax over fp32. Use uint16 directly.
             const size_t total_bytes = s.out_sz[(size_t)logits_idx];
             const int    vocab = (int)(total_bytes / 2 / (size_t)ar);
             const uint16_t* logits =
                 (const uint16_t*)s.out_bufs[(size_t)logits_idx];
             const int last_q = n_real_clamped - 1;
             const uint16_t* row = logits + (size_t)last_q * vocab;
-            int    best_id = 0;
-            float  best_v  = -1.0e30f;
+            int      best_id = 0;
+            uint16_t best_v  = 0;
             for (int v = 0; v < vocab; ++v) {
-                const float f = sp_fp16_to_fp32(row[v]);
-                if (f > best_v) { best_v = f; best_id = v; }
+                if (row[v] > best_v) { best_v = row[v]; best_id = v; }
             }
             *picked_token_id = best_id;
             std::fprintf(stderr,
-                "[qnn_bin] logits[%d]: argmax id=%d value=%.4f (vocab=%d)\n",
-                last_q, best_id, best_v, vocab);
+                "[qnn_bin] logits[%d]: argmax id=%d uint16=%u (vocab=%d) "
+                "[NOTE: dtype=UFIXED_16, true fp32 needs scale+offset]\n",
+                last_q, best_id, (unsigned)best_v, vocab);
         }
 
         free_split(s);

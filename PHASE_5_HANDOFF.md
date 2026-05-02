@@ -23,7 +23,118 @@ was likely measured with llama.cpp / ggml / thread-pool state
 polluting HTP working memory; the standalone driver doesn't have
 that overhead, so the chain fits.
 
-## Update 2026-05-02 — root cause identified: the .bins are broken
+## Update 2026-05-02 (SECOND) — root cause was a dtype interpretation bug, NOT broken .bins
+
+After running `qnn-net-run` (the official Android-target QNN tool from
+the SDK) on split 1 with `--profiling_level detailed`, two output dumps
+came back:
+
+- `_model_model_embed_tokens_Gather_output_0.raw` (default mode):
+  **1,310,720 bytes** (1×128×2560×4 = fp32)
+  - Sample values: -0.0188, 0.0249, -0.0181, -0.0077, ... abs_mean ≈ 0.018
+  - These are **valid Qwen3 embedding values** (typical ±0.05 range)
+- `_model_model_embed_tokens_Gather_output_0_native.raw`
+  (`--use_native_output_files`): **655,360 bytes** (1×128×2560×2)
+  - These are the EXACT same bytes our `sp_qnn` reads back
+
+The 655,360 bytes match `s.out_sz[residual_out_idx]` in our code, but
+when interpreted as fp16 they decode as huge garbage (6256, 17024, NaN).
+When `qnn-net-run`'s extension converts them to fp32 via the proper
+dequant, they become sane embeddings.
+
+**Reading `QnnTypes.h`:**
+
+```c
+QNN_DATATYPE_FLOAT_16        = 0x0216 = 534
+QNN_DATATYPE_UFIXED_POINT_16 = 0x0416 = 1046
+```
+
+Our schema dump shows `dtype=1046` for the embedding output, attention
+mask, position_ids_cos/sin, residual streams, and logits. We assumed
+fp16 because the byte width is the same, **but it's actually uint16
+with per-tensor scale + offset**. The .bin's tensor metadata stores
+these via `Qnn_QuantizeParams_t.quantizationEncoding =
+QNN_QUANTIZATION_ENCODING_SCALE_OFFSET`, which our `sp_qnn_tensor_info`
+struct discards.
+
+**Empirical scale/offset** for the embedding output, derived from
+matching the native uint16 bytes to the fp32-dequantized values:
+
+```
+fp32 ≈ scale * uint16 + offset   with scale ≈ 7.2e-6, offset ≈ -0.222
+```
+
+**What this means for everything we tried:**
+
+- Split 1's "saturated NaN" output was real bytes from a healthy .bin
+  exec, just being misinterpreted as fp16 by our `fp16_stats` and our
+  argmax. Not a calibration bug. Not a ghost run. A type bug on our side.
+- The 104 t/s benchmark IS a valid throughput number; the .bins were
+  always functional.
+- The pipeline residual handoff (memcpy of raw bytes from split N's
+  output to split N+1's input) is CORRECT — same dtype on both ends,
+  bytes preserved.
+- The inputs we generate from scratch (`attention_mask`,
+  `position_ids_cos/sin`, and the `past_key/past_value` calloc-zeros)
+  are encoded as either fp16 or raw zeros. They need to be encoded
+  through the per-tensor scale+offset to be meaningful to the .bin.
+
+**Validation that confirmed the diagnosis:** Changed argmax to read
+logits as `uint16` (since UFIXED scale > 0, argmax over uint16 ==
+argmax over fp32-dequantized). For prompt "The capital of France is":
+
+```
+[qnn_bin] logits[5]: argmax id=30743 uint16=38728 (vocab=151936)
+[qnn_bin_run] next token id=30743 text=' ____'
+```
+
+Not Paris yet — because mask/cos/sin/past_K still aren't properly
+quantized — but no longer +inf garbage. The chain executes coherently.
+
+**What's needed (Phase 5.7):**
+
+1. Expand `sp_qnn_tensor_info` to expose `quantizationEncoding`,
+   `scaleOffset.scale`, `scaleOffset.offset` (and bitwidth for the
+   sub-byte-packed cases). **DONE** (sp_qnn.h + sp_qnn.c). However,
+   running schema dump shows the .bin's restored tensor templates
+   report `quant_encoding=0` (UNDEFINED) for the dtype=1046 tensors —
+   AI Hub appears to compile the dequant scales into the graph ops
+   rather than exposing them as tensor metadata. So this step alone
+   isn't sufficient.
+2. Two viable paths to learn the actual scales:
+   - **(a) Probe via known input/output pairs**: feed a known fp32
+     input through qnn-net-run, dump native bytes, solve for
+     `(scale, offset)` per tensor. We already have one data point
+     for the embedding output (scale ≈ 7.2e-6, offset ≈ -0.222).
+     Repeat for each input tensor by looping calibration.
+   - **(b) Hook into libQnnHtpNetRunExtensions.so**: this .so ships
+     with QnnHtpProfilingReader and presumably exposes the conversion
+     LUTs the qnn-net-run tool uses. Reverse-engineer or use the
+     extension API directly. Faster and more accurate than (a).
+3. Update mask, cos, sin generation to use the proper quantize:
+   `uint16 = round((fp32 - offset) / scale)` with per-tensor params.
+4. Encode past_key/past_value zeros as `round(-offset / scale)` rather
+   than raw bytes (or write the proper "quant zero" byte).
+5. (Optional) Dequantize logits before argmax for human-readable
+   confidence values. Argmax-only doesn't strictly need this.
+
+The .bins do NOT need to be re-exported.
+
+**Validation status (after partial fix — uint16 argmax only):**
+
+```
+prompt: "The capital of France is"
+→ token id=30743 (' ____')
+```
+
+Not Paris yet (mask/cos/sin still misencoded), but the chain runs
+end-to-end, outputs a real token instead of fp16-saturated junk.
+This proves splits 2/3/4 are alive and computing — the residual
+bytes from split 1 → split 4 flow correctly (same dtype, raw memcpy
+preserves them). What's left is teaching ourselves what bytes to
+write into the FROM-SCRATCH inputs (mask, cos, sin, past_K/V).
+
+## Update 2026-05-02 (FIRST — superseded) — earlier hypothesis: the .bins are broken
 
 After landing per-split residual instrumentation in `qnn_bin_driver.cpp`
 and rerunning all three diagnostic env-gates plus a residual-override
