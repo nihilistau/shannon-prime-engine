@@ -281,10 +281,22 @@ int forward_native_attention(const ForwardNativeLayer&   layer,
 
         // scores[n_seq, n_kv_total] = Q_h[n_seq, head_dim] @
         //                              K_full[n_kv_total, head_dim]^T
-        // sp_matmul shape: lhs[m, k] @ rhs[n, k]^T → out[m, n]
-        // → m=n_seq, k=head_dim, n=n_kv_total
-        sp_matmul_f32(Q_h.data(), K_full.data(),
-                      n_seq, head_dim, n_kv_total, scores.data());
+        //
+        // Backend hook path: when layer.kq_dispatch is set, route to
+        // it (e.g. QNN HTP via sp_llama_qnn_matmul_dispatch). Falls
+        // through to CPU sp_matmul_f32 on hook failure so correctness
+        // floor holds even if HTP errors mid-session.
+        int kq_rc = -1;
+        if (layer.kq_dispatch) {
+            kq_rc = layer.kq_dispatch(layer.kq_dispatch_userdata,
+                                       Q_h.data(), K_full.data(),
+                                       n_seq, head_dim, n_kv_total,
+                                       scores.data());
+        }
+        if (kq_rc != 0) {
+            sp_matmul_f32(Q_h.data(), K_full.data(),
+                          n_seq, head_dim, n_kv_total, scores.data());
+        }
 
         // Softmax with scale + mask, row-wise over n_kv_total.
         sp_softmax_f32_rows(scores.data(), mask_buf.data(),
