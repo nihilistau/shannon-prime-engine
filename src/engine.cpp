@@ -7,6 +7,7 @@
 #include "engine.h"
 
 #include "forward.h"
+#include "forward_native_context.h"
 #include "gguf_loader.h"
 #include "kv_cache.h"
 #include "llama_weights.h"
@@ -69,8 +70,14 @@ struct Engine::Impl {
     std::unique_ptr<Tokenizer>         tok;
     std::unique_ptr<LlamaWeights>      weights;
     std::unique_ptr<ForwardContext>    fc;
+    // Phase 4: native forward path (no ggml graph). Constructed in
+    // load() when SP_ENGINE_NATIVE=1; used in generate() in place of
+    // fc->prefill / fc->decode. Mutually exclusive with fc for now.
+    std::unique_ptr<ForwardNativeContext> fnc;
+    bool                                  native_active = false;
 
     ~Impl() {
+        fnc.reset();
         fc.reset();
         weights.reset();
         tok.reset();
@@ -192,6 +199,33 @@ int Engine::load(const Config& cfg) {
             pe, impl_->backend);
     }
     if (!impl_->fc) return 6;
+
+    // ── Native forward (Phase 4) ────────────────────────────────────
+    // When SHANNON_PRIME_NATIVE=1 in env (or SP_ENGINE_NATIVE=1, both
+    // accepted), build a parallel ForwardNativeContext that drives
+    // the layer step without ggml's graph machinery. Engine::generate
+    // will use it in place of fc->prefill / fc->decode.
+    {
+        const char* a = std::getenv("SHANNON_PRIME_NATIVE");
+        const char* b = std::getenv("SP_ENGINE_NATIVE");
+        const bool want_native =
+            (a && a[0] == '1') || (b && b[0] == '1');
+        if (want_native) {
+            impl_->fnc = ForwardNativeContext::create(
+                *impl_->model, *impl_->weights);
+            if (impl_->fnc) {
+                impl_->native_active = true;
+                std::fprintf(stderr,
+                    "[sp-engine] native forward path active "
+                    "(SHANNON_PRIME_NATIVE=1)\n");
+            } else {
+                std::fprintf(stderr,
+                    "[sp-engine] SHANNON_PRIME_NATIVE=1 set but "
+                    "ForwardNativeContext::create returned null — "
+                    "falling back to ggml ForwardContext\n");
+            }
+        }
+    }
 
     impl_->loaded = true;
     return 0;
@@ -365,9 +399,17 @@ int Engine::generate(const std::string& prompt, int n_predict,
     std::vector<float> last_logits;
     int n_vocab_out = 0;
     const auto t_prefill_start = std::chrono::steady_clock::now();
-    if (!impl_->fc->prefill(ids, last_logits, n_vocab_out)) {
-        std::fprintf(stderr, "[sp-engine] Engine::generate: prefill failed\n");
-        return -1;
+    const bool use_native = impl_->native_active && impl_->fnc;
+    if (use_native) {
+        if (!impl_->fnc->prefill(ids, last_logits, n_vocab_out)) {
+            std::fprintf(stderr, "[sp-engine] native prefill failed\n");
+            return -1;
+        }
+    } else {
+        if (!impl_->fc->prefill(ids, last_logits, n_vocab_out)) {
+            std::fprintf(stderr, "[sp-engine] Engine::generate: prefill failed\n");
+            return -1;
+        }
     }
     const auto t_prefill_end = std::chrono::steady_clock::now();
     const double t_prefill_ms = std::chrono::duration<double, std::milli>(
@@ -431,7 +473,13 @@ int Engine::generate(const std::string& prompt, int n_predict,
 
         std::vector<float> step_logits;
         int step_nv = 0;
-        if (!impl_->fc->decode(tok_id, step_logits, step_nv)) {
+        bool ok;
+        if (use_native) {
+            ok = impl_->fnc->decode(tok_id, step_logits, step_nv);
+        } else {
+            ok = impl_->fc->decode(tok_id, step_logits, step_nv);
+        }
+        if (!ok) {
             std::fprintf(stderr,
                 "[sp-engine] Engine::generate: decode failed at step %d\n", i);
             break;
