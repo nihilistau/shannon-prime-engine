@@ -3,9 +3,14 @@
 
 #include "forward_native.h"
 
+#include "kv_cache.h"          // KvCache — SP-banded compress/decompress
 #include "sp_kernels_cpu.h"
 #include "sp_quant.h"
 #include "sp_tensor.h"
+
+#ifdef SP_HEXAGON_FASTRPC
+#include "shannon_prime_hexagon.h"   // sp_hexagon_cache_kq_matmul_fused
+#endif
 
 #include "ggml.h"   // type_traits.to_float for quant types we don't yet
                     // have native fused-matmul kernels for. Used at one
@@ -125,13 +130,17 @@ int forward_native_attention(const ForwardNativeLayer&   layer,
     const int head_dim   = hp.head_dim;
     const int n_q_dim    = n_head * head_dim;        // Q feature width
     const int n_kv_dim   = n_head_kv * head_dim;     // K/V feature width
-    const int n_pos_past = kv.n_pos;
+    const int n_pos_past = kv.n_pos_past;
     const int n_pos_full = n_pos_past + n_seq;
 
-    if (n_pos_full > kv.max_seq) {
+    if (!kv.kv) {
+        std::fprintf(stderr, "[sp_native] attn: kv.kv is null\n");
+        return -1;
+    }
+    if (n_pos_full > kv.kv->max_seq()) {
         std::fprintf(stderr,
             "[sp_native] attn: kv overflow (have %d, need %d)\n",
-            kv.max_seq, n_pos_full);
+            kv.kv->max_seq(), n_pos_full);
         return -1;
     }
 
@@ -199,27 +208,56 @@ int forward_native_attention(const ForwardNativeLayer&   layer,
     sp_rope_f32(K, head_dim, n_head_kv, n_seq, pos,
                 hp.n_rot, hp.rope_freq_base, hp.rope_freq_scale);
 
-    // ── Append K/V to cache ──────────────────────────────────────
-    // Cache layout: [head_dim, n_head_kv, max_seq] fp16. Per
-    // position p: cache[k][p][h][d] = K_post_rope[seq_idx][h][d].
-    for (int s = 0; s < n_seq; ++s) {
-        const int p = n_pos_past + s;
-        for (int h = 0; h < n_head_kv; ++h) {
-            const float* k_src = K + (size_t)s * n_kv_dim + (size_t)h * head_dim;
-            const float* v_src = V + (size_t)s * n_kv_dim + (size_t)h * head_dim;
-            uint16_t* k_dst = kv.k_cache
-                + (size_t)p * n_head_kv * head_dim
-                + (size_t)h * head_dim;
-            uint16_t* v_dst = kv.v_cache
-                + (size_t)p * n_head_kv * head_dim
-                + (size_t)h * head_dim;
-            for (int d = 0; d < head_dim; ++d) {
-                k_dst[d] = sp_fp32_to_fp16(k_src[d]);
-                v_dst[d] = sp_fp32_to_fp16(v_src[d]);
+    // ── Append K/V to cache (SP-banded compression) ──────────────
+    // K/V are laid out [n_seq, n_head_kv, head_dim] row-major — i.e.
+    // K[(s * n_head_kv + h) * head_dim + d]. This matches KvCache::write's
+    // K_flat layout exactly, so we hand the buffer through.
+    //
+    // Compression happens INSIDE write(): VHT2 → Möbius reorder → band
+    // quantize. ~10× memory savings vs fp16 slabs. The per-layer state
+    // (compressed bytes) lives in kv.kv (the engine's KvCache).
+    //
+    // Calibration pass: feed each K vector to calibrate_feed instead of
+    // writing. Attention below will run on the local K/V buffer so the
+    // cache never holds uncalibrated data. Caller does calibrate_end()
+    // after the calibration pass, then re-runs prefill with the flag off.
+    if (kv.calibrate_pass) {
+        for (int s = 0; s < n_seq; ++s) {
+            for (int h = 0; h < n_head_kv; ++h) {
+                const float* k_src = K + (size_t)s * n_kv_dim
+                                       + (size_t)h * head_dim;
+                kv.kv->calibrate_feed(k_src);
             }
         }
+    } else {
+        if (!kv.kv->write(kv.layer_idx, n_pos_past, n_seq, K, V)) {
+            std::fprintf(stderr,
+                "[sp_native] attn: KvCache::write failed (layer=%d pos=%d n=%d)\n",
+                kv.layer_idx, n_pos_past, n_seq);
+            return -1;
+        }
+#ifdef SP_HEXAGON_FASTRPC
+        // Mirror K into the hexagon cache so HVX kq_matmul_fused has
+        // bytes to read against. The hexagon cache stores per-(layer,
+        // head) so we gather strided per head. Buffer layout from
+        // forward_native: K[(s * n_head_kv + h) * head_dim + d].
+        if (kv.hex_cache) {
+            sp_hexagon_cache_t* hex = (sp_hexagon_cache_t*)kv.hex_cache;
+            std::vector<float> k_head((size_t)n_seq * head_dim);
+            for (int h = 0; h < n_head_kv; ++h) {
+                for (int s = 0; s < n_seq; ++s) {
+                    const float* k_src = K + (size_t)s * n_kv_dim
+                                           + (size_t)h * head_dim;
+                    std::memcpy(k_head.data() + (size_t)s * head_dim,
+                                k_src, (size_t)head_dim * sizeof(float));
+                }
+                sp_hexagon_cache_write_k_batch(hex, kv.layer_idx, h,
+                                                n_pos_past, n_seq,
+                                                k_head.data());
+            }
+        }
+#endif
     }
-    kv.n_pos = n_pos_full;
 
     // ── Attention compute (per-head loop) ────────────────────────
     // Allocate per-head intermediates from the arena. Reused per head.
@@ -237,6 +275,33 @@ int forward_native_attention(const ForwardNativeLayer&   layer,
     std::vector<float> scores((size_t)n_seq * n_kv_total);
     std::vector<float> mask_buf((size_t)n_seq * n_kv_total, 0.0f);
 
+    // ── Decompress full K/V history once for this layer ──────────
+    // KvCache::read returns flat layout K_all[(p * n_head_kv + hk) * head_dim + d].
+    // We do one decompress (running VHT2 inverse + dequant on every band)
+    // then per-head gather in the loop below — far cheaper than calling
+    // read() per head, and a single arena-friendly allocation.
+    //
+    // Calibration pass: skip decompress; alias K_all/V_all to the local
+    // just-computed K/V. They share the [n_seq, n_head_kv, head_dim]
+    // layout the head-loop gather expects, and n_pos_past was zero so
+    // n_kv_total == n_seq below.
+    std::vector<float> K_all_owned, V_all_owned;
+    const float* K_all_ptr;
+    const float* V_all_ptr;
+    if (kv.calibrate_pass) {
+        K_all_ptr = K;
+        V_all_ptr = V;
+    } else {
+        if (!kv.kv->read(kv.layer_idx, n_kv_total, K_all_owned, V_all_owned)) {
+            std::fprintf(stderr,
+                "[sp_native] attn: KvCache::read failed (layer=%d kv_len=%d)\n",
+                kv.layer_idx, n_kv_total);
+            return -1;
+        }
+        K_all_ptr = K_all_owned.data();
+        V_all_ptr = V_all_owned.data();
+    }
+
     // Causal mask: for each query position (n_pos_past + s), block
     // out future positions. Mask is +0 where allowed, -INF where
     // blocked, ADDED to scores before softmax.
@@ -253,19 +318,21 @@ int forward_native_attention(const ForwardNativeLayer&   layer,
     for (int h = 0; h < n_head; ++h) {
         const int hk = h / gqa_ratio;     // shared-KV head index
 
-        // Build K_full[head_dim, n_kv_total] and V_full likewise from
-        // the fp16 cache for this KV head, dequanting back to fp32.
+        // Strided gather from K_all/V_all (flat [n_kv_total, n_head_kv,
+        // head_dim] layout) into per-head contiguous K_full/V_full
+        // [n_kv_total, head_dim]. K_all has already been decompressed
+        // (VHT2 inverse + band dequant) by the read() above — except
+        // on the calibration pass where K_all aliases the local
+        // just-computed K (fp32, no compression).
         for (int p = 0; p < n_kv_total; ++p) {
-            const uint16_t* k_src = kv.k_cache
-                + (size_t)p * n_head_kv * head_dim
-                + (size_t)hk * head_dim;
-            const uint16_t* v_src = kv.v_cache
-                + (size_t)p * n_head_kv * head_dim
-                + (size_t)hk * head_dim;
-            for (int d = 0; d < head_dim; ++d) {
-                K_full[(size_t)p * head_dim + d] = sp_fp16_to_fp32(k_src[d]);
-                V_full[(size_t)p * head_dim + d] = sp_fp16_to_fp32(v_src[d]);
-            }
+            const float* k_src = K_all_ptr
+                + (size_t)(p * n_head_kv + hk) * head_dim;
+            const float* v_src = V_all_ptr
+                + (size_t)(p * n_head_kv + hk) * head_dim;
+            std::memcpy(K_full.data() + (size_t)p * head_dim,
+                        k_src, (size_t)head_dim * sizeof(float));
+            std::memcpy(V_full.data() + (size_t)p * head_dim,
+                        v_src, (size_t)head_dim * sizeof(float));
         }
 
         // Q for this head: [n_seq, head_dim] view into Q.
@@ -282,12 +349,36 @@ int forward_native_attention(const ForwardNativeLayer&   layer,
         // scores[n_seq, n_kv_total] = Q_h[n_seq, head_dim] @
         //                              K_full[n_kv_total, head_dim]^T
         //
-        // Backend hook path: when layer.kq_dispatch is set, route to
-        // it (e.g. QNN HTP via sp_llama_qnn_matmul_dispatch). Falls
-        // through to CPU sp_matmul_f32 on hook failure so correctness
-        // floor holds even if HTP errors mid-session.
+        // Dispatch order (first hit wins):
+        //   1. HVX fused decompress+matmul on cDSP — reads compressed
+        //      K bytes directly out of the hexagon cache, runs the
+        //      fused decompress+matmul kernel from Phase 1.6 (1.79×
+        //      prefill speedup measured on S22U). Skipped during
+        //      calibration pass since hex_cache hasn't been written
+        //      with the calibrated bytes yet.
+        //   2. layer.kq_dispatch — generic backend hook (QNN HTP via
+        //      sp_llama_qnn_matmul_dispatch).
+        //   3. CPU sp_matmul_f32 — correctness floor.
+        // ── Phase 1.6 fused decompress+matmul (CPU) ─────────────
+        // Reads packed K bytes directly out of the shadow cache slot
+        // and runs band_dequantize → mobius/var unreorder → VHT2
+        // self-inverse → dot per K row. Matches llama_sp_fused_kq.cpp
+        // (the validated CPU path that produced the 3.58× spec-decode
+        // win on S22U). Skipped on calibration pass (cache hasn't been
+        // written yet).
         int kq_rc = -1;
-        if (layer.kq_dispatch) {
+        if (!kv.calibrate_pass && kv.kv) {
+            // KvCache::kq_fused_cpu writes scores[(q,kv)] in [n_q, n_kv]
+            // row-major. n_q = n_seq, n_kv = n_kv_total. That's exactly
+            // what sp_matmul_f32(Q_h, K_full, n_seq, hd, n_kv_total,
+            // scores) produces — drop-in.
+            if (kv.kv->kq_fused_cpu(kv.layer_idx, hk, n_kv_total,
+                                    Q_h.data(), n_seq,
+                                    scores.data())) {
+                kq_rc = 0;
+            }
+        }
+        if (kq_rc != 0 && layer.kq_dispatch) {
             kq_rc = layer.kq_dispatch(layer.kq_dispatch_userdata,
                                        Q_h.data(), K_full.data(),
                                        n_seq, head_dim, n_kv_total,

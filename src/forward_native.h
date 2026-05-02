@@ -105,21 +105,46 @@ struct ForwardNativeHparams {
 };
 
 // ─────────────────────────────────────────────────────────────────
-// KV cache for one layer. Holds past K/V values that the layer step
-// reads from + appends to. Shapes:
-//   k_cache: [head_dim, n_head_kv, max_seq] fp16
-//   v_cache: [head_dim, n_head_kv, max_seq] fp16
-// Storage is contiguous; positions index along the outer dim.
+// KV cache binding for the layer step. Just a thin pointer-pair
+// referring to the engine's KvCache (which DOES the actual SP-banded
+// compression — VHT2 + Möbius + band quantize on write, inverse on
+// read). The forward pass owns nothing; the context owns the
+// underlying KvCache.
 //
-// Phase 4.4 first cut: plain fp16 (no SP-banded compression yet).
-// SP-banded layers on top later via the existing shannon-prime
-// hexagon backend — same buffer pointers, different read/write ops.
+// Phase 4.7: KV storage is now SP-banded packed bytes (~10× smaller
+// than fp16) via the engine's KvCache wrapper around sp_shadow_cache_t
+// (CPU ship-path compress/decompress). Hexagon backend variant
+// (sp_hexagon_cache_t with sp_hexagon_cache_kq_matmul_fused — the
+// HVX fused-decompress-matmul kernel from Phase 1.6) plugs in via
+// the same KvCache::create call when SP_HEXAGON_FASTRPC=ON.
 // ─────────────────────────────────────────────────────────────────
+class KvCache;  // forward-declared; full def in kv_cache.h
+
 struct ForwardNativeKv {
-    uint16_t* k_cache = nullptr;    // owned by caller
-    uint16_t* v_cache = nullptr;
-    int       max_seq = 0;
-    int       n_pos   = 0;          // number of positions written so far
+    KvCache* kv         = nullptr;   // borrowed; context owns it
+    int      layer_idx  = 0;
+    int      n_pos_past = 0;         // positions already in the cache
+
+    // First-prefill calibration pass. When true, forward_native_attention
+    // feeds each K vector to KvCache::calibrate_feed and runs attention
+    // off the local just-computed K/V (no cache write/read). This is how
+    // we train the Möbius reorder + per-band variance ranking on real
+    // RoPE'd K vectors before the cache holds anything compressed.
+    // Caller (ForwardNativeContext::prefill) flips this on for the first
+    // pass, calls calibrate_end() between passes, then runs the real
+    // prefill with calibrate_pass=false.
+    bool     calibrate_pass = false;
+
+    // Optional Hexagon cache pointer + matching ctx. When non-null AND
+    // SP_HEXAGON_FASTRPC build, K vectors are mirrored into the
+    // sp_hexagon_cache_t (compressed bytes resident on rpcmem-backed
+    // pages) and the per-head KQ matmul routes through
+    // sp_hexagon_cache_kq_matmul_fused — the HVX fused
+    // decompress+matmul kernel from Phase 1.6 (1.79× prefill speedup
+    // measured on S22U). Falls back to host CPU matmul on rc != 0.
+    // Type kept as void* so this header doesn't pull in the C-only
+    // hexagon header into every TU; cast at use site.
+    void*    hex_cache  = nullptr;
 };
 
 // ─────────────────────────────────────────────────────────────────

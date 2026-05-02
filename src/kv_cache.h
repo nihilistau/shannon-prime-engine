@@ -172,6 +172,32 @@ public:
     float compression_ratio() const;
     std::string describe()    const;
 
+    // --- Phase 1.6 fused decompress+matmul (CPU) ---------------------
+    //
+    // For one (layer, head_kv) pair, compute KQ scores against `n_kv`
+    // cached K positions without ever materialising the full
+    // [n_kv, head_dim] decompressed K matrix. Reads packed bytes
+    // directly out of the shadow cache slot, decompresses one K row
+    // at a time (sp_band_dequantize → mobius unreorder if active →
+    // sp_vht2_forward_f32 self-inverse), and dot-products against
+    // every Q row before moving to the next K row. Compressed bytes
+    // are ~10× smaller than fp32 K, so they stay in L2 cache and the
+    // kernel is ALU-bound rather than memory-bound — Phase 1.6's
+    // measured 1.79× ARM-CPU win on S22U.
+    //
+    // q_vec     : [n_q, head_dim] row-major fp32 host buffer.
+    // n_kv      : positions to attend over, taken from [0, n_kv).
+    // scores    : [n_q, n_kv] row-major fp32 output (note: same
+    //             layout sp_matmul_f32(Q, K, n_q, head_dim, n_kv,
+    //             scores) produces — caller can drop in as a
+    //             replacement). n_q × n_kv floats.
+    //
+    // Returns true on success. Currently only implemented for the
+    // shadow (ship) path; sqfree/hier and GPU caches return false.
+    bool kq_fused_cpu(int layer, int head_kv, int n_kv,
+                      const float* q_vec, int n_q,
+                      float* scores) const;
+
     // --- Cauchy reset system (decode-chain causal stability) ---
     //
     // Layers:

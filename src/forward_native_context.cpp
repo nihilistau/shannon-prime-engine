@@ -4,11 +4,16 @@
 
 #include "forward_native.h"
 #include "gguf_loader.h"
+#include "kv_cache.h"
 #include "llama_weights.h"
 #include "sp_kernels_cpu.h"
 #include "sp_quant.h"
 #include "sp_tensor.h"
 #include "sp_threadpool.h"
+
+#ifdef SP_HEXAGON_FASTRPC
+#include "shannon_prime_hexagon.h"
+#endif
 
 #include "ggml.h"   // ONLY for reading ggml_tensor metadata + data ptr
 
@@ -287,10 +292,13 @@ struct ForwardNativeContext::Impl {
     // Per-layer bound views.
     std::vector<ForwardNativeLayer> layers_bound;
 
-    // Per-layer KV state. Each layer owns max_seq * n_head_kv * head_dim
-    // fp16 K and V slabs.
+    // Per-layer KV state. The KvCache object owns the SP-banded
+    // compressed storage (VHT2 + Möbius + band quantize on write,
+    // inverse on read). One KvCache shared across all layers; the
+    // per-layer ForwardNativeKv is a thin pointer-pair binding the
+    // cache + layer_idx + n_pos_past for each layer call.
+    std::unique_ptr<KvCache>     kvcache;
     std::vector<ForwardNativeKv> kv;
-    std::vector<uint16_t>        kv_storage;  // owned: K then V per layer
 
     // LM head + final norm pointers.
     const ggml_tensor* tok_embd    = nullptr;
@@ -308,6 +316,16 @@ struct ForwardNativeContext::Impl {
     // graphFinalize cost ~50ms once per shape, then ~330µs per dispatch.
     sp_llama_qnn_matmul_cache* qnn_mm_cache = nullptr;
     bool qnn_active = false;
+#endif
+
+#ifdef SP_HEXAGON_FASTRPC
+    // Phase 4.8: optional sp_hexagon_cache_t mirroring K writes onto
+    // rpcmem-backed pages so sp_hexagon_cache_kq_matmul_fused (HVX
+    // fused decompress+matmul on cDSP) can read them with no host
+    // round-trip. Lazy-init when SHANNON_PRIME_HEXAGON=1 is set in env.
+    sp_hexagon_ctx_t*    hex_ctx   = nullptr;
+    sp_hexagon_cache_t   hex_cache = {};
+    bool                 hex_active = false;
 #endif
 };
 
@@ -447,17 +465,96 @@ std::unique_ptr<ForwardNativeContext> ForwardNativeContext::create(
     }
 #endif
 
-    // Allocate KV storage for all layers. Per layer: max_seq * n_head_kv
-    // * head_dim fp16 each for K and V.
-    const size_t per_layer_kv = (size_t)I.max_seq * I.hp.n_head_kv * I.hp.head_dim;
-    I.kv_storage.assign((size_t)I.n_layer * 2 * per_layer_kv, 0);
+    // Allocate compressed KV cache (Shannon-Prime SP-banded ship path:
+    // VHT2 + Möbius + band quantize on write, inverse on read).
+    // ~10× memory savings vs the fp16 slab path, and the underlying
+    // sp_shadow_cache_t is the same primitive that lights up the HVX
+    // fused decompress+matmul kernel on cDSP (Phase 1.6 leapfrog).
+    //
+    // When hexagon dispatch is active (SHANNON_PRIME_HEXAGON=1), we
+    // disable the shadow cache's Möbius reorder so that K bytes match
+    // what the DSP-side compress produces (which has no Möbius). This
+    // keeps the K view consistent across the two caches — important
+    // for KQ from hex + V from shadow to agree on K's identity.
+    const bool want_hexagon = []() {
+        const char* v = std::getenv("SHANNON_PRIME_HEXAGON");
+        return v && v[0] == '1';
+    }();
+    {
+        Config cfg;
+        cfg.sqfree        = false;
+        cfg.spinor        = false;
+        cfg.mobius        = !want_hexagon;
+        cfg.k_bits_csv    = "5,5,4,3";
+        cfg.v_bits_csv    = "3";
+        cfg.residual_bits = 3;
+        cfg.hierarchical  = false;
+        // Allow env override of compression aggressiveness without
+        // rewiring the engine's main Config plumbing.
+        if (const char* s = std::getenv("SP_NATIVE_K_BITS")) cfg.k_bits_csv = s;
+        if (const char* s = std::getenv("SP_NATIVE_V_BITS")) cfg.v_bits_csv = s;
+
+        I.kvcache = KvCache::create(I.n_layer, I.hp.n_head_kv, I.hp.head_dim,
+                                     I.max_seq, cfg);
+        if (!I.kvcache) {
+            std::fprintf(stderr,
+                "[sp_native] context: KvCache::create failed\n");
+            return nullptr;
+        }
+        std::fprintf(stderr,
+            "[sp_native] kv: SP-banded cache (n_layer=%d n_head_kv=%d "
+            "head_dim=%d max_seq=%d) — %s\n",
+            I.n_layer, I.hp.n_head_kv, I.hp.head_dim, I.max_seq,
+            I.kvcache->describe().c_str());
+    }
     I.kv.resize(I.n_layer);
     for (int L = 0; L < I.n_layer; ++L) {
-        I.kv[L].k_cache = I.kv_storage.data() + (size_t)L * 2 * per_layer_kv;
-        I.kv[L].v_cache = I.kv_storage.data() + (size_t)L * 2 * per_layer_kv + per_layer_kv;
-        I.kv[L].max_seq = I.max_seq;
-        I.kv[L].n_pos   = 0;
+        I.kv[L].kv         = I.kvcache.get();
+        I.kv[L].layer_idx  = L;
+        I.kv[L].n_pos_past = 0;
     }
+
+#ifdef SP_HEXAGON_FASTRPC
+    // ── Hexagon cache for HVX fused KQ (Phase 4.8) ──────────────────
+    // Activated when SHANNON_PRIME_HEXAGON=1 in env. Mirrors K writes
+    // onto rpcmem-backed pages so sp_hexagon_cache_kq_matmul_fused
+    // (cDSP HVX fused decompress+matmul, Phase 1.6 leapfrog primitive)
+    // can read them. ADSP_LIBRARY_PATH must point at a dir containing
+    // libsp_hex_skel.so for the FastRPC handshake to succeed.
+    {
+        const char* v = std::getenv("SHANNON_PRIME_HEXAGON");
+        if (v && v[0] == '1') {
+            sp_config_t cfg;
+            sp_config_init(&cfg, I.hp.head_dim, I.n_layer, I.hp.n_head_kv);
+            I.hex_ctx = sp_hexagon_init(&cfg);
+            if (I.hex_ctx) {
+                if (sp_hexagon_cache_init(&I.hex_cache, I.hex_ctx,
+                                          &cfg, I.max_seq) == 0) {
+                    I.hex_active = true;
+                    for (int L = 0; L < I.n_layer; ++L) {
+                        I.kv[L].hex_cache = &I.hex_cache;
+                    }
+                    std::fprintf(stderr,
+                        "[sp_native] Hexagon HVX-fused KQ active "
+                        "(SHANNON_PRIME_HEXAGON=1) — per-head matmul "
+                        "routes to sp_hexagon_cache_kq_matmul_fused\n");
+                } else {
+                    std::fprintf(stderr,
+                        "[sp_native] sp_hexagon_cache_init failed — "
+                        "staying on CPU/SP-banded path\n");
+                    sp_hexagon_free(I.hex_ctx);
+                    I.hex_ctx = nullptr;
+                }
+            } else {
+                std::fprintf(stderr,
+                    "[sp_native] SHANNON_PRIME_HEXAGON=1 set but "
+                    "sp_hexagon_init failed (FastRPC unavailable? "
+                    "missing libsp_hex_skel.so on ADSP_LIBRARY_PATH?) — "
+                    "staying on CPU/SP-banded path\n");
+            }
+        }
+    }
+#endif
 
     // Top-level pointers.
     I.tok_embd    = weights.tok_embd;
@@ -497,6 +594,14 @@ ForwardNativeContext::~ForwardNativeContext() {
         sp_llama_qnn_matmul_cache_destroy(&impl_->qnn_mm_cache);
     }
 #endif
+#ifdef SP_HEXAGON_FASTRPC
+    if (impl_ && impl_->hex_active) {
+        sp_hexagon_cache_free(&impl_->hex_cache);
+    }
+    if (impl_ && impl_->hex_ctx) {
+        sp_hexagon_free(impl_->hex_ctx);
+    }
+#endif
 }
 
 int ForwardNativeContext::n_layer()   const { return impl_->n_layer; }
@@ -508,7 +613,50 @@ int ForwardNativeContext::max_seq()   const { return impl_->max_seq; }
 
 void ForwardNativeContext::reset() {
     auto& I = *impl_;
-    for (auto& kv : I.kv) kv.n_pos = 0;
+    // Drop the SP-banded cache and re-create it. The cache owns
+    // calibration state + compressed bytes; cheaper / safer than
+    // adding a public clear() to KvCache for now.
+    if (I.kvcache) {
+        Config cfg;
+        cfg.sqfree        = false;
+        cfg.spinor        = false;
+        cfg.mobius        = true;
+        cfg.k_bits_csv    = "5,5,4,3";
+        cfg.v_bits_csv    = "3";
+        cfg.residual_bits = 3;
+        if (const char* s = std::getenv("SP_NATIVE_K_BITS")) cfg.k_bits_csv = s;
+        if (const char* s = std::getenv("SP_NATIVE_V_BITS")) cfg.v_bits_csv = s;
+        I.kvcache = KvCache::create(I.n_layer, I.hp.n_head_kv, I.hp.head_dim,
+                                     I.max_seq, cfg);
+    }
+    for (int L = 0; L < I.n_layer; ++L) {
+        I.kv[L].kv         = I.kvcache.get();
+        I.kv[L].layer_idx  = L;
+        I.kv[L].n_pos_past = 0;
+    }
+#ifdef SP_HEXAGON_FASTRPC
+    // Rebuild the hexagon cache so its position counters / packed
+    // bytes match the freshly-created KvCache. Skip if not active.
+    if (I.hex_active) {
+        sp_hexagon_cache_free(&I.hex_cache);
+        sp_config_t cfg;
+        sp_config_init(&cfg, I.hp.head_dim, I.n_layer, I.hp.n_head_kv);
+        if (sp_hexagon_cache_init(&I.hex_cache, I.hex_ctx,
+                                  &cfg, I.max_seq) == 0) {
+            for (int L = 0; L < I.n_layer; ++L) {
+                I.kv[L].hex_cache = &I.hex_cache;
+            }
+        } else {
+            std::fprintf(stderr,
+                "[sp_native] reset: hexagon cache reinit failed — "
+                "disabling hexagon path for this context\n");
+            I.hex_active = false;
+            for (int L = 0; L < I.n_layer; ++L) {
+                I.kv[L].hex_cache = nullptr;
+            }
+        }
+    }
+#endif
     I.n_pos = 0;
 }
 
@@ -525,6 +673,10 @@ static int run_layers(ForwardNativeContext::Impl& I,
 
     for (int L = 0; L < I.n_layer; ++L) {
         I.arena.reset();
+        // Stamp current sequence offset for this layer's call. All
+        // layers see the same n_pos_past — they all advance in lock
+        // step through the cache.
+        I.kv[L].n_pos_past = I.n_pos;
         int rc = forward_native_layer(I.layers_bound[L], I.hp,
                                        x_io, pos, n_seq,
                                        I.kv[L], I.arena, x_next.data());
@@ -591,7 +743,58 @@ bool ForwardNativeContext::prefill(const std::vector<int32_t>& ids,
     std::vector<int32_t> pos(n_seq);
     for (int s = 0; s < n_seq; ++s) pos[s] = I.n_pos + s;
 
-    // Layer stack.
+    // ── First-prefill calibration ─────────────────────────────────
+    // The SP-banded cache's Möbius reorder is identity until
+    // calibrate_begin/feed/end runs over real RoPE'd K vectors.
+    // Without it, write→read round-trip introduces enough error to
+    // drift generation off-prompt. Run a one-shot calibration pass
+    // across the full prompt — attention runs off the local K/V
+    // (no cache write/read), each K is fed to calibrate_feed,
+    // calibrate_end rebuilds masks, then we run the real prefill.
+    //
+    // Skip when SHANNON_PRIME_NO_CALIBRATE=1 (env A/B), already
+    // calibrated, or hierarchical (which needs per-slot feed and
+    // ≥24 samples per slot — separate work item).
+    const char* env_no_calib = std::getenv("SHANNON_PRIME_NO_CALIBRATE");
+    const bool hex_active_local = []() {
+        const char* v = std::getenv("SHANNON_PRIME_HEXAGON");
+        return v && v[0] == '1';
+    }();
+    const bool skip_calibration =
+        (env_no_calib && std::atoi(env_no_calib) != 0) ||
+        I.kvcache->is_calibrated() ||
+        I.kvcache->is_hierarchical() ||
+        // Calibration installs a variance-ranked reorder which the
+        // hex DSP-side kernel doesn't apply — diverges shadow vs hex
+        // K bytes. Skip when hex is on so both stay on natural-order
+        // VHT2.
+        hex_active_local;
+    if (!skip_calibration) {
+        if (I.kvcache->calibrate_begin()) {
+            // Calibration pass: attention uses local K/V, K vectors
+            // get fed to calibrate_feed inside forward_native_attention.
+            for (int L = 0; L < I.n_layer; ++L) {
+                I.kv[L].calibrate_pass = true;
+                I.kv[L].n_pos_past     = 0;
+            }
+            std::vector<float> x_calib = x;   // pass 1 mutates its input
+            int rc_cal = run_layers(I, pos.data(), n_seq, x_calib.data());
+            if (rc_cal != 0) {
+                std::fprintf(stderr,
+                    "[sp_native] calibration pass failed (rc=%d)\n", rc_cal);
+            }
+            I.kvcache->calibrate_end();
+            for (int L = 0; L < I.n_layer; ++L) {
+                I.kv[L].calibrate_pass = false;
+            }
+            std::fprintf(stderr,
+                "[sp_native] cache calibrated on %d K vectors per layer\n",
+                n_seq * I.hp.n_head_kv);
+        }
+    }
+
+    // Layer stack — real prefill, writes through the (now-calibrated)
+    // cache and reads back compressed history.
     int rc = run_layers(I, pos.data(), n_seq, x.data());
     if (rc != 0) return false;
     I.n_pos += n_seq;
