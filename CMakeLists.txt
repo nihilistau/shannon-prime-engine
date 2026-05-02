@@ -57,6 +57,7 @@ option(SP_ENGINE_WITH_CUDA       "Enable CUDA backend for KV kernels"   OFF)
 option(SP_ENGINE_WITH_VULKAN     "Enable Vulkan backend for KV kernels" OFF)
 option(SP_ENGINE_WITH_HEXAGON    "Enable Hexagon DSP backend (cDSP / FastRPC)" ON)
 option(SP_ENGINE_HEXAGON_FASTRPC "Link real Qualcomm FastRPC libs (Android+SDK only)" OFF)
+option(SP_ENGINE_WITH_QNN        "Enable Qualcomm QNN HTP backend (V69+ NPU dispatch)" OFF)
 option(SP_ENGINE_FP8             "Enable FP8 (E4M3) KV cache quantization kernels" OFF)
 option(SP_ENGINE_FP4             "Enable FP4 (Blackwell sm_120+) KV cache quantization" OFF)
 option(SP_ENGINE_AUTO_PATCH      "Auto-apply vendor patches before build" ON)
@@ -229,6 +230,63 @@ if(SP_ENGINE_WITH_HEXAGON)
 endif()
 
 # --------------------------------------------------------------------
+# QNN HTP backend: V69+ NPU dispatch via Qualcomm AI Engine Direct (QNN).
+#
+# Compiles the sp_qnn primitive (runtime graph build + ION-backed
+# persistent K) from lib/shannon-prime/backends/qnn_aihub/sp_qnn_runner/.
+# These are pure host-side libs that dlopen libQnnHtp.so + libQnnSystem.so
+# at runtime — no link-time dependency on QNN libs, just the headers.
+#
+# Caller must point QAIRT_ROOT at a Qualcomm AI Engine Direct install
+# (the SDK that ships the QNN headers). On Windows that's typically
+# C:/Qualcomm/AIStack/QAIRT/2.45.40.260406. On Linux it's wherever the
+# SDK is unpacked. The QNN runtime libs themselves (libQnnHtp.so etc.)
+# only need to be present on the device at runtime, set in
+# LD_LIBRARY_PATH.
+#
+# Activated at runtime via SHANNON_PRIME_QNN=1 env var (gated inside
+# forward.cpp / Engine::generate). Turning the option ON without the
+# runtime gate produces a binary that COULD dispatch but won't unless
+# explicitly opted in.
+# --------------------------------------------------------------------
+if(SP_ENGINE_WITH_QNN)
+    if(NOT QAIRT_ROOT)
+        message(FATAL_ERROR
+            "SP_ENGINE_WITH_QNN=ON requires QAIRT_ROOT to point at a "
+            "Qualcomm AI Engine Direct install. Example: "
+            "-DQAIRT_ROOT=C:/Qualcomm/AIStack/QAIRT/2.45.40.260406")
+    endif()
+    if(NOT EXISTS "${QAIRT_ROOT}/include/QNN/QnnInterface.h")
+        message(FATAL_ERROR
+            "QAIRT_ROOT='${QAIRT_ROOT}' does not contain "
+            "include/QNN/QnnInterface.h — verify the SDK install path.")
+    endif()
+
+    set(_SP_QNN_RUNNER ${SP_CORE_DIR}/backends/qnn_aihub/sp_qnn_runner)
+    set(_SP_QNN_SOURCES
+        ${_SP_QNN_RUNNER}/sp_qnn.c
+        ${_SP_QNN_RUNNER}/sp_llama_qnn.c)
+    add_library(shannon_prime_qnn_backend STATIC ${_SP_QNN_SOURCES})
+    target_include_directories(shannon_prime_qnn_backend PUBLIC
+        ${_SP_QNN_RUNNER}
+        ${QAIRT_ROOT}/include/QNN
+        ${QAIRT_ROOT}/include
+        ${SP_CORE_DIR}/core)
+    target_link_libraries(shannon_prime_qnn_backend PUBLIC shannon_prime_core)
+    target_compile_features(shannon_prime_qnn_backend PUBLIC c_std_11)
+    set_property(TARGET shannon_prime_qnn_backend PROPERTY POSITION_INDEPENDENT_CODE ON)
+    # sp_qnn dlopen's libQnnHtp.so + libcdsprpc.so at runtime — needs libdl on
+    # POSIX targets (Android/Linux). MSVC has dlopen via a shim or it's a no-op.
+    if(NOT WIN32)
+        target_link_libraries(shannon_prime_qnn_backend PUBLIC dl)
+    endif()
+    # QnnTypes.h has enum values that exceed signed int range; silence the
+    # warning since it's a Qualcomm header issue, not our code.
+    target_compile_options(shannon_prime_qnn_backend PRIVATE -Wno-pedantic)
+    message(STATUS "Shannon-Prime QNN: enabled (QAIRT_ROOT=${QAIRT_ROOT})")
+endif()
+
+# --------------------------------------------------------------------
 # ggml (submodule) — MIT-licensed compute graph + GGUF loader + matmul
 # Disable the bits we don't need so the engine binary stays lean.
 # --------------------------------------------------------------------
@@ -272,6 +330,11 @@ if(SP_ENGINE_WITH_HEXAGON)
     if(SP_ENGINE_HEXAGON_FASTRPC)
         target_compile_definitions(sp_engine PUBLIC SP_HEXAGON_FASTRPC=1)
     endif()
+endif()
+if(SP_ENGINE_WITH_QNN)
+    target_link_libraries(sp_engine PUBLIC shannon_prime_qnn_backend)
+    target_compile_definitions(sp_engine PUBLIC SP_ENGINE_WITH_QNN=1)
+    target_include_directories(sp_engine PUBLIC ${SP_CORE_DIR}/backends/qnn_aihub/sp_qnn_runner)
 endif()
 if(SP_ENGINE_WITH_CUDA)
     target_link_libraries(sp_engine PUBLIC shannon_prime_cuda_backend)
@@ -321,6 +384,7 @@ message(STATUS "  build type : ${CMAKE_BUILD_TYPE}")
 message(STATUS "  CUDA       : ${SP_ENGINE_WITH_CUDA}")
 message(STATUS "  Vulkan     : ${SP_ENGINE_WITH_VULKAN}")
 message(STATUS "  Hexagon    : ${SP_ENGINE_WITH_HEXAGON} (FastRPC=${SP_ENGINE_HEXAGON_FASTRPC})")
+message(STATUS "  QNN HTP    : ${SP_ENGINE_WITH_QNN}")
 message(STATUS "  FP8 (E4M3) : ${SP_ENGINE_FP8}")
 message(STATUS "  FP4 (BW)   : ${SP_ENGINE_FP4}")
 message(STATUS "  auto-patch : ${SP_ENGINE_AUTO_PATCH}")
