@@ -124,6 +124,16 @@ struct ForwardNativeKv {
     KvCache* kv         = nullptr;   // borrowed; context owns it
     int      layer_idx  = 0;
     int      n_pos_past = 0;         // positions already in the cache
+
+    // First-prefill calibration pass. When true, forward_native_attention
+    // feeds each K vector to KvCache::calibrate_feed and runs attention
+    // off the local just-computed K/V (no cache write/read). This is how
+    // we train the Möbius reorder + per-band variance ranking on real
+    // RoPE'd K vectors before the cache holds anything compressed.
+    // Caller (ForwardNativeContext::prefill) flips this on for the first
+    // pass, calls calibrate_end() between passes, then runs the real
+    // prefill with calibrate_pass=false.
+    bool     calibrate_pass = false;
 };
 
 // ─────────────────────────────────────────────────────────────────

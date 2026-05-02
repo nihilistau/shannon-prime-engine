@@ -212,11 +212,26 @@ int forward_native_attention(const ForwardNativeLayer&   layer,
     // Compression happens INSIDE write(): VHT2 → Möbius reorder → band
     // quantize. ~10× memory savings vs fp16 slabs. The per-layer state
     // (compressed bytes) lives in kv.kv (the engine's KvCache).
-    if (!kv.kv->write(kv.layer_idx, n_pos_past, n_seq, K, V)) {
-        std::fprintf(stderr,
-            "[sp_native] attn: KvCache::write failed (layer=%d pos=%d n=%d)\n",
-            kv.layer_idx, n_pos_past, n_seq);
-        return -1;
+    //
+    // Calibration pass: feed each K vector to calibrate_feed instead of
+    // writing. Attention below will run on the local K/V buffer so the
+    // cache never holds uncalibrated data. Caller does calibrate_end()
+    // after the calibration pass, then re-runs prefill with the flag off.
+    if (kv.calibrate_pass) {
+        for (int s = 0; s < n_seq; ++s) {
+            for (int h = 0; h < n_head_kv; ++h) {
+                const float* k_src = K + (size_t)s * n_kv_dim
+                                       + (size_t)h * head_dim;
+                kv.kv->calibrate_feed(k_src);
+            }
+        }
+    } else {
+        if (!kv.kv->write(kv.layer_idx, n_pos_past, n_seq, K, V)) {
+            std::fprintf(stderr,
+                "[sp_native] attn: KvCache::write failed (layer=%d pos=%d n=%d)\n",
+                kv.layer_idx, n_pos_past, n_seq);
+            return -1;
+        }
     }
 
     // ── Attention compute (per-head loop) ────────────────────────
@@ -240,12 +255,26 @@ int forward_native_attention(const ForwardNativeLayer&   layer,
     // We do one decompress (running VHT2 inverse + dequant on every band)
     // then per-head gather in the loop below — far cheaper than calling
     // read() per head, and a single arena-friendly allocation.
-    std::vector<float> K_all, V_all;
-    if (!kv.kv->read(kv.layer_idx, n_kv_total, K_all, V_all)) {
-        std::fprintf(stderr,
-            "[sp_native] attn: KvCache::read failed (layer=%d kv_len=%d)\n",
-            kv.layer_idx, n_kv_total);
-        return -1;
+    //
+    // Calibration pass: skip decompress; alias K_all/V_all to the local
+    // just-computed K/V. They share the [n_seq, n_head_kv, head_dim]
+    // layout the head-loop gather expects, and n_pos_past was zero so
+    // n_kv_total == n_seq below.
+    std::vector<float> K_all_owned, V_all_owned;
+    const float* K_all_ptr;
+    const float* V_all_ptr;
+    if (kv.calibrate_pass) {
+        K_all_ptr = K;
+        V_all_ptr = V;
+    } else {
+        if (!kv.kv->read(kv.layer_idx, n_kv_total, K_all_owned, V_all_owned)) {
+            std::fprintf(stderr,
+                "[sp_native] attn: KvCache::read failed (layer=%d kv_len=%d)\n",
+                kv.layer_idx, n_kv_total);
+            return -1;
+        }
+        K_all_ptr = K_all_owned.data();
+        V_all_ptr = V_all_owned.data();
     }
 
     // Causal mask: for each query position (n_pos_past + s), block
@@ -267,11 +296,13 @@ int forward_native_attention(const ForwardNativeLayer&   layer,
         // Strided gather from K_all/V_all (flat [n_kv_total, n_head_kv,
         // head_dim] layout) into per-head contiguous K_full/V_full
         // [n_kv_total, head_dim]. K_all has already been decompressed
-        // (VHT2 inverse + band dequant) by the read() above.
+        // (VHT2 inverse + band dequant) by the read() above — except
+        // on the calibration pass where K_all aliases the local
+        // just-computed K (fp32, no compression).
         for (int p = 0; p < n_kv_total; ++p) {
-            const float* k_src = K_all.data()
+            const float* k_src = K_all_ptr
                 + (size_t)(p * n_head_kv + hk) * head_dim;
-            const float* v_src = V_all.data()
+            const float* v_src = V_all_ptr
                 + (size_t)(p * n_head_kv + hk) * head_dim;
             std::memcpy(K_full.data() + (size_t)p * head_dim,
                         k_src, (size_t)head_dim * sizeof(float));

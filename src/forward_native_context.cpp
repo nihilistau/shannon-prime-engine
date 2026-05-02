@@ -646,7 +646,49 @@ bool ForwardNativeContext::prefill(const std::vector<int32_t>& ids,
     std::vector<int32_t> pos(n_seq);
     for (int s = 0; s < n_seq; ++s) pos[s] = I.n_pos + s;
 
-    // Layer stack.
+    // ── First-prefill calibration ─────────────────────────────────
+    // The SP-banded cache's Möbius reorder is identity until
+    // calibrate_begin/feed/end runs over real RoPE'd K vectors.
+    // Without it, write→read round-trip introduces enough error to
+    // drift generation off-prompt. Run a one-shot calibration pass
+    // across the full prompt — attention runs off the local K/V
+    // (no cache write/read), each K is fed to calibrate_feed,
+    // calibrate_end rebuilds masks, then we run the real prefill.
+    //
+    // Skip when SHANNON_PRIME_NO_CALIBRATE=1 (env A/B), already
+    // calibrated, or hierarchical (which needs per-slot feed and
+    // ≥24 samples per slot — separate work item).
+    const char* env_no_calib = std::getenv("SHANNON_PRIME_NO_CALIBRATE");
+    const bool skip_calibration =
+        (env_no_calib && std::atoi(env_no_calib) != 0) ||
+        I.kvcache->is_calibrated() ||
+        I.kvcache->is_hierarchical();
+    if (!skip_calibration) {
+        if (I.kvcache->calibrate_begin()) {
+            // Calibration pass: attention uses local K/V, K vectors
+            // get fed to calibrate_feed inside forward_native_attention.
+            for (int L = 0; L < I.n_layer; ++L) {
+                I.kv[L].calibrate_pass = true;
+                I.kv[L].n_pos_past     = 0;
+            }
+            std::vector<float> x_calib = x;   // pass 1 mutates its input
+            int rc_cal = run_layers(I, pos.data(), n_seq, x_calib.data());
+            if (rc_cal != 0) {
+                std::fprintf(stderr,
+                    "[sp_native] calibration pass failed (rc=%d)\n", rc_cal);
+            }
+            I.kvcache->calibrate_end();
+            for (int L = 0; L < I.n_layer; ++L) {
+                I.kv[L].calibrate_pass = false;
+            }
+            std::fprintf(stderr,
+                "[sp_native] cache calibrated on %d K vectors per layer\n",
+                n_seq * I.hp.n_head_kv);
+        }
+    }
+
+    // Layer stack — real prefill, writes through the (now-calibrated)
+    // cache and reads back compressed history.
     int rc = run_layers(I, pos.data(), n_seq, x.data());
     if (rc != 0) return false;
     I.n_pos += n_seq;
