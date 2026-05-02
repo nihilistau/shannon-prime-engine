@@ -769,15 +769,73 @@ bool ForwardNativeContext::prefill(const std::vector<int32_t>& ids,
         // K bytes. Skip when hex is on so both stay on natural-order
         // VHT2.
         hex_active_local;
+    // Single-pass calibration is faster (~2× first-prefill) but
+    // introduces a discontinuity: pass-1 attention uses uncompressed
+    // local K/V, decode reads compressed-via-calibrated cache, so the
+    // FIRST decode token can mispredict slightly. Default is the
+    // two-pass path (correctness floor); SHANNON_PRIME_FAST_CALIB=1
+    // opts into single-pass.
+    const bool fast_calib = []() {
+        const char* v = std::getenv("SHANNON_PRIME_FAST_CALIB");
+        return v && v[0] == '1';
+    }();
+
     if (!skip_calibration) {
         if (I.kvcache->calibrate_begin()) {
-            // Calibration pass: attention uses local K/V, K vectors
-            // get fed to calibrate_feed inside forward_native_attention.
+            if (fast_calib) {
+                // ── Single-pass calibration (Phase 4.12) ──────────
+                // Pass 1 runs the full layer stack with local K/V
+                // (no cache touch) AND captures post-RoPE K/V per
+                // layer. After calibrate_end, we write the captured
+                // K/V to the cache via kv->write — no second
+                // recompute pass.
+                const size_t per_layer_kv = (size_t)n_seq * I.hp.n_head_kv
+                                                         * I.hp.head_dim;
+                std::vector<std::vector<float>> cap_k(I.n_layer);
+                std::vector<std::vector<float>> cap_v(I.n_layer);
+                for (int L = 0; L < I.n_layer; ++L) {
+                    cap_k[L].assign(per_layer_kv, 0.0f);
+                    cap_v[L].assign(per_layer_kv, 0.0f);
+                    I.kv[L].calibrate_pass = true;
+                    I.kv[L].n_pos_past     = 0;
+                    I.kv[L].capture_k      = cap_k[L].data();
+                    I.kv[L].capture_v      = cap_v[L].data();
+                }
+                int rc_cal = run_layers(I, pos.data(), n_seq, x.data());
+                if (rc_cal != 0) {
+                    std::fprintf(stderr,
+                        "[sp_native] calibration pass failed (rc=%d)\n", rc_cal);
+                }
+                I.kvcache->calibrate_end();
+                for (int L = 0; L < I.n_layer; ++L) {
+                    if (!I.kvcache->write(L, /*pos_offset=*/0, n_seq,
+                                           cap_k[L].data(),
+                                           cap_v[L].data())) {
+                        std::fprintf(stderr,
+                            "[sp_native] post-calibration write failed (layer=%d)\n",
+                            L);
+                    }
+                    I.kv[L].calibrate_pass = false;
+                    I.kv[L].capture_k      = nullptr;
+                    I.kv[L].capture_v      = nullptr;
+                }
+                std::fprintf(stderr,
+                    "[sp_native] cache calibrated on %d K vectors per layer "
+                    "(single-pass; pass-1 output reused)\n",
+                    n_seq * I.hp.n_head_kv);
+                I.n_pos += n_seq;
+                return finalize_logits(I, x.data(), n_seq,
+                                        last_logits, n_vocab_out) == 0;
+            }
+            // Two-pass path (default): correctness over speed.
+            // Pass 1 calibrates against local K/V; pass 2 re-runs
+            // the full stack writing through calibrated masks. Both
+            // prefill and decode read consistent compressed K/V.
             for (int L = 0; L < I.n_layer; ++L) {
                 I.kv[L].calibrate_pass = true;
                 I.kv[L].n_pos_past     = 0;
             }
-            std::vector<float> x_calib = x;   // pass 1 mutates its input
+            std::vector<float> x_calib = x;
             int rc_cal = run_layers(I, pos.data(), n_seq, x_calib.data());
             if (rc_cal != 0) {
                 std::fprintf(stderr,
@@ -793,8 +851,8 @@ bool ForwardNativeContext::prefill(const std::vector<int32_t>& ids,
         }
     }
 
-    // Layer stack — real prefill, writes through the (now-calibrated)
-    // cache and reads back compressed history.
+    // No calibration: regular single-pass prefill that writes through
+    // the (already-calibrated, hierarchical, or env-skipped) cache.
     int rc = run_layers(I, pos.data(), n_seq, x.data());
     if (rc != 0) return false;
     I.n_pos += n_seq;

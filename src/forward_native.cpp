@@ -230,6 +230,18 @@ int forward_native_attention(const ForwardNativeLayer&   layer,
                 kv.kv->calibrate_feed(k_src);
             }
         }
+        // Capture K/V for the post-calibration cache write that
+        // replaces the pass-2 recompute. Layout matches kv->write's
+        // K_flat: K[(s * n_head_kv + h) * head_dim + d] — same as
+        // our local K/V layout, so a single memcpy suffices.
+        if (kv.capture_k) {
+            std::memcpy(kv.capture_k, K,
+                        (size_t)n_seq * n_kv_dim * sizeof(float));
+        }
+        if (kv.capture_v) {
+            std::memcpy(kv.capture_v, V,
+                        (size_t)n_seq * n_kv_dim * sizeof(float));
+        }
     } else {
         if (!kv.kv->write(kv.layer_idx, n_pos_past, n_seq, K, V)) {
             std::fprintf(stderr,

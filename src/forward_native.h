@@ -145,6 +145,17 @@ struct ForwardNativeKv {
     // Type kept as void* so this header doesn't pull in the C-only
     // hexagon header into every TU; cast at use site.
     void*    hex_cache  = nullptr;
+
+    // Phase 4.12: per-layer K/V capture for single-pass calibration.
+    // When non-null AND calibrate_pass=true, forward_native_attention
+    // copies the post-RoPE K and V vectors into these buffers BEFORE
+    // returning. Caller (ForwardNativeContext::prefill) then calls
+    // calibrate_end() once, walks all captures, and writes them to
+    // the cache via kv->write — no second full-stack recompute.
+    // Layout: [n_seq, n_head_kv, head_dim] flat (matches kv->write).
+    // Caller sizes these to n_seq * n_head_kv * head_dim each.
+    float*   capture_k = nullptr;
+    float*   capture_v = nullptr;
 };
 
 // ─────────────────────────────────────────────────────────────────
