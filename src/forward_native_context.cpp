@@ -470,11 +470,21 @@ std::unique_ptr<ForwardNativeContext> ForwardNativeContext::create(
     // ~10× memory savings vs the fp16 slab path, and the underlying
     // sp_shadow_cache_t is the same primitive that lights up the HVX
     // fused decompress+matmul kernel on cDSP (Phase 1.6 leapfrog).
+    //
+    // When hexagon dispatch is active (SHANNON_PRIME_HEXAGON=1), we
+    // disable the shadow cache's Möbius reorder so that K bytes match
+    // what the DSP-side compress produces (which has no Möbius). This
+    // keeps the K view consistent across the two caches — important
+    // for KQ from hex + V from shadow to agree on K's identity.
+    const bool want_hexagon = []() {
+        const char* v = std::getenv("SHANNON_PRIME_HEXAGON");
+        return v && v[0] == '1';
+    }();
     {
         Config cfg;
         cfg.sqfree        = false;
         cfg.spinor        = false;
-        cfg.mobius        = true;
+        cfg.mobius        = !want_hexagon;
         cfg.k_bits_csv    = "5,5,4,3";
         cfg.v_bits_csv    = "3";
         cfg.residual_bits = 3;
@@ -746,10 +756,19 @@ bool ForwardNativeContext::prefill(const std::vector<int32_t>& ids,
     // calibrated, or hierarchical (which needs per-slot feed and
     // ≥24 samples per slot — separate work item).
     const char* env_no_calib = std::getenv("SHANNON_PRIME_NO_CALIBRATE");
+    const bool hex_active_local = []() {
+        const char* v = std::getenv("SHANNON_PRIME_HEXAGON");
+        return v && v[0] == '1';
+    }();
     const bool skip_calibration =
         (env_no_calib && std::atoi(env_no_calib) != 0) ||
         I.kvcache->is_calibrated() ||
-        I.kvcache->is_hierarchical();
+        I.kvcache->is_hierarchical() ||
+        // Calibration installs a variance-ranked reorder which the
+        // hex DSP-side kernel doesn't apply — diverges shadow vs hex
+        // K bytes. Skip when hex is on so both stay on natural-order
+        // VHT2.
+        hex_active_local;
     if (!skip_calibration) {
         if (I.kvcache->calibrate_begin()) {
             // Calibration pass: attention uses local K/V, K vectors
