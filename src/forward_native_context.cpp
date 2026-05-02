@@ -8,6 +8,7 @@
 #include "sp_kernels_cpu.h"
 #include "sp_quant.h"
 #include "sp_tensor.h"
+#include "sp_threadpool.h"
 
 #include "ggml.h"   // ONLY for reading ggml_tensor metadata + data ptr
 
@@ -150,16 +151,35 @@ static int lm_head_apply(const ggml_tensor* W,
 
 #if defined(SP_ENGINE_WITH_QNN)
 // ─────────────────────────────────────────────────────────────────
+// Round n up to the next bucket boundary. Power-of-2 schedule with a
+// minimum of 8 — collapses every distinct n_kv_total to one of
+// ~12 buckets (8/16/32/.../4096/8192), so the QNN runtime graph
+// gets compiled at most ~12 times per session instead of once per
+// decode step. Garbage from zero-padded K positions is masked out
+// by the CPU softmax that runs after the QNN call (the caller's
+// causal mask already covers positions ≥ n_kv_total as -INF).
+// ─────────────────────────────────────────────────────────────────
+static inline int qnn_kv_bucket(int n) {
+    if (n <= 8) return 8;
+    int b = 16;
+    while (b < n) b <<= 1;
+    return b;
+}
+
+// ─────────────────────────────────────────────────────────────────
 // QNN KQ-matmul dispatch shim.
 //
 // forward_native_attention's hook signature is fp32 in / fp32 out.
-// QNN HTP wants fp16 buffers. The shim converts:
-//   1. Q[n_seq, head_dim] fp32 → fp16 in thread_local scratch
-//   2. K[n_kv_total, head_dim] fp32 → transposed [head_dim, n_kv_total]
-//      fp16 in thread_local scratch  (sp_llama_qnn_matmul does plain
-//      MatMul A@B; we need Q @ K^T so we hand it K-transposed)
-//   3. dispatch  → fp16 [n_seq, n_kv_total] in thread_local scratch
-//   4. fp16 → fp32 back into caller's `scores` buffer
+// QNN HTP wants fp16 buffers. The shim:
+//   1. Buckets n_kv_total UP to the next power of 2 (≥8) so the QNN
+//      cache reuses one finalized graph across many real n_kv values.
+//   2. Q[n_seq, head_dim] fp32 → fp16 scratch.
+//   3. K[n_kv_total, head_dim] fp32 → transposed [head_dim, bucket_n]
+//      fp16 scratch, ZERO-PADDED in columns [n_kv_total, bucket_n).
+//      sp_llama_qnn_matmul does plain MatMul A@B; we hand K^T.
+//   4. dispatch → fp16 [n_seq, bucket_n] in scratch.
+//   5. fp16 → fp32 ONLY for the first n_kv_total cols, written into
+//      caller's `scores` buffer. Padded cols are discarded.
 //
 // Returns 0 on success, non-zero to fall through to CPU sp_matmul_f32.
 // ─────────────────────────────────────────────────────────────────
@@ -171,13 +191,15 @@ static int qnn_kq_dispatch_shim(void* userdata,
     auto* cache = (sp_llama_qnn_matmul_cache*)userdata;
     if (!cache) return -1;
 
+    const int n_bucket = qnn_kv_bucket(n_kv_total);
+
     // Per-thread scratch — small enough to live on the heap as
-    // thread_local; resized per call when shape grows.
+    // thread_local; resized when shape grows.
     static thread_local std::vector<uint16_t> q_fp16, kt_fp16, out_fp16;
 
     const size_t q_n  = (size_t)n_seq * head_dim;
-    const size_t kt_n = (size_t)head_dim * n_kv_total;
-    const size_t o_n  = (size_t)n_seq * n_kv_total;
+    const size_t kt_n = (size_t)head_dim * n_bucket;
+    const size_t o_n  = (size_t)n_seq * n_bucket;
 
     if (q_fp16.size()   < q_n)  q_fp16.resize(q_n);
     if (kt_fp16.size()  < kt_n) kt_fp16.resize(kt_n);
@@ -186,28 +208,41 @@ static int qnn_kq_dispatch_shim(void* userdata,
     // Q: just narrow.
     for (size_t i = 0; i < q_n; ++i) q_fp16[i] = sp_fp32_to_fp16(Q[i]);
 
-    // K^T: transpose [n_kv_total, head_dim] → [head_dim, n_kv_total]
-    // and narrow to fp16 in one pass.
-    for (int p = 0; p < n_kv_total; ++p) {
-        const float* k_row = K + (size_t)p * head_dim;
-        for (int d = 0; d < head_dim; ++d) {
-            kt_fp16[(size_t)d * n_kv_total + p] = sp_fp32_to_fp16(k_row[d]);
+    // K^T: transpose [n_kv_total, head_dim] → [head_dim, n_bucket].
+    // Real columns [0, n_kv_total) hold the transposed K bytes.
+    // Padded columns [n_kv_total, n_bucket) get zero — those produce
+    // zero dot-products which (after no scale + no mask in QNN)
+    // become 0.0f scores; the CPU softmax-with-mask that runs after
+    // this call uses an n_kv_total-sized mask buffer so it never
+    // sees the padded columns anyway.
+    const uint16_t fp16_zero = 0;
+    for (int d = 0; d < head_dim; ++d) {
+        uint16_t* kt_row = kt_fp16.data() + (size_t)d * n_bucket;
+        for (int p = 0; p < n_kv_total; ++p) {
+            kt_row[p] = sp_fp32_to_fp16(K[(size_t)p * head_dim + d]);
         }
+        for (int p = n_kv_total; p < n_bucket; ++p) kt_row[p] = fp16_zero;
     }
 
     uint64_t exec_us = 0;
     int rc = sp_llama_qnn_matmul_dispatch(cache,
                                           (uint32_t)n_seq,
                                           (uint32_t)head_dim,
-                                          (uint32_t)n_kv_total,
+                                          (uint32_t)n_bucket,
                                           q_fp16.data(),  q_n  * 2,
                                           kt_fp16.data(), kt_n * 2,
                                           out_fp16.data(), o_n * 2,
                                           &exec_us);
     if (rc != 0) return rc;
 
-    // Widen output back to fp32 in caller buffer.
-    for (size_t i = 0; i < o_n; ++i) scores[i] = sp_fp16_to_fp32(out_fp16[i]);
+    // Widen output back to fp32 — only the first n_kv_total cols
+    // per row; padded cols are discarded. Caller's `scores` is
+    // [n_seq, n_kv_total], not the bucketed shape.
+    for (int s = 0; s < n_seq; ++s) {
+        const uint16_t* src = out_fp16.data() + (size_t)s * n_bucket;
+        float*          dst = scores          + (size_t)s * n_kv_total;
+        for (int p = 0; p < n_kv_total; ++p) dst[p] = sp_fp16_to_fp32(src[p]);
+    }
     return 0;
 }
 #endif  // SP_ENGINE_WITH_QNN
@@ -436,6 +471,19 @@ std::unique_ptr<ForwardNativeContext> ForwardNativeContext::create(
     // Round generously — 64 MB for the working set; we reset the arena
     // between layers so peak is per-layer.
     I.arena.reserve(64 * 1024 * 1024);
+
+    // Persistent thread pool for sp_matmul_f32 / sp_matmul_f32_q5k
+    // partitioning. SP_ENGINE_THREADS env (or 4 by default) sets the
+    // worker count. Init is idempotent — second context creation in
+    // the same process reuses the existing pool.
+    {
+        int n_threads = 4;
+        if (const char* s = std::getenv("SP_ENGINE_THREADS")) {
+            int v = std::atoi(s);
+            if (v > 0 && v <= 64) n_threads = v;
+        }
+        sp_threadpool_init(n_threads);
+    }
 
     return ctx;
 }
