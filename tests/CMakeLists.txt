@@ -33,3 +33,11 @@ target_link_libraries(bench_disk_partial PRIVATE sp_engine)
 add_executable(test_sp_quant_q5k test_sp_quant_q5k.cpp)
 target_link_libraries(test_sp_quant_q5k PRIVATE sp_engine ggml-base ggml-cpu)
 add_test(NAME sp_quant_q5k COMMAND test_sp_quant_q5k)
+
+# CPU kernels parity vs ggml (RMSNorm, SiLU, Softmax, fp32 matmul,
+# Q5_K-packed matmul). Tolerances: relative 1e-4, absolute 1e-5 — SIMD
+# reduction order varies between us and ggml so true bit-exact match
+# isn't expected; we want "model output equivalence" which this catches.
+add_executable(test_sp_kernels test_sp_kernels.cpp)
+target_link_libraries(test_sp_kernels PRIVATE sp_engine ggml ggml-base ggml-cpu)
+add_test(NAME sp_kernels COMMAND test_sp_kernels)
