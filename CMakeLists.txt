@@ -314,6 +314,8 @@ add_library(sp_engine STATIC
     src/forward.cpp
     src/prime_pe.cpp
     src/http_server.cpp
+    src/sp_tensor.cpp
+    src/sp_quant.cpp
     vendor/cpp-httplib/httplib.cpp)
 target_include_directories(sp_engine PUBLIC src)
 target_include_directories(sp_engine PUBLIC ${CMAKE_SOURCE_DIR}/vendor/cpp-httplib)

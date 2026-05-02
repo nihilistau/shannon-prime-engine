@@ -24,3 +24,12 @@ add_test(NAME disk_cache_roundtrip COMMAND test_disk_cache_roundtrip)
 # (RAMMap on Windows, drop_caches on Linux).
 add_executable(bench_disk_partial bench_disk_partial.cpp)
 target_link_libraries(bench_disk_partial PRIVATE sp_engine)
+
+# Q5_K dequant parity vs ggml. Self-contained — synthesizes a random
+# fp32 buffer, quantizes via ggml's encoder, then dequants with BOTH
+# sp_dequant_q5_K and ggml's dequantize_row_q5_K and asserts the outputs
+# are bit-exact. Foundation for forward_native.cpp's confidence that
+# weight reads match ggml semantics.
+add_executable(test_sp_quant_q5k test_sp_quant_q5k.cpp)
+target_link_libraries(test_sp_quant_q5k PRIVATE sp_engine ggml-base ggml-cpu)
+add_test(NAME sp_quant_q5k COMMAND test_sp_quant_q5k)
