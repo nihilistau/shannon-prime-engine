@@ -35,6 +35,11 @@ struct Pool {
 
 }  // anon
 
+// Forward decl — sp_parallel_for reads this thread_local to detect
+// nested calls and run them inline.
+extern thread_local bool t_sp_in_parallel;
+thread_local bool t_sp_in_parallel = false;
+
 static void worker_main(int worker_id) {
     Pool& p = Pool::inst();
     uint64_t last_epoch = 0;
@@ -50,7 +55,11 @@ static void worker_main(int worker_id) {
         last_epoch = p.task_epoch;
         lk.unlock();
 
-        if (t) (*t)(worker_id);
+        if (t) {
+            t_sp_in_parallel = true;   // any nested parallel_for → inline
+            (*t)(worker_id);
+            t_sp_in_parallel = false;
+        }
 
         // Mark this slice done; wake driver if it was the last.
         const int prev = p.done_count.fetch_add(1, std::memory_order_acq_rel);
@@ -118,6 +127,16 @@ void sp_parallel_for(const std::function<void(int)>& task) {
         task(0);
         return;
     }
+    // Nesting guard. The pool has one global task slot; nested
+    // parallel_for would clobber it and deadlock waiting for
+    // done_count. When already inside a parallel section (driver or
+    // worker), run the inner task inline as if n_threads==1.
+    if (t_sp_in_parallel) {
+        task(0);
+        return;
+    }
+    t_sp_in_parallel = true;
+
     // Hand work to workers and run slice 0 ourselves.
     {
         std::lock_guard<std::mutex> g(p.mu);
@@ -136,6 +155,8 @@ void sp_parallel_for(const std::function<void(int)>& task) {
         });
         p.task = nullptr;
     }
+
+    t_sp_in_parallel = false;
 }
 
 }  // namespace sp::engine
