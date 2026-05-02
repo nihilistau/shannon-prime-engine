@@ -318,6 +318,7 @@ add_library(sp_engine STATIC
     src/sp_quant.cpp
     src/sp_kernels_cpu.cpp
     src/forward_native.cpp
+    src/forward_native_context.cpp
     vendor/cpp-httplib/httplib.cpp)
 target_include_directories(sp_engine PUBLIC src)
 target_include_directories(sp_engine PUBLIC ${CMAKE_SOURCE_DIR}/vendor/cpp-httplib)

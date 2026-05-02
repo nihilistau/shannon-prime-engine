@@ -71,6 +71,29 @@ void sp_rms_norm_f32_rows(const float* x, const float* scale,
 }
 
 // ──────────────────────────────────────────────────────────────────
+// Bias add (broadcast)
+// ──────────────────────────────────────────────────────────────────
+
+void sp_bias_add_f32_rows(float* out, const float* bias,
+                           int n_cols, int n_rows) {
+    if (!bias) return;
+    for (int r = 0; r < n_rows; ++r) {
+        float* row = out + (size_t)r * n_cols;
+#if SP_HAS_NEON
+        int c = 0;
+        for (; c + 4 <= n_cols; c += 4) {
+            float32x4_t v_o = vld1q_f32(row + c);
+            float32x4_t v_b = vld1q_f32(bias + c);
+            vst1q_f32(row + c, vaddq_f32(v_o, v_b));
+        }
+        for (; c < n_cols; ++c) row[c] += bias[c];
+#else
+        for (int c = 0; c < n_cols; ++c) row[c] += bias[c];
+#endif
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────
 // SiLU
 // ──────────────────────────────────────────────────────────────────
 //

@@ -38,6 +38,13 @@ void sp_rms_norm_f32_rows(const float* x, const float* scale,
                           int n_cols, int n_rows, float eps,
                           float* out);
 
+// ─── Bias add (broadcast a [n_cols] bias vector across rows) ──────
+// out[r * n_cols + c] += bias[c]   for r in [0, n_rows), c in [0, n_cols).
+// `out` is the [n_cols, n_rows] row-major buffer being augmented in
+// place. No-op if bias is nullptr.
+void sp_bias_add_f32_rows(float* out, const float* bias,
+                           int n_cols, int n_rows);
+
 // ─── SiLU (Swish-1) ────────────────────────────────────────────────
 // out[i] = x[i] / (1 + exp(-x[i]))
 // Element-wise, n elements. out may alias x.

@@ -7,6 +7,11 @@
 #include "sp_quant.h"
 #include "sp_tensor.h"
 
+#include "ggml.h"   // type_traits.to_float for quant types we don't yet
+                    // have native fused-matmul kernels for. Used at one
+                    // call site (matmul_fp32_lhs fallback). NO ggml
+                    // graph / scheduler / backend involvement.
+
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -33,6 +38,21 @@ static float* arena_f32(sp_arena& a, size_t n_elements) {
 //
 // On unsupported dtype, returns -1 (caller should bail).
 // ─────────────────────────────────────────────────────────────────
+// Map sp_dtype back to ggml_type for the type_traits fallback. This
+// is the one place we accept a "soft" dependency on ggml's quant
+// tables — purely for dequant math, no compute graph involvement.
+static ggml_type sp_dtype_to_ggml(sp_dtype d) {
+    switch (d) {
+        case sp_dtype::F32:  return GGML_TYPE_F32;
+        case sp_dtype::F16:  return GGML_TYPE_F16;
+        case sp_dtype::Q4_K: return GGML_TYPE_Q4_K;
+        case sp_dtype::Q5_K: return GGML_TYPE_Q5_K;
+        case sp_dtype::Q6_K: return GGML_TYPE_Q6_K;
+        case sp_dtype::Q8_0: return GGML_TYPE_Q8_0;
+        default:             return GGML_TYPE_COUNT;  // sentinel
+    }
+}
+
 static int matmul_fp32_lhs(const float* lhs, const void* W, sp_dtype W_dtype,
                             int m, int k, int n, float* out) {
     switch (W_dtype) {
@@ -42,14 +62,28 @@ static int matmul_fp32_lhs(const float* lhs, const void* W, sp_dtype W_dtype,
         case sp_dtype::Q5_K:
             sp_matmul_f32_q5k(lhs, W, m, k, n, out);
             return 0;
-        // F16, Q4_K, Q6_K, Q8_0 routes added when needed. For now,
-        // any unhandled dtype is a hard fail — surfaces the missing
-        // backend rather than silently producing zeros.
-        default:
-            std::fprintf(stderr,
-                "[sp_native] matmul: unsupported W dtype=%d (need F32 or Q5_K)\n",
-                (int)W_dtype);
-            return -1;
+        // F16, Q4_K, Q6_K, Q8_0 — fall through to ggml-dequant
+        // fallback. Native fused kernels can be added per-quant later;
+        // until then we trade some perf for correctness on any
+        // GGUF-supported quant.
+        default: {
+            const ggml_type gt = sp_dtype_to_ggml(W_dtype);
+            const struct ggml_type_traits* tt = ggml_get_type_traits(gt);
+            if (!tt || !tt->to_float || gt == GGML_TYPE_COUNT) {
+                std::fprintf(stderr,
+                    "[sp_native] matmul: unsupported W dtype=%d (no fallback)\n",
+                    (int)W_dtype);
+                return -1;
+            }
+            // Dequant the entire weight matrix once, then fp32 matmul.
+            // Slower than per-row L1 reuse (sp_matmul_f32_q5k pattern)
+            // but trivially correct and fine until per-quant native
+            // kernels land.
+            std::vector<float> Wf((size_t)n * k);
+            tt->to_float(W, Wf.data(), (int64_t)n * k);
+            sp_matmul_f32(lhs, Wf.data(), m, k, n, out);
+            return 0;
+        }
     }
 }
 
@@ -125,6 +159,11 @@ int forward_native_attention(const ForwardNativeLayer&   layer,
                          n_seq, n_embd, n_kv_dim, K) != 0) return -3;
     if (matmul_fp32_lhs(xn, layer.wv, layer.wv_dtype,
                          n_seq, n_embd, n_kv_dim, V) != 0) return -3;
+
+    // Apply Q/K/V biases when present (Qwen2 has them; Qwen3 omits).
+    sp_bias_add_f32_rows(Q, layer.bq, n_q_dim,  n_seq);
+    sp_bias_add_f32_rows(K, layer.bk, n_kv_dim, n_seq);
+    sp_bias_add_f32_rows(V, layer.bv, n_kv_dim, n_seq);
 
     // Q layout right now: [n_q_dim, n_seq] = [n_head*head_dim, n_seq]
     // For RoPE we need [head_dim, n_head, n_seq]. The memory is the
@@ -284,6 +323,7 @@ int forward_native_attention(const ForwardNativeLayer&   layer,
     // dims. lhs[n_seq, n_q_dim], W[n_embd, n_q_dim], out[n_seq, n_embd].
     if (matmul_fp32_lhs(attn_out, layer.wo, layer.wo_dtype,
                          n_seq, n_q_dim, n_embd, out_residual) != 0) return -3;
+    sp_bias_add_f32_rows(out_residual, layer.bo, n_embd, n_seq);
     return 0;
 }
 

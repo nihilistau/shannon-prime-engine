@@ -50,6 +50,14 @@ struct ForwardNativeLayer {
     const void*  wv = nullptr;   sp_dtype wv_dtype = sp_dtype::UNDEFINED;
     const void*  wo = nullptr;   sp_dtype wo_dtype = sp_dtype::UNDEFINED;
 
+    // Optional Q/K/V/O biases (Qwen2 has bq/bk/bv; Qwen3 omits them
+    // by design; Llama variants vary). Always fp32 in GGUF when
+    // present. Null = no bias add.
+    const float* bq = nullptr;
+    const float* bk = nullptr;
+    const float* bv = nullptr;
+    const float* bo = nullptr;
+
     // Optional Q/K per-head RMSNorm (Qwen2 doesn't use these; Qwen3
     // does for stability). [head_dim] each. Null when disabled.
     const float* attn_q_norm = nullptr;
