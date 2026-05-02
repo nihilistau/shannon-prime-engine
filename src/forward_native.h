@@ -67,6 +67,26 @@ struct ForwardNativeLayer {
     const void*  ffn_gate = nullptr;  sp_dtype ffn_gate_dtype = sp_dtype::UNDEFINED;
     const void*  ffn_up   = nullptr;  sp_dtype ffn_up_dtype   = sp_dtype::UNDEFINED;
     const void*  ffn_down = nullptr;  sp_dtype ffn_down_dtype = sp_dtype::UNDEFINED;
+
+    // ─── Optional backend dispatch hooks ─────────────────────────────
+    // The CPU layer step uses sp_matmul_f32 internally for the per-head
+    // KQ matmul. When a heterogeneous backend (QNN HTP, Hexagon, etc.)
+    // is wired up, set this hook on each layer; the attention loop
+    // calls it in place of sp_matmul_f32 for that one op.
+    //
+    // Contract: caller-supplied function computes
+    //   scores[n_seq, n_kv_total] = Q[n_seq, head_dim] @ K^T[n_kv_total, head_dim]
+    // (so K is stored row-major as [n_kv_total, head_dim] — same memory
+    // forward_native already produces). Returns 0 on success, non-zero
+    // to fall through to sp_matmul_f32. fp32 in / fp32 out — backend
+    // is responsible for any internal precision conversion.
+    typedef int (*kq_dispatch_fn_t)(void* userdata,
+                                     const float* Q,        // [n_seq, head_dim]
+                                     const float* K,        // [n_kv_total, head_dim]
+                                     int n_seq, int head_dim, int n_kv_total,
+                                     float* scores);        // [n_seq, n_kv_total]
+    kq_dispatch_fn_t kq_dispatch          = nullptr;
+    void*            kq_dispatch_userdata = nullptr;
 };
 
 // ─────────────────────────────────────────────────────────────────

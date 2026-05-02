@@ -11,8 +11,14 @@
 
 #include "ggml.h"   // ONLY for reading ggml_tensor metadata + data ptr
 
+#if defined(SP_ENGINE_WITH_QNN)
+#include "sp_llama_qnn.h"   // QNN HTP dispatch wrapper (matmul cache)
+#include "QnnTypes.h"       // QNN_DATATYPE_FLOAT_16
+#endif
+
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <vector>
 
@@ -142,6 +148,70 @@ static int lm_head_apply(const ggml_tensor* W,
     }
 }
 
+#if defined(SP_ENGINE_WITH_QNN)
+// ─────────────────────────────────────────────────────────────────
+// QNN KQ-matmul dispatch shim.
+//
+// forward_native_attention's hook signature is fp32 in / fp32 out.
+// QNN HTP wants fp16 buffers. The shim converts:
+//   1. Q[n_seq, head_dim] fp32 → fp16 in thread_local scratch
+//   2. K[n_kv_total, head_dim] fp32 → transposed [head_dim, n_kv_total]
+//      fp16 in thread_local scratch  (sp_llama_qnn_matmul does plain
+//      MatMul A@B; we need Q @ K^T so we hand it K-transposed)
+//   3. dispatch  → fp16 [n_seq, n_kv_total] in thread_local scratch
+//   4. fp16 → fp32 back into caller's `scores` buffer
+//
+// Returns 0 on success, non-zero to fall through to CPU sp_matmul_f32.
+// ─────────────────────────────────────────────────────────────────
+static int qnn_kq_dispatch_shim(void* userdata,
+                                 const float* Q,
+                                 const float* K,
+                                 int n_seq, int head_dim, int n_kv_total,
+                                 float* scores) {
+    auto* cache = (sp_llama_qnn_matmul_cache*)userdata;
+    if (!cache) return -1;
+
+    // Per-thread scratch — small enough to live on the heap as
+    // thread_local; resized per call when shape grows.
+    static thread_local std::vector<uint16_t> q_fp16, kt_fp16, out_fp16;
+
+    const size_t q_n  = (size_t)n_seq * head_dim;
+    const size_t kt_n = (size_t)head_dim * n_kv_total;
+    const size_t o_n  = (size_t)n_seq * n_kv_total;
+
+    if (q_fp16.size()   < q_n)  q_fp16.resize(q_n);
+    if (kt_fp16.size()  < kt_n) kt_fp16.resize(kt_n);
+    if (out_fp16.size() < o_n)  out_fp16.resize(o_n);
+
+    // Q: just narrow.
+    for (size_t i = 0; i < q_n; ++i) q_fp16[i] = sp_fp32_to_fp16(Q[i]);
+
+    // K^T: transpose [n_kv_total, head_dim] → [head_dim, n_kv_total]
+    // and narrow to fp16 in one pass.
+    for (int p = 0; p < n_kv_total; ++p) {
+        const float* k_row = K + (size_t)p * head_dim;
+        for (int d = 0; d < head_dim; ++d) {
+            kt_fp16[(size_t)d * n_kv_total + p] = sp_fp32_to_fp16(k_row[d]);
+        }
+    }
+
+    uint64_t exec_us = 0;
+    int rc = sp_llama_qnn_matmul_dispatch(cache,
+                                          (uint32_t)n_seq,
+                                          (uint32_t)head_dim,
+                                          (uint32_t)n_kv_total,
+                                          q_fp16.data(),  q_n  * 2,
+                                          kt_fp16.data(), kt_n * 2,
+                                          out_fp16.data(), o_n * 2,
+                                          &exec_us);
+    if (rc != 0) return rc;
+
+    // Widen output back to fp32 in caller buffer.
+    for (size_t i = 0; i < o_n; ++i) scores[i] = sp_fp16_to_fp32(out_fp16[i]);
+    return 0;
+}
+#endif  // SP_ENGINE_WITH_QNN
+
 // ─────────────────────────────────────────────────────────────────
 // Build a ForwardNativeLayer view over a LlamaLayer's ggml tensors.
 // All pointers point into the GGUF mmap (or backend-resident copy);
@@ -194,6 +264,16 @@ struct ForwardNativeContext::Impl {
 
     sp_arena arena;
     int n_pos = 0;     // current cache fill
+
+#if defined(SP_ENGINE_WITH_QNN)
+    // QNN HTP matmul dispatch cache. Lazy-init when SHANNON_PRIME_QNN=1
+    // is set in env at context create. Shape-keyed on (M=n_seq, K=head_dim,
+    // N=n_kv_total) — n_kv_total grows as decode progresses, so each
+    // step past the prefill creates a new shape entry. Phase 2.5
+    // graphFinalize cost ~50ms once per shape, then ~330µs per dispatch.
+    sp_llama_qnn_matmul_cache* qnn_mm_cache = nullptr;
+    bool qnn_active = false;
+#endif
 };
 
 std::unique_ptr<ForwardNativeContext> ForwardNativeContext::create(
@@ -300,6 +380,38 @@ std::unique_ptr<ForwardNativeContext> ForwardNativeContext::create(
     I.layers_bound.reserve(I.n_layer);
     for (const auto& L : weights.layers()) I.layers_bound.push_back(bind_layer(L));
 
+#if defined(SP_ENGINE_WITH_QNN)
+    // ── QNN HTP KQ matmul dispatch (Phase 4.5) ──────────────────────
+    // When SHANNON_PRIME_QNN=1 in env, allocate the matmul cache and
+    // install the shim on every bound layer's kq_dispatch hook. The
+    // attention loop then routes the per-head Q@K^T matmul to V69 HTP
+    // via sp_qnn_runtime_matmul_create (validated standalone at 238 µs
+    // for 256² fp32 / 187 µs fp16). Phase 2.6b's ION-backed persistent
+    // K plumbing engages here for real for the first time, since this
+    // is a clean direct-call site (no map_custom2 / thread_local /
+    // ggml worker fan-out around it).
+    {
+        const char* v = std::getenv("SHANNON_PRIME_QNN");
+        if (v && v[0] == '1') {
+            I.qnn_mm_cache = sp_llama_qnn_matmul_cache_create();
+            if (I.qnn_mm_cache) {
+                for (auto& L : I.layers_bound) {
+                    L.kq_dispatch = &qnn_kq_dispatch_shim;
+                    L.kq_dispatch_userdata = I.qnn_mm_cache;
+                }
+                I.qnn_active = true;
+                std::fprintf(stderr,
+                    "[sp_native] QNN HTP dispatch active — per-head KQ "
+                    "matmul routed to V69 HTP via sp_qnn runtime graph\n");
+            } else {
+                std::fprintf(stderr,
+                    "[sp_native] SHANNON_PRIME_QNN=1 set but matmul cache "
+                    "create failed — staying on CPU sp_matmul_f32\n");
+            }
+        }
+    }
+#endif
+
     // Allocate KV storage for all layers. Per layer: max_seq * n_head_kv
     // * head_dim fp16 each for K and V.
     const size_t per_layer_kv = (size_t)I.max_seq * I.hp.n_head_kv * I.hp.head_dim;
@@ -330,7 +442,14 @@ std::unique_ptr<ForwardNativeContext> ForwardNativeContext::create(
 
 ForwardNativeContext::ForwardNativeContext()
     : impl_(std::make_unique<Impl>()) {}
-ForwardNativeContext::~ForwardNativeContext() = default;
+
+ForwardNativeContext::~ForwardNativeContext() {
+#if defined(SP_ENGINE_WITH_QNN)
+    if (impl_ && impl_->qnn_mm_cache) {
+        sp_llama_qnn_matmul_cache_destroy(&impl_->qnn_mm_cache);
+    }
+#endif
+}
 
 int ForwardNativeContext::n_layer()   const { return impl_->n_layer; }
 int ForwardNativeContext::n_embd()    const { return impl_->hp.n_embd; }
