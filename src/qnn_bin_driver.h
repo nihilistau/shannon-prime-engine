@@ -45,4 +45,28 @@ int qnn_bin_prefill_bench(const std::vector<std::string>& split_paths,
 // the KV cache). Returns 0 on success.
 int qnn_bin_schema_dump(const std::vector<std::string>& split_paths);
 
+// Phase 5.2: real prompt → tokens → split chain → sample
+// argmax(logits[last_real_position]). Validates the .bin pipeline
+// produces a coherent next token for an actual prompt (not
+// zero-init buffers). One prefill chunk (≤128 tokens), no decode
+// loop yet — that's Phase 5.3 once AR=1 .bins are exported.
+//
+//   prompt_tokens — int32 tokenised prompt (truncated to 128 if
+//                   longer, padded with 0s if shorter).
+//   ar            — activation rank baked into the .bins (128).
+//   cl            — context length baked into the .bins (2048).
+//   head_dim      — KV head dim (128 for Qwen3-4B).
+//   n_freq_pairs  — head_dim / 2 (RoPE frequency pairs).
+//   rope_base     — RoPE base frequency (1000000 for Qwen3-4B).
+//   out_next_token_id — receives argmax over logits[last_pos].
+//
+// Returns 0 on success.
+int qnn_bin_generate_one(const std::vector<std::string>& split_paths,
+                          const std::vector<int32_t>& prompt_tokens,
+                          int   ar,
+                          int   cl,
+                          int   head_dim,
+                          float rope_base,
+                          int*  out_next_token_id);
+
 }  // namespace sp::engine

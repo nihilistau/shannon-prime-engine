@@ -8,10 +8,12 @@
 
 #include "qnn_bin_driver.h"
 
-#include "sp_qnn.h"   // load_binary, get_io_info, execute, init/shutdown
+#include "sp_quant.h"         // sp_fp32_to_fp16 / sp_fp16_to_fp32
+#include "sp_qnn.h"           // load_binary, get_io_info, execute, init/shutdown
 
 #include <chrono>
 #include <cinttypes>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -291,6 +293,292 @@ int qnn_bin_prefill_bench(const std::vector<std::string>& split_paths,
             mx/1000.0,  128.0 * 1e6 / (double)mx);
     }
 
+    sp_qnn_shutdown();
+    return rc;
+}
+
+// ─────────────────────────────────────────────────────────────────
+// Phase 5.2 — real prompt → next token through the .bin chain.
+// ─────────────────────────────────────────────────────────────────
+
+namespace {
+
+// Find input/output index by exact name match. Returns -1 if not found.
+int find_io_idx(const sp_qnn_tensor_info* infos, size_t n,
+                const char* needle) {
+    for (size_t i = 0; i < n; ++i) {
+        if (infos[i].name && std::strcmp(infos[i].name, needle) == 0) {
+            return (int)i;
+        }
+    }
+    return -1;
+}
+
+// Find any input/output whose name contains the substring. Used for
+// past_key_*_in / past_value_*_in iteration where the layer index is
+// embedded in the name.
+int find_io_by_substr(const sp_qnn_tensor_info* infos, size_t n,
+                       const char* needle) {
+    for (size_t i = 0; i < n; ++i) {
+        if (infos[i].name && std::strstr(infos[i].name, needle)) {
+            return (int)i;
+        }
+    }
+    return -1;
+}
+
+// Build precomputed RoPE position_ids_cos/sin tables for the first
+// `n_positions` positions. fp16[1, 1, n_positions, n_freq_pairs].
+// theta_i(p) = p / rope_base^(2i / head_dim) for i in [0, n_freq_pairs).
+void build_position_ids(int n_positions, int n_freq_pairs,
+                          float rope_base,
+                          std::vector<uint16_t>& cos_out,
+                          std::vector<uint16_t>& sin_out) {
+    cos_out.assign((size_t)n_positions * n_freq_pairs, 0);
+    sin_out.assign((size_t)n_positions * n_freq_pairs, 0);
+    const double base = (double)rope_base;
+    const int    head_dim = n_freq_pairs * 2;
+    for (int p = 0; p < n_positions; ++p) {
+        for (int i = 0; i < n_freq_pairs; ++i) {
+            const double freq  = std::pow(base, (double)(2 * i) / (double)head_dim);
+            const double theta = (double)p / freq;
+            cos_out[(size_t)p * n_freq_pairs + i] =
+                sp_fp32_to_fp16((float)std::cos(theta));
+            sin_out[(size_t)p * n_freq_pairs + i] =
+                sp_fp32_to_fp16((float)std::sin(theta));
+        }
+    }
+}
+
+// Build causal attention mask fp16[1, 1, ar, cl] for HF-convention
+// hybrid prefill graphs. The 2048-wide K dimension is laid out as
+// [past_in_buffer (cl-ar slots) | current_chunk (ar slots)]. Past
+// has past_len ≤ cl-ar meaningful positions starting at offset
+// (cl - ar - past_len); the rest of the past buffer is junk and
+// must be masked. Current chunk lives at [cl-ar, cl) — for query q
+// (q ∈ [0, ar)), causal allow covers past meaningful positions plus
+// current [cl-ar, cl-ar+q].
+//
+// First chunk has past_len = 0 → only the current chunk's [cl-ar,
+// cl-ar+q] positions are unmasked. My earlier version allowed
+// [0, q] which pointed at PAST junk slots → fp16-saturated logits.
+void build_causal_mask(int ar, int cl, int n_real_tokens, int past_len,
+                        std::vector<uint16_t>& mask_out) {
+    const uint16_t neg_inf_fp16 = sp_fp32_to_fp16(-1.0e30f);
+    const uint16_t zero_fp16    = sp_fp32_to_fp16(0.0f);
+    mask_out.assign((size_t)ar * cl, neg_inf_fp16);
+    const int past_max = cl - ar;            // past buffer width
+    const int past_off = past_max - past_len; // offset to first meaningful past
+    const int last_q   = n_real_tokens > ar ? ar : n_real_tokens;
+    for (int q = 0; q < last_q; ++q) {
+        // Meaningful past positions [past_off, past_max).
+        for (int k = past_off; k < past_max && k < cl; ++k) {
+            mask_out[(size_t)q * cl + k] = zero_fp16;
+        }
+        // Current chunk [past_max, past_max + q] — causal.
+        for (int k = past_max; k <= past_max + q && k < cl; ++k) {
+            mask_out[(size_t)q * cl + k] = zero_fp16;
+        }
+    }
+}
+
+}  // namespace
+
+int qnn_bin_generate_one(const std::vector<std::string>& split_paths,
+                          const std::vector<int32_t>& prompt_tokens,
+                          int   ar,
+                          int   cl,
+                          int   head_dim,
+                          float rope_base,
+                          int*  out_next_token_id) {
+    if (split_paths.size() != 4) {
+        std::fprintf(stderr,
+            "[qnn_bin] generate_one expects 4 splits, got %zu\n",
+            split_paths.size());
+        return -1;
+    }
+    if (!out_next_token_id) return -1;
+    if (prompt_tokens.empty()) {
+        std::fprintf(stderr, "[qnn_bin] empty prompt\n");
+        return -1;
+    }
+
+    if (sp_qnn_init(nullptr, nullptr) != SP_QNN_OK) {
+        std::fprintf(stderr, "[qnn_bin] sp_qnn_init failed\n");
+        return -2;
+    }
+
+    // ── Build static inputs that don't change per chunk ──
+    const int n_freq_pairs = head_dim / 2;
+    std::vector<uint16_t> pos_cos, pos_sin;
+    build_position_ids(ar, n_freq_pairs, rope_base, pos_cos, pos_sin);
+
+    const int n_real = (int)prompt_tokens.size();
+    const int n_real_clamped = n_real > ar ? ar : n_real;
+    if (n_real > ar) {
+        std::fprintf(stderr,
+            "[qnn_bin] warning: prompt has %d tokens, truncating to AR=%d "
+            "(multi-chunk prefill is Phase 5.4)\n", n_real, ar);
+    }
+
+    std::vector<uint16_t> attn_mask;
+    // First chunk: no history.
+    build_causal_mask(ar, cl, n_real_clamped, /*past_len=*/0, attn_mask);
+
+    std::vector<int32_t> input_ids((size_t)ar, 0);
+    for (int i = 0; i < n_real_clamped; ++i) input_ids[(size_t)i] = prompt_tokens[(size_t)i];
+
+    // ── SPLIT 1: input_ids → embedding ──────────────────────────
+    Split s1;
+    if (!load_split(split_paths[0], s1)) { sp_qnn_shutdown(); return -3; }
+    const sp_qnn_tensor_info* s1_in_info  = nullptr;
+    const sp_qnn_tensor_info* s1_out_info = nullptr;
+    sp_qnn_get_io_info(s1.h, &s1.n_in, &s1_in_info, &s1.n_out, &s1_out_info);
+
+    const int s1_input_ids_idx = find_io_idx(s1_in_info, s1.n_in, "input_ids");
+    if (s1_input_ids_idx < 0) {
+        std::fprintf(stderr, "[qnn_bin] split 1 missing input_ids\n");
+        free_split(s1); sp_qnn_shutdown(); return -3;
+    }
+    std::memcpy(s1.in_bufs[(size_t)s1_input_ids_idx],
+                input_ids.data(), s1.in_sz[(size_t)s1_input_ids_idx]);
+
+    uint64_t exec_us = 0;
+    if (!exec_split(s1, &exec_us)) {
+        std::fprintf(stderr, "[qnn_bin] split 1 exec failed\n");
+        free_split(s1); sp_qnn_shutdown(); return -4;
+    }
+    std::fprintf(stderr, "[qnn_bin] split 1 exec: %.1f ms\n", exec_us / 1000.0);
+
+    // Carry the embedding (residual) buffer.
+    std::vector<uint8_t> residual;
+    if (s1.residual_out_idx < 0) {
+        std::fprintf(stderr, "[qnn_bin] split 1 has no residual output\n");
+        free_split(s1); sp_qnn_shutdown(); return -3;
+    }
+    {
+        const size_t sz = s1.out_sz[(size_t)s1.residual_out_idx];
+        residual.assign(sz, 0);
+        std::memcpy(residual.data(),
+                    s1.out_bufs[(size_t)s1.residual_out_idx], sz);
+    }
+    free_split(s1);
+
+    // ── Helper: run one of the layer-block splits (2/3/4) ───────
+    // For each: bind attention_mask, residual_in, position_ids_cos/sin,
+    // and zero-init all past_key/past_value inputs (first chunk, no
+    // history). Carry residual_out into `residual`. For split 4,
+    // additionally read the logits output and pick the argmax at
+    // position n_real_clamped - 1.
+    auto run_layer_block = [&](const std::string& path, bool is_last,
+                                int* picked_token_id) -> int {
+        Split s;
+        if (!load_split(path, s)) return -3;
+        const sp_qnn_tensor_info* in_info  = nullptr;
+        const sp_qnn_tensor_info* out_info = nullptr;
+        sp_qnn_get_io_info(s.h, &s.n_in, &in_info, &s.n_out, &out_info);
+
+        // Bind attention_mask.
+        const int mask_idx = find_io_idx(in_info, s.n_in, "attention_mask");
+        if (mask_idx < 0
+            || s.in_sz[(size_t)mask_idx] != attn_mask.size() * sizeof(uint16_t)) {
+            std::fprintf(stderr,
+                "[qnn_bin] %s: attention_mask shape mismatch\n", path.c_str());
+            free_split(s); return -3;
+        }
+        std::memcpy(s.in_bufs[(size_t)mask_idx],
+                    attn_mask.data(), s.in_sz[(size_t)mask_idx]);
+
+        // Bind position_ids_cos/sin.
+        const int pcos_idx = find_io_idx(in_info, s.n_in, "position_ids_cos");
+        const int psin_idx = find_io_idx(in_info, s.n_in, "position_ids_sin");
+        if (pcos_idx < 0 || psin_idx < 0) {
+            std::fprintf(stderr, "[qnn_bin] %s: position_ids missing\n",
+                         path.c_str());
+            free_split(s); return -3;
+        }
+        std::memcpy(s.in_bufs[(size_t)pcos_idx], pos_cos.data(),
+                    s.in_sz[(size_t)pcos_idx]);
+        std::memcpy(s.in_bufs[(size_t)psin_idx], pos_sin.data(),
+                    s.in_sz[(size_t)psin_idx]);
+
+        // Bind residual_in via name search — covers both
+        // "..._Add_1_output_0" (block residual chain) and
+        // "..._Gather_output_0" (embedding from split 1).
+        if (s.residual_in_idx < 0) {
+            std::fprintf(stderr,
+                "[qnn_bin] %s: no residual input\n", path.c_str());
+            free_split(s); return -3;
+        }
+        const size_t res_in_bytes = s.in_sz[(size_t)s.residual_in_idx];
+        if (res_in_bytes != residual.size()) {
+            std::fprintf(stderr,
+                "[qnn_bin] %s: residual size mismatch %zu vs %zu\n",
+                path.c_str(), res_in_bytes, residual.size());
+            free_split(s); return -3;
+        }
+        std::memcpy(s.in_bufs[(size_t)s.residual_in_idx],
+                    residual.data(), res_in_bytes);
+
+        // past_key/past_value inputs stay at calloc-zero (first chunk,
+        // no history). Inputs are tagged "past_key_*_in" / "past_value_*_in".
+        // Nothing to do.
+
+        // Execute.
+        uint64_t us = 0;
+        if (!exec_split(s, &us)) {
+            std::fprintf(stderr,
+                "[qnn_bin] %s exec failed\n", path.c_str());
+            free_split(s); return -4;
+        }
+        std::fprintf(stderr, "[qnn_bin] %s exec: %.1f ms\n",
+                     path.c_str(), us / 1000.0);
+
+        // Carry residual_out → residual (for next split).
+        if (s.residual_out_idx >= 0) {
+            const size_t sz = s.out_sz[(size_t)s.residual_out_idx];
+            residual.assign(sz, 0);
+            std::memcpy(residual.data(),
+                        s.out_bufs[(size_t)s.residual_out_idx], sz);
+        }
+
+        // For split 4: pick argmax(logits[last_real_position]).
+        if (is_last) {
+            const int logits_idx = find_io_idx(out_info, s.n_out, "logits");
+            if (logits_idx < 0) {
+                std::fprintf(stderr,
+                    "[qnn_bin] %s: missing logits output\n", path.c_str());
+                free_split(s); return -3;
+            }
+            // logits shape [1, 128, vocab]; bytes = 1 * 128 * vocab * 2.
+            const size_t total_bytes = s.out_sz[(size_t)logits_idx];
+            const int    vocab = (int)(total_bytes / 2 / (size_t)ar);
+            const uint16_t* logits =
+                (const uint16_t*)s.out_bufs[(size_t)logits_idx];
+            const int last_q = n_real_clamped - 1;
+            const uint16_t* row = logits + (size_t)last_q * vocab;
+            int    best_id = 0;
+            float  best_v  = -1.0e30f;
+            for (int v = 0; v < vocab; ++v) {
+                const float f = sp_fp16_to_fp32(row[v]);
+                if (f > best_v) { best_v = f; best_id = v; }
+            }
+            *picked_token_id = best_id;
+            std::fprintf(stderr,
+                "[qnn_bin] logits[%d]: argmax id=%d value=%.4f (vocab=%d)\n",
+                last_q, best_id, best_v, vocab);
+        }
+
+        free_split(s);
+        return 0;
+    };
+
+    int rc = run_layer_block(split_paths[1], /*is_last=*/false, nullptr);
+    if (rc != 0) { sp_qnn_shutdown(); return rc; }
+    rc = run_layer_block(split_paths[2], /*is_last=*/false, nullptr);
+    if (rc != 0) { sp_qnn_shutdown(); return rc; }
+    rc = run_layer_block(split_paths[3], /*is_last=*/true,
+                          out_next_token_id);
     sp_qnn_shutdown();
     return rc;
 }

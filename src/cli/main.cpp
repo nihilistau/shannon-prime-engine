@@ -1534,6 +1534,64 @@ int main(int argc, char** argv) {
         }
         return sp::engine::qnn_bin_schema_dump(splits);
     }
+
+    // Phase 5.2: real prompt → next token through the .bin chain.
+    //   sp-engine qnn_bin_run --tokenizer <gguf> --prompt "..." \
+    //                         [--ar 128] [--cl 2048] [--head-dim 128] \
+    //                         [--rope-base 1000000] \
+    //                         split1 split2 split3 split4
+    if (cmd == "qnn_bin_run") {
+        std::string tok_path, prompt;
+        int   ar = 128, cl = 2048, hd = 128;
+        float rope_base = 1000000.0f;
+        std::vector<std::string> splits;
+        for (int i = 2; i < argc; ++i) {
+            std::string a = argv[i];
+            if      (a == "--tokenizer" && i + 1 < argc) tok_path = argv[++i];
+            else if (a == "--prompt"    && i + 1 < argc) prompt   = argv[++i];
+            else if (a == "--ar"        && i + 1 < argc) ar = std::atoi(argv[++i]);
+            else if (a == "--cl"        && i + 1 < argc) cl = std::atoi(argv[++i]);
+            else if (a == "--head-dim"  && i + 1 < argc) hd = std::atoi(argv[++i]);
+            else if (a == "--rope-base" && i + 1 < argc) rope_base = (float)std::atof(argv[++i]);
+            else splits.emplace_back(std::move(a));
+        }
+        if (tok_path.empty() || prompt.empty() || splits.size() != 4) {
+            std::fprintf(stderr,
+                "qnn_bin_run: needs --tokenizer <gguf> --prompt <text> "
+                "and exactly 4 split paths\n");
+            return 1;
+        }
+
+        // Load model just for vocab/tokenizer.
+        auto m = sp::engine::Model::load(tok_path);
+        if (!m) { std::fprintf(stderr, "Model::load failed\n"); return 2; }
+        auto v  = sp::engine::Vocab::load(*m);
+        auto tk = v ? sp::engine::Tokenizer::create(*v) : nullptr;
+        if (!tk) { std::fprintf(stderr, "tokenizer init failed\n"); return 3; }
+
+        std::vector<int32_t> ids;
+        tk->encode(prompt, /*add_bos=*/true, ids);
+        std::fprintf(stderr,
+            "[qnn_bin_run] prompt encoded to %zu tokens (ar=%d, cl=%d)\n",
+            ids.size(), ar, cl);
+
+        int next_id = -1;
+        const int rc = sp::engine::qnn_bin_generate_one(
+            splits, ids, ar, cl, hd, rope_base, &next_id);
+        if (rc != 0) {
+            std::fprintf(stderr, "qnn_bin_generate_one failed rc=%d\n", rc);
+            return 4;
+        }
+
+        // Decode the predicted token back to text.
+        const std::string next_text = tk->decode({next_id});
+        std::fprintf(stderr,
+            "[qnn_bin_run] next token id=%d text='%s'\n",
+            next_id, next_text.c_str());
+        std::printf("PROMPT: %s\nNEXT  : %s (id=%d)\n",
+                    prompt.c_str(), next_text.c_str(), next_id);
+        return 0;
+    }
 #endif  // SP_ENGINE_WITH_QNN
 
     // `run` is dispatched here (before the global flag parser) so its
