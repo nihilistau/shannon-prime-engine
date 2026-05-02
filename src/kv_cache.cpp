@@ -19,6 +19,13 @@ extern "C" {
 #include <cstdlib>
 #include <cstring>
 
+#if defined(__aarch64__)
+  #include <arm_neon.h>
+  #define SP_KV_HAS_NEON 1
+#else
+  #define SP_KV_HAS_NEON 0
+#endif
+
 namespace sp::engine {
 
 namespace {
@@ -252,6 +259,60 @@ float KvCache::compression_ratio() const {
     return sp_compression_ratio(&impl_->cfg);
 }
 
+// NEON-friendly fp32 dot product. Falls back to scalar on non-ARM
+// or when head_dim isn't a multiple of 4. Inlined into the per-row
+// kernels below — head_dim is typically 64/128/256, all 4-aligned.
+namespace {
+#if SP_KV_HAS_NEON
+inline float dot_f32_neon(const float* a, const float* b, int n) {
+    int i = 0;
+    float32x4_t acc = vdupq_n_f32(0.0f);
+    for (; i + 16 <= n; i += 16) {
+        // 4-way unrolled — keeps the FMA pipe full.
+        acc = vfmaq_f32(acc, vld1q_f32(a + i),       vld1q_f32(b + i));
+        acc = vfmaq_f32(acc, vld1q_f32(a + i + 4),   vld1q_f32(b + i + 4));
+        acc = vfmaq_f32(acc, vld1q_f32(a + i + 8),   vld1q_f32(b + i + 8));
+        acc = vfmaq_f32(acc, vld1q_f32(a + i + 12),  vld1q_f32(b + i + 12));
+    }
+    for (; i + 4 <= n; i += 4) {
+        acc = vfmaq_f32(acc, vld1q_f32(a + i), vld1q_f32(b + i));
+    }
+    float s = vaddvq_f32(acc);
+    for (; i < n; ++i) s += a[i] * b[i];
+    return s;
+}
+// out += w * v   (n elements). Used by V dot accumulator.
+inline void axpy_f32_neon(float* out, const float* v, float w, int n) {
+    int i = 0;
+    float32x4_t vw = vdupq_n_f32(w);
+    for (; i + 16 <= n; i += 16) {
+        vst1q_f32(out + i,
+            vfmaq_f32(vld1q_f32(out + i),       vld1q_f32(v + i),       vw));
+        vst1q_f32(out + i + 4,
+            vfmaq_f32(vld1q_f32(out + i + 4),   vld1q_f32(v + i + 4),   vw));
+        vst1q_f32(out + i + 8,
+            vfmaq_f32(vld1q_f32(out + i + 8),   vld1q_f32(v + i + 8),   vw));
+        vst1q_f32(out + i + 12,
+            vfmaq_f32(vld1q_f32(out + i + 12),  vld1q_f32(v + i + 12),  vw));
+    }
+    for (; i + 4 <= n; i += 4) {
+        vst1q_f32(out + i,
+            vfmaq_f32(vld1q_f32(out + i), vld1q_f32(v + i), vw));
+    }
+    for (; i < n; ++i) out[i] += w * v[i];
+}
+#else
+inline float dot_f32_neon(const float* a, const float* b, int n) {
+    float s = 0.0f;
+    for (int i = 0; i < n; ++i) s += a[i] * b[i];
+    return s;
+}
+inline void axpy_f32_neon(float* out, const float* v, float w, int n) {
+    for (int i = 0; i < n; ++i) out[i] += w * v[i];
+}
+#endif
+} // namespace
+
 // Phase 1.6 fused decompress+matmul (CPU). Reads packed bytes directly
 // from the shadow cache slot, decompresses one K row at a time using
 // the same primitives as sp_shadow_read_k_impl (band_dequantize +
@@ -308,12 +369,11 @@ bool KvCache::kq_fused_cpu(int layer, int head_kv, int n_kv,
         // VHT2 self-inverse → original space.
         sp_vht2_forward_f32(coeffs.data(), hd);
 
-        // Dot against every Q row.
+        // Dot against every Q row — NEON 4-way (16-unrolled) on ARM.
         for (int q = 0; q < n_q; ++q) {
             const float* q_row = q_vec + (size_t)q * (size_t)hd;
-            float dot = 0.0f;
-            for (int i = 0; i < hd; ++i) dot += q_row[i] * coeffs[i];
-            scores[(size_t)q * (size_t)n_kv + (size_t)kv] = dot;
+            scores[(size_t)q * (size_t)n_kv + (size_t)kv] =
+                dot_f32_neon(q_row, coeffs.data(), hd);
         }
     }
     return true;
@@ -350,13 +410,12 @@ bool KvCache::v_dot_fused_cpu(int layer, int head_kv, int n_kv,
 
         // attn_out[q, d] += weights[q, kv] * v_row[d]
         // Outer over Q rows so v_row stays hot in regs / L1.
+        // NEON 4-way (16-unrolled) FMA on ARM.
         for (int q = 0; q < n_q; ++q) {
             const float w = weights[(size_t)q * (size_t)n_kv + (size_t)kv];
             if (w == 0.0f) continue;
             float* out_row = attn_out + (size_t)q * (size_t)hd;
-            for (int d = 0; d < hd; ++d) {
-                out_row[d] += w * v_row[d];
-            }
+            axpy_f32_neon(out_row, v_row.data(), w, hd);
         }
     }
     return true;
