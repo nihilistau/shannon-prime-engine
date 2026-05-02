@@ -359,86 +359,25 @@ int forward_native_attention(const ForwardNativeLayer&   layer,
         //   2. layer.kq_dispatch — generic backend hook (QNN HTP via
         //      sp_llama_qnn_matmul_dispatch).
         //   3. CPU sp_matmul_f32 — correctness floor.
+        // ── Phase 1.6 fused decompress+matmul (CPU) ─────────────
+        // Reads packed K bytes directly out of the shadow cache slot
+        // and runs band_dequantize → mobius/var unreorder → VHT2
+        // self-inverse → dot per K row. Matches llama_sp_fused_kq.cpp
+        // (the validated CPU path that produced the 3.58× spec-decode
+        // win on S22U). Skipped on calibration pass (cache hasn't been
+        // written yet).
         int kq_rc = -1;
-#ifdef SP_HEXAGON_FASTRPC
-        // Restrict hex dispatch to KV head 0. Mirrors the llama-cpp-sp
-        // FUSED_KQ wiring (llama_sp_fused_kq.cpp:357 — "head=0 (matches
-        // existing FUSED_KQ wiring's known limitation — GQA n_heads_kv
-        // > 1 fix is a follow-up)"). Other KV heads fall through to
-        // CPU + KvCache::read decompression.
-        if (kv.hex_cache && !kv.calibrate_pass && hk == 0) {
-            sp_hexagon_cache_t* hex = (sp_hexagon_cache_t*)kv.hex_cache;
-            // Kernel writes kq_scores[kv * n_q + q] — [n_kv, n_q]
-            // layout. We need scores[s * n_kv_total + p] = [n_seq,
-            // n_kv_total]. Allocate a temp, run the kernel, transpose
-            // (no-op flat copy when n_seq == 1, which is the decode
-            // hot path).
-            std::vector<float> hex_out((size_t)n_kv_total * n_seq);
-            kq_rc = sp_hexagon_cache_kq_matmul_fused(
-                hex, kv.layer_idx, hk,
-                /*start_pos=*/0, /*n_kv=*/n_kv_total,
-                Q_h.data(), n_seq,
-                hex_out.data());
-            if (kq_rc == 0) {
-                if (n_seq == 1) {
-                    std::memcpy(scores.data(), hex_out.data(),
-                                (size_t)n_kv_total * sizeof(float));
-                } else {
-                    for (int s = 0; s < n_seq; ++s) {
-                        for (int p = 0; p < n_kv_total; ++p) {
-                            scores[(size_t)s * n_kv_total + p] =
-                                hex_out[(size_t)p * n_seq + s];
-                        }
-                    }
-                }
-                // ── Diagnostic (one-shot): compare hex scores vs CPU
-                // matmul on the same K_full. If max abs diff is small
-                // we know the kernel is consistent with CPU and the
-                // bug lives elsewhere; if large, kernel/cache disagree
-                // on byte interpretation and we need to dig there.
-                static int diag_done = 0;
-                if (!diag_done && kv.layer_idx == 0 && hk == 0) {
-                    diag_done = 1;
-                    std::vector<float> cpu_scores((size_t)n_seq * n_kv_total);
-                    sp_matmul_f32(Q_h.data(), K_full.data(),
-                                  n_seq, head_dim, n_kv_total,
-                                  cpu_scores.data());
-                    float max_abs = 0.0f;
-                    int   bad_s = 0, bad_p = 0;
-                    for (int s = 0; s < n_seq; ++s) {
-                        for (int p = 0; p < n_kv_total; ++p) {
-                            float d = std::fabs(
-                                scores[(size_t)s * n_kv_total + p] -
-                                cpu_scores[(size_t)s * n_kv_total + p]);
-                            if (d > max_abs) {
-                                max_abs = d; bad_s = s; bad_p = p;
-                            }
-                        }
-                    }
-                    std::fprintf(stderr,
-                        "[sp_native:diag] hex KQ vs CPU @ L0H0 "
-                        "n_seq=%d n_kv=%d hd=%d max_abs_diff=%.4f "
-                        "(at s=%d p=%d hex=%.4f cpu=%.4f)\n",
-                        n_seq, n_kv_total, head_dim, max_abs,
-                        bad_s, bad_p,
-                        scores[(size_t)bad_s * n_kv_total + bad_p],
-                        cpu_scores[(size_t)bad_s * n_kv_total + bad_p]);
-                    std::fprintf(stderr,
-                        "[sp_native:diag] first 4 hex scores: "
-                        "%.4f %.4f %.4f %.4f\n",
-                        scores[0], scores[1 < n_kv_total ? 1 : 0],
-                        scores[2 < n_kv_total ? 2 : 0],
-                        scores[3 < n_kv_total ? 3 : 0]);
-                    std::fprintf(stderr,
-                        "[sp_native:diag] first 4 cpu scores: "
-                        "%.4f %.4f %.4f %.4f\n",
-                        cpu_scores[0], cpu_scores[1 < n_kv_total ? 1 : 0],
-                        cpu_scores[2 < n_kv_total ? 2 : 0],
-                        cpu_scores[3 < n_kv_total ? 3 : 0]);
-                }
+        if (!kv.calibrate_pass && kv.kv) {
+            // KvCache::kq_fused_cpu writes scores[(q,kv)] in [n_q, n_kv]
+            // row-major. n_q = n_seq, n_kv = n_kv_total. That's exactly
+            // what sp_matmul_f32(Q_h, K_full, n_seq, hd, n_kv_total,
+            // scores) produces — drop-in.
+            if (kv.kv->kq_fused_cpu(kv.layer_idx, hk, n_kv_total,
+                                    Q_h.data(), n_seq,
+                                    scores.data())) {
+                kq_rc = 0;
             }
         }
-#endif
         if (kq_rc != 0 && layer.kq_dispatch) {
             kq_rc = layer.kq_dispatch(layer.kq_dispatch_userdata,
                                        Q_h.data(), K_full.data(),

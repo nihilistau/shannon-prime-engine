@@ -252,6 +252,73 @@ float KvCache::compression_ratio() const {
     return sp_compression_ratio(&impl_->cfg);
 }
 
+// Phase 1.6 fused decompress+matmul (CPU). Reads packed bytes directly
+// from the shadow cache slot, decompresses one K row at a time using
+// the same primitives as sp_shadow_read_k_impl (band_dequantize +
+// optional reorder unde + VHT2 self-inverse), and dot-products against
+// every Q row before moving to the next K position. Total memory
+// traffic is bounded by sizeof(packed_bytes) (~10× smaller than fp32 K)
+// rather than sizeof(fp32_K), so the kernel becomes ALU-bound on ARM.
+//
+// Implementation mirrors llama_sp_fused_kq.cpp:decompress_one_row +
+// inner dot loop. All work runs on the calling thread; not yet
+// threaded — caller can split n_q across threads at the call site.
+bool KvCache::kq_fused_cpu(int layer, int head_kv, int n_kv,
+                            const float* q_vec, int n_q,
+                            float* scores) const {
+    if (!impl_) return false;
+    if (!impl_->shadow_inited) {
+        // sqfree, hier, GPU-resident caches don't share the same
+        // packed-byte layout that the per-row decompress assumes.
+        return false;
+    }
+    if (layer < 0 || layer >= impl_->n_layer) return false;
+    if (head_kv < 0 || head_kv >= impl_->n_head_kv) return false;
+    if (n_kv <= 0 || n_q <= 0 || !q_vec || !scores) return false;
+
+    const sp_shadow_cache_t* sc = &impl_->shadow;
+    const int hd       = sc->config.head_dim;
+    const int n_heads  = sc->config.n_heads_kv;
+    const int slot     = layer * n_heads + head_kv;
+    const uint8_t* k_archive = sc->k_cache[slot];
+    if (!k_archive) return false;
+
+    const sp_band_config_t* bc = &sc->k_bands;
+    const int per_pos = bc->total_bytes;
+
+    // Per-row scratch — head_dim floats.
+    std::vector<float> coeffs((size_t)hd);
+    std::vector<float> tmp((size_t)hd);
+
+    for (int kv = 0; kv < n_kv; ++kv) {
+        const uint8_t* src = k_archive + (size_t)kv * (size_t)per_pos;
+
+        sp_band_dequantize(src, coeffs.data(), bc);
+
+        // Inverse reorder. Mirrors sp_shadow_read_k_impl exactly so
+        // the round-trip matches the canonical read path.
+        if (sc->use_var_reorder) {
+            for (int i = 0; i < hd; ++i) tmp[sc->var_order[i]] = coeffs[i];
+            std::memcpy(coeffs.data(), tmp.data(), (size_t)hd * sizeof(float));
+        } else if (sc->config.use_mobius_mask) {
+            sp_mobius_unreorder_ex(coeffs.data(), &sc->mobius_mask,
+                                   tmp.data());
+        }
+
+        // VHT2 self-inverse → original space.
+        sp_vht2_forward_f32(coeffs.data(), hd);
+
+        // Dot against every Q row.
+        for (int q = 0; q < n_q; ++q) {
+            const float* q_row = q_vec + (size_t)q * (size_t)hd;
+            float dot = 0.0f;
+            for (int i = 0; i < hd; ++i) dot += q_row[i] * coeffs[i];
+            scores[(size_t)q * (size_t)n_kv + (size_t)kv] = dot;
+        }
+    }
+    return true;
+}
+
 std::string KvCache::describe() const {
     const char* mode = impl_->hierarchical ? "hierarchical" :
                        impl_->sqfree       ? "sqfree"       : "shadow";
