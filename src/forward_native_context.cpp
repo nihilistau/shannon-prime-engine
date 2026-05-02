@@ -11,6 +11,10 @@
 #include "sp_tensor.h"
 #include "sp_threadpool.h"
 
+#ifdef SP_HEXAGON_FASTRPC
+#include "shannon_prime_hexagon.h"
+#endif
+
 #include "ggml.h"   // ONLY for reading ggml_tensor metadata + data ptr
 
 #if defined(SP_ENGINE_WITH_QNN)
@@ -313,6 +317,16 @@ struct ForwardNativeContext::Impl {
     sp_llama_qnn_matmul_cache* qnn_mm_cache = nullptr;
     bool qnn_active = false;
 #endif
+
+#ifdef SP_HEXAGON_FASTRPC
+    // Phase 4.8: optional sp_hexagon_cache_t mirroring K writes onto
+    // rpcmem-backed pages so sp_hexagon_cache_kq_matmul_fused (HVX
+    // fused decompress+matmul on cDSP) can read them with no host
+    // round-trip. Lazy-init when SHANNON_PRIME_HEXAGON=1 is set in env.
+    sp_hexagon_ctx_t*    hex_ctx   = nullptr;
+    sp_hexagon_cache_t   hex_cache = {};
+    bool                 hex_active = false;
+#endif
 };
 
 std::unique_ptr<ForwardNativeContext> ForwardNativeContext::create(
@@ -490,6 +504,48 @@ std::unique_ptr<ForwardNativeContext> ForwardNativeContext::create(
         I.kv[L].n_pos_past = 0;
     }
 
+#ifdef SP_HEXAGON_FASTRPC
+    // ── Hexagon cache for HVX fused KQ (Phase 4.8) ──────────────────
+    // Activated when SHANNON_PRIME_HEXAGON=1 in env. Mirrors K writes
+    // onto rpcmem-backed pages so sp_hexagon_cache_kq_matmul_fused
+    // (cDSP HVX fused decompress+matmul, Phase 1.6 leapfrog primitive)
+    // can read them. ADSP_LIBRARY_PATH must point at a dir containing
+    // libsp_hex_skel.so for the FastRPC handshake to succeed.
+    {
+        const char* v = std::getenv("SHANNON_PRIME_HEXAGON");
+        if (v && v[0] == '1') {
+            sp_config_t cfg;
+            sp_config_init(&cfg, I.hp.head_dim, I.n_layer, I.hp.n_head_kv);
+            I.hex_ctx = sp_hexagon_init(&cfg);
+            if (I.hex_ctx) {
+                if (sp_hexagon_cache_init(&I.hex_cache, I.hex_ctx,
+                                          &cfg, I.max_seq) == 0) {
+                    I.hex_active = true;
+                    for (int L = 0; L < I.n_layer; ++L) {
+                        I.kv[L].hex_cache = &I.hex_cache;
+                    }
+                    std::fprintf(stderr,
+                        "[sp_native] Hexagon HVX-fused KQ active "
+                        "(SHANNON_PRIME_HEXAGON=1) — per-head matmul "
+                        "routes to sp_hexagon_cache_kq_matmul_fused\n");
+                } else {
+                    std::fprintf(stderr,
+                        "[sp_native] sp_hexagon_cache_init failed — "
+                        "staying on CPU/SP-banded path\n");
+                    sp_hexagon_free(I.hex_ctx);
+                    I.hex_ctx = nullptr;
+                }
+            } else {
+                std::fprintf(stderr,
+                    "[sp_native] SHANNON_PRIME_HEXAGON=1 set but "
+                    "sp_hexagon_init failed (FastRPC unavailable? "
+                    "missing libsp_hex_skel.so on ADSP_LIBRARY_PATH?) — "
+                    "staying on CPU/SP-banded path\n");
+            }
+        }
+    }
+#endif
+
     // Top-level pointers.
     I.tok_embd    = weights.tok_embd;
     I.output_norm = weights.output_norm;
@@ -528,6 +584,14 @@ ForwardNativeContext::~ForwardNativeContext() {
         sp_llama_qnn_matmul_cache_destroy(&impl_->qnn_mm_cache);
     }
 #endif
+#ifdef SP_HEXAGON_FASTRPC
+    if (impl_ && impl_->hex_active) {
+        sp_hexagon_cache_free(&impl_->hex_cache);
+    }
+    if (impl_ && impl_->hex_ctx) {
+        sp_hexagon_free(impl_->hex_ctx);
+    }
+#endif
 }
 
 int ForwardNativeContext::n_layer()   const { return impl_->n_layer; }
@@ -560,6 +624,29 @@ void ForwardNativeContext::reset() {
         I.kv[L].layer_idx  = L;
         I.kv[L].n_pos_past = 0;
     }
+#ifdef SP_HEXAGON_FASTRPC
+    // Rebuild the hexagon cache so its position counters / packed
+    // bytes match the freshly-created KvCache. Skip if not active.
+    if (I.hex_active) {
+        sp_hexagon_cache_free(&I.hex_cache);
+        sp_config_t cfg;
+        sp_config_init(&cfg, I.hp.head_dim, I.n_layer, I.hp.n_head_kv);
+        if (sp_hexagon_cache_init(&I.hex_cache, I.hex_ctx,
+                                  &cfg, I.max_seq) == 0) {
+            for (int L = 0; L < I.n_layer; ++L) {
+                I.kv[L].hex_cache = &I.hex_cache;
+            }
+        } else {
+            std::fprintf(stderr,
+                "[sp_native] reset: hexagon cache reinit failed — "
+                "disabling hexagon path for this context\n");
+            I.hex_active = false;
+            for (int L = 0; L < I.n_layer; ++L) {
+                I.kv[L].hex_cache = nullptr;
+            }
+        }
+    }
+#endif
     I.n_pos = 0;
 }
 

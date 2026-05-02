@@ -8,6 +8,10 @@
 #include "sp_quant.h"
 #include "sp_tensor.h"
 
+#ifdef SP_HEXAGON_FASTRPC
+#include "shannon_prime_hexagon.h"   // sp_hexagon_cache_kq_matmul_fused
+#endif
+
 #include "ggml.h"   // type_traits.to_float for quant types we don't yet
                     // have native fused-matmul kernels for. Used at one
                     // call site (matmul_fp32_lhs fallback). NO ggml
@@ -232,6 +236,27 @@ int forward_native_attention(const ForwardNativeLayer&   layer,
                 kv.layer_idx, n_pos_past, n_seq);
             return -1;
         }
+#ifdef SP_HEXAGON_FASTRPC
+        // Mirror K into the hexagon cache so HVX kq_matmul_fused has
+        // bytes to read against. The hexagon cache stores per-(layer,
+        // head) so we gather strided per head. Buffer layout from
+        // forward_native: K[(s * n_head_kv + h) * head_dim + d].
+        if (kv.hex_cache) {
+            sp_hexagon_cache_t* hex = (sp_hexagon_cache_t*)kv.hex_cache;
+            std::vector<float> k_head((size_t)n_seq * head_dim);
+            for (int h = 0; h < n_head_kv; ++h) {
+                for (int s = 0; s < n_seq; ++s) {
+                    const float* k_src = K + (size_t)s * n_kv_dim
+                                           + (size_t)h * head_dim;
+                    std::memcpy(k_head.data() + (size_t)s * head_dim,
+                                k_src, (size_t)head_dim * sizeof(float));
+                }
+                sp_hexagon_cache_write_k_batch(hex, kv.layer_idx, h,
+                                                n_pos_past, n_seq,
+                                                k_head.data());
+            }
+        }
+#endif
     }
 
     // ── Attention compute (per-head loop) ────────────────────────
@@ -324,12 +349,47 @@ int forward_native_attention(const ForwardNativeLayer&   layer,
         // scores[n_seq, n_kv_total] = Q_h[n_seq, head_dim] @
         //                              K_full[n_kv_total, head_dim]^T
         //
-        // Backend hook path: when layer.kq_dispatch is set, route to
-        // it (e.g. QNN HTP via sp_llama_qnn_matmul_dispatch). Falls
-        // through to CPU sp_matmul_f32 on hook failure so correctness
-        // floor holds even if HTP errors mid-session.
+        // Dispatch order (first hit wins):
+        //   1. HVX fused decompress+matmul on cDSP — reads compressed
+        //      K bytes directly out of the hexagon cache, runs the
+        //      fused decompress+matmul kernel from Phase 1.6 (1.79×
+        //      prefill speedup measured on S22U). Skipped during
+        //      calibration pass since hex_cache hasn't been written
+        //      with the calibrated bytes yet.
+        //   2. layer.kq_dispatch — generic backend hook (QNN HTP via
+        //      sp_llama_qnn_matmul_dispatch).
+        //   3. CPU sp_matmul_f32 — correctness floor.
         int kq_rc = -1;
-        if (layer.kq_dispatch) {
+#ifdef SP_HEXAGON_FASTRPC
+        if (kv.hex_cache && !kv.calibrate_pass) {
+            sp_hexagon_cache_t* hex = (sp_hexagon_cache_t*)kv.hex_cache;
+            // Kernel writes kq_scores[kv * n_q + q] — [n_kv, n_q]
+            // layout. We need scores[s * n_kv_total + p] = [n_seq,
+            // n_kv_total]. Allocate a temp, run the kernel, transpose
+            // (no-op flat copy when n_seq == 1, which is the decode
+            // hot path).
+            std::vector<float> hex_out((size_t)n_kv_total * n_seq);
+            kq_rc = sp_hexagon_cache_kq_matmul_fused(
+                hex, kv.layer_idx, hk,
+                /*start_pos=*/0, /*n_kv=*/n_kv_total,
+                Q_h.data(), n_seq,
+                hex_out.data());
+            if (kq_rc == 0) {
+                if (n_seq == 1) {
+                    std::memcpy(scores.data(), hex_out.data(),
+                                (size_t)n_kv_total * sizeof(float));
+                } else {
+                    for (int s = 0; s < n_seq; ++s) {
+                        for (int p = 0; p < n_kv_total; ++p) {
+                            scores[(size_t)s * n_kv_total + p] =
+                                hex_out[(size_t)p * n_seq + s];
+                        }
+                    }
+                }
+            }
+        }
+#endif
+        if (kq_rc != 0 && layer.kq_dispatch) {
             kq_rc = layer.kq_dispatch(layer.kq_dispatch_userdata,
                                        Q_h.data(), K_full.data(),
                                        n_seq, head_dim, n_kv_total,

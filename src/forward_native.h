@@ -134,6 +134,17 @@ struct ForwardNativeKv {
     // pass, calls calibrate_end() between passes, then runs the real
     // prefill with calibrate_pass=false.
     bool     calibrate_pass = false;
+
+    // Optional Hexagon cache pointer + matching ctx. When non-null AND
+    // SP_HEXAGON_FASTRPC build, K vectors are mirrored into the
+    // sp_hexagon_cache_t (compressed bytes resident on rpcmem-backed
+    // pages) and the per-head KQ matmul routes through
+    // sp_hexagon_cache_kq_matmul_fused — the HVX fused
+    // decompress+matmul kernel from Phase 1.6 (1.79× prefill speedup
+    // measured on S22U). Falls back to host CPU matmul on rc != 0.
+    // Type kept as void* so this header doesn't pull in the C-only
+    // hexagon header into every TU; cast at use site.
+    void*    hex_cache  = nullptr;
 };
 
 // ─────────────────────────────────────────────────────────────────
