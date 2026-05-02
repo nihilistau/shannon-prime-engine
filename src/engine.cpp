@@ -17,6 +17,7 @@
 #include "ggml.h"
 #include "ggml-backend.h"
 
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -363,10 +364,19 @@ int Engine::generate(const std::string& prompt, int n_predict,
 
     std::vector<float> last_logits;
     int n_vocab_out = 0;
+    const auto t_prefill_start = std::chrono::steady_clock::now();
     if (!impl_->fc->prefill(ids, last_logits, n_vocab_out)) {
         std::fprintf(stderr, "[sp-engine] Engine::generate: prefill failed\n");
         return -1;
     }
+    const auto t_prefill_end = std::chrono::steady_clock::now();
+    const double t_prefill_ms = std::chrono::duration<double, std::milli>(
+        t_prefill_end - t_prefill_start).count();
+    const double prefill_tps = (t_prefill_ms > 0)
+        ? (double)ids.size() * 1000.0 / t_prefill_ms : 0.0;
+    std::fprintf(stderr,
+        "[sp-engine:perf] prefill = %d tokens in %.1f ms (%.2f t/s)\n",
+        (int)ids.size(), t_prefill_ms, prefill_tps);
 
     // System 1↔2: if hier System 2 cache needs calibration, calibrate
     // it now using the same prefill data. The System 1 cache was already
@@ -383,6 +393,8 @@ int Engine::generate(const std::string& prompt, int n_predict,
 
     int sys2_routed = 0;
     int32_t tok_id = argmax(last_logits.data(), n_vocab_out);
+    const auto t_decode_start = std::chrono::steady_clock::now();
+    int decoded_count = 0;
     for (int i = 0; i < n_predict; ++i) {
         generated.push_back(tok_id);
         if (eos >= 0 && tok_id == eos) break;
@@ -427,7 +439,16 @@ int Engine::generate(const std::string& prompt, int n_predict,
         last_logits = std::move(step_logits);
         n_vocab_out = step_nv;
         tok_id = argmax(last_logits.data(), step_nv);
+        ++decoded_count;
     }
+    const auto t_decode_end = std::chrono::steady_clock::now();
+    const double t_decode_ms = std::chrono::duration<double, std::milli>(
+        t_decode_end - t_decode_start).count();
+    const double decode_tps = (t_decode_ms > 0 && decoded_count > 0)
+        ? (double)decoded_count * 1000.0 / t_decode_ms : 0.0;
+    std::fprintf(stderr,
+        "[sp-engine:perf] decode  = %d tokens in %.1f ms (%.2f t/s)\n",
+        decoded_count, t_decode_ms, decode_tps);
 
     if (dual && sys2_routed > 0) {
         std::fprintf(stderr,

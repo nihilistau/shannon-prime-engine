@@ -10,6 +10,7 @@
 
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
+#include "ggml-cpu.h"
 #include "ggml.h"
 
 #ifdef SP_ENGINE_WITH_CUDA
@@ -423,6 +424,28 @@ std::unique_ptr<ForwardContext> ForwardContext::create(const Model& model,
         if (!fc->impl_->backend) {
             std::fprintf(stderr, "[sp-engine] ForwardContext: failed to init CPU backend\n");
             return nullptr;
+        }
+    }
+
+    // Configure CPU backend thread count. Default to 4 (sweet spot on
+    // most multi-core ARM/x86 — beyond that, ggml's per-op scheduling
+    // overhead dominates for small models). Override via env
+    // SP_ENGINE_THREADS=N. Only meaningful when our backend IS the CPU
+    // backend (external GPU backend ignores this); also no-op if the
+    // backend isn't actually a CPU one (the cpu_set_n_threads symbol
+    // is safe to call on any backend — it tests internally).
+    {
+        int n_threads = 4;
+        if (const char* s = std::getenv("SP_ENGINE_THREADS")) {
+            int v = std::atoi(s);
+            if (v > 0 && v <= 64) n_threads = v;
+        }
+        // Detect whether our primary backend is the CPU backend by
+        // checking its device type. Only call cpu_set_n_threads on it.
+        ggml_backend_dev_t dev = ggml_backend_get_device(fc->impl_->backend);
+        if (dev && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+            ggml_backend_cpu_set_n_threads(fc->impl_->backend, n_threads);
+            std::fprintf(stderr, "[sp-engine] CPU backend: %d threads\n", n_threads);
         }
     }
 
