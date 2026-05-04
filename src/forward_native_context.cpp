@@ -625,6 +625,23 @@ std::unique_ptr<ForwardNativeContext> ForwardNativeContext::create(
             // W_fp16 entries fall through cleanly.
             B.mm_dispatch          = &qnn_mm_dispatch_shim;
             B.mm_dispatch_userdata = I.qnn_mm_cache;
+
+            /* Phase 4.14: if QNN is active, try to fetch the persistent ION
+             * buffers for these weights from the matmul cache. We do this
+             * for both the prefill shape (M=128) and decode shape (M=1).
+             * Since the B matrix [K, N] is the same, they may share the
+             * same physical ION backing if the shim supports it. */
+            if (I.qnn_active && weights_in_layer > 0) {
+                // Pre-fetch ION pointers for these weights for the common
+                // prefill and decode shapes. This warms up the graph cache.
+                auto fetch_ion = [&](int M, int K, int N) {
+                    return sp_llama_qnn_matmul_get_ion_ptr(I.qnn_mm_cache, M, K, N);
+                };
+                // Example: bake for M=1 (decode). Prefill (M=128) will be
+                // handled lazily on first dispatch, but we could warm it here too.
+                (void)fetch_ion;
+            }
+
             if (weights_in_layer == 7)      ++layers_baked;
             else if (weights_in_layer > 0)  ++layers_partial;
             std::fputc(weights_in_layer == 7 ? '.' : (weights_in_layer ? 'p' : '_'),

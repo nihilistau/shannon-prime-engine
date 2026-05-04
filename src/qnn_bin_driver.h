@@ -69,4 +69,43 @@ int qnn_bin_generate_one(const std::vector<std::string>& split_paths,
                           float rope_base,
                           int*  out_next_token_id);
 
+// ─────────────────────────────────────────────────────────────────
+// QnnBinSession — persistent HTP context management
+// ─────────────────────────────────────────────────────────────────
+
+class SpOracle;  // forward-declared; defined in speculative_oracle.h
+
+class QnnBinSession {
+public:
+    QnnBinSession();
+    ~QnnBinSession();
+
+    // Load the 4 splits and keep them resident in HTP memory.
+    int load(const std::vector<std::string>& split_paths,
+             int ar = 128, int cl = 2048, int hd = 2560,
+             float rope_base = 1000000.0f);
+
+    // Attach a speculative oracle for Phase 8 draft-token prediction.
+    // The oracle must outlive all subsequent generate() calls.
+    // Pass nullptr to disable oracle (default — no speculative decode).
+    // Oracle must already have been prefilled with the session prompt
+    // before generate() is called (QnnBinSession calls prefill internally
+    // when an oracle is attached and generate() is invoked).
+    void set_oracle(SpOracle* oracle);
+
+    // Run a full generation loop.
+    // If an oracle is attached (set_oracle), uses speculative decoding:
+    //   - Oracle drafts SP_ORACLE_DRAFT_N tokens per step
+    //   - HTP verifies the draft in a single batched forward pass
+    //   - Accepted tokens advance both the HTP KV and the oracle
+    // Accuracy stats are printed to stderr after generation completes.
+    int generate(const std::vector<int32_t>& prompt_ids,
+                 int n_predict,
+                 std::vector<int32_t>& out_ids);
+
+private:
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
+};
+
 }  // namespace sp::engine

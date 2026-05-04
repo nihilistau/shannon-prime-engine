@@ -1,70 +1,56 @@
 // qnn_bin_driver — see qnn_bin_driver.h.
 //
-// Phase 5.0 / 5.1 — bench + schema dump for AI Hub-compiled V69 QNN
-// context binaries. Mirrors the load+exec+destroy pattern from
-// test_sp_qnn_prefill_batch.c (Phase 2.4, 65.8 t/s on Qwen3-4B
-// w4a16 ar128 cl2048) but called from inside sp-engine so the
-// pipeline can be wired into Engine::generate next.
-
+// Context model: all 4 split contexts are loaded once in load() and kept
+// alive for the session lifetime (persistent context mode, Phase 7).
+// KV cache state lives in host-side in_bufs / out_bufs and survives
+// context cycles. If a persistent load fails (HTP OOM), run_step()
+// falls back per-split to graph-switching (create/destroy around execute).
+//
+// Tensor naming (from schema dump):
+//   KV inputs:  past_key_N_in,  past_value_N_in
+//   KV outputs: past_key_N_out, past_value_N_out
+//   Residual:   [1, ar, hd] tensor — found by shape match
+//   Mask input: "attention_mask"
+//   Cos/sin:    "position_ids_cos" / "position_ids_sin"
+//   Logits:     "logits" (split 4 only)
 #include "qnn_bin_driver.h"
+#include "speculative_oracle.h"
+#include "sp_quant.h"
+#include "sp_qnn.h"
+#include "qnn_bin_quant_table.h"
 
-#include "sp_quant.h"         // sp_fp32_to_fp16 / sp_fp16_to_fp32
-#include "sp_qnn.h"           // load_binary, get_io_info, execute, init/shutdown
+#ifdef SP_ENGINE_HEXAGON_FASTRPC
+// Phase 6: HVX logit argmax — eliminates the ARM scan after Split 4.
+extern "C" {
+#include "../lib/shannon-prime/backends/hexagon/shannon_prime_hexagon.h"
+#include "rpcmem.h"  // logit output buffer is rpcmem-backed for zero-copy DSP access
+}
+// rpcmem constants (matching shannon_prime_hexagon.c)
+#ifndef SP_RPCMEM_HEAP_ID_SYSTEM
+#define SP_RPCMEM_HEAP_ID_SYSTEM 25
+#define SP_RPCMEM_DEFAULT_FLAGS  1
+#endif
+#endif
 
 #include <chrono>
-#include <cinttypes>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <vector>
+#include <string>
+#include <memory>
+#include <malloc.h>
 
 namespace sp::engine {
 
 namespace {
 
-uint64_t now_us() {
-    using namespace std::chrono;
-    return (uint64_t)duration_cast<microseconds>(
-               steady_clock::now().time_since_epoch()).count();
+void* alloc_aligned(size_t sz) {
+    void* ptr = memalign(4096, sz);
+    if (ptr) std::memset(ptr, 0, sz);
+    return ptr;
 }
-
-// fp16 buffer stats — min/max/abs-mean/finite-count. Used to bisect
-// where saturation begins along the split chain.
-struct ResStats {
-    float vmin, vmax, abs_mean;
-    size_t n_total, n_inf, n_nan;
-};
-inline ResStats fp16_stats(const uint8_t* bytes, size_t bytes_len) {
-    const size_t n = bytes_len / 2;
-    const uint16_t* p = (const uint16_t*)bytes;
-    ResStats r{1e30f, -1e30f, 0.0f, n, 0, 0};
-    double accum = 0.0;
-    size_t finite = 0;
-    for (size_t i = 0; i < n; ++i) {
-        const float f = sp_fp16_to_fp32(p[i]);
-        if (std::isnan(f)) { r.n_nan++; continue; }
-        if (std::isinf(f)) { r.n_inf++; continue; }
-        if (f < r.vmin) r.vmin = f;
-        if (f > r.vmax) r.vmax = f;
-        accum += std::fabs((double)f);
-        finite++;
-    }
-    r.abs_mean = finite ? (float)(accum / (double)finite) : 0.0f;
-    if (finite == 0) { r.vmin = 0.0f; r.vmax = 0.0f; }
-    return r;
-}
-
-// Per-split state: handle, n_in/n_out, owned input/output buffers,
-// and the residual-stream tensor index (matched by rank=3 + the
-// canonical [1, ar, hidden] shape Qwen3-4B exports use).
-struct Split {
-    sp_qnn_handle*    h = nullptr;
-    size_t            n_in = 0, n_out = 0;
-    std::vector<void*> in_bufs, out_bufs;
-    std::vector<size_t> in_sz, out_sz;
-    int               residual_in_idx  = -1;
-    int               residual_out_idx = -1;
-};
 
 size_t tensor_bytes(const sp_qnn_tensor_info& t) {
     size_t n = t.bytes_per_element ? t.bytes_per_element : 1;
@@ -72,659 +58,698 @@ size_t tensor_bytes(const sp_qnn_tensor_info& t) {
     return n;
 }
 
-// Find the rank-3 [1, AR, hidden] residual stream tensor. AR is the
-// activation rank (128 for the prefill .bins), hidden is the model
-// dim (2560 for Qwen3-4B). Returns -1 if no match.
-int find_residual_idx(const sp_qnn_tensor_info* infos, size_t n) {
+// Find the inter-split residual tensor by elimination.
+// The residual is the one tensor that is NOT any of the well-known
+// named tensors (attention_mask, position_ids_cos/sin, input_ids,
+// logits, past_key_*, past_value_*). Returns -1 if not found or
+// if there is more than one candidate (ambiguous).
+int find_residual_auto(const sp_qnn_tensor_info* infos, size_t n) {
+    int found = -1;
     for (size_t i = 0; i < n; ++i) {
-        if (infos[i].rank == 3
-            && infos[i].dims[0] == 1
-            && infos[i].dims[1] == 128
-            && infos[i].dims[2] == 2560) {
-            return (int)i;
-        }
+        const char* nm = infos[i].name;
+        if (!nm) continue;
+        if (std::strcmp(nm, "attention_mask")    == 0) continue;
+        if (std::strcmp(nm, "position_ids_cos")  == 0) continue;
+        if (std::strcmp(nm, "position_ids_sin")  == 0) continue;
+        if (std::strcmp(nm, "input_ids")         == 0) continue;
+        if (std::strcmp(nm, "logits")            == 0) continue;
+        if (std::strstr(nm, "past_key")          != nullptr) continue;
+        if (std::strstr(nm, "past_value")        != nullptr) continue;
+        if (found >= 0) return -1;  // multiple candidates — don't guess
+        found = (int)i;
     }
+    return found;
+}
+
+int find_io_idx(const sp_qnn_tensor_info* infos, size_t n, const char* name) {
+    for (size_t i = 0; i < n; ++i)
+        if (infos[i].name && std::strcmp(infos[i].name, name) == 0)
+            return (int)i;
     return -1;
 }
 
-// Print the schema for one split's tensors. Pure diagnostic.
-void print_io(const char* label,
-              const sp_qnn_tensor_info* infos, size_t n,
-              int residual_idx) {
-    for (size_t i = 0; i < n; ++i) {
-        std::fprintf(stderr,
-            "    %s[%zu]: name=%-32s dtype=%u bpe=%zu rank=%u dims=[",
-            label, i,
-            infos[i].name ? infos[i].name : "(null)",
-            (unsigned)infos[i].dtype,
-            infos[i].bytes_per_element,
-            (unsigned)infos[i].rank);
-        for (uint32_t d = 0; d < infos[i].rank; ++d) {
-            std::fprintf(stderr, "%u%s",
-                infos[i].dims[d],
-                d + 1 == infos[i].rank ? "" : ", ");
+// Build RoPE cos/sin tables for ar positions with n_freq frequency pairs.
+// pos_offset: absolute sequence position of chunk slot 0 (0 for prefill, n_take for decode).
+// n_freq is derived from the actual tensor size at load time.
+void build_position_ids(int ar, int n_freq, float base, int pos_offset,
+                        std::vector<uint16_t>& cos_out,
+                        std::vector<uint16_t>& sin_out) {
+    cos_out.assign((size_t)ar * n_freq, 0);
+    sin_out.assign((size_t)ar * n_freq, 0);
+    for (int p = 0; p < ar; ++p) {
+        int abs_pos = pos_offset + p;
+        for (int i = 0; i < n_freq; ++i) {
+            // theta_i = abs_pos / base^(2i / (2*n_freq))
+            double theta = (double)abs_pos /
+                std::pow((double)base, (double)(2 * i) / (double)(2 * n_freq));
+            cos_out[(size_t)p * n_freq + i] =
+                sp_ufixed16_encode((float)std::cos(theta), QNN_QUANT_COS_SIN);
+            sin_out[(size_t)p * n_freq + i] =
+                sp_ufixed16_encode((float)std::sin(theta), QNN_QUANT_COS_SIN);
         }
-        std::fprintf(stderr, "] bytes=%zu",
-            tensor_bytes(infos[i]));
-        if (infos[i].quant_encoding != 0) {
-            std::fprintf(stderr, " quant{enc=%u scale=%.6g offset=%d}",
-                (unsigned)infos[i].quant_encoding,
-                (double)infos[i].quant_scale,
-                (int)infos[i].quant_offset);
+    }
+}
+
+// Build additive causal attention mask [ar, cl].
+// Only attend to past positions 0..n_past-1 (filled KV slots) and
+// the causal current window at positions cl-ar..cl-ar+q for row q.
+void build_causal_mask(int ar, int cl, int n_past, int n_real,
+                       std::vector<uint16_t>& mask_out) {
+    uint16_t att = sp_ufixed16_encode(0.0f,      QNN_QUANT_MASK);
+    uint16_t blk = sp_ufixed16_encode(-65504.0f, QNN_QUANT_MASK);
+    mask_out.assign((size_t)ar * cl, blk);
+    int window_start = cl - ar;   // first position of the current ar-window in KV
+    for (int q = 0; q < ar && q < n_real; ++q) {
+        // Attend to actually-filled past KV slots (positions 0..n_past-1).
+        for (int k = 0; k < n_past && k < window_start; ++k)
+            mask_out[(size_t)q * cl + k] = att;
+        // Attend to causal window: current + earlier queries in this chunk.
+        for (int k = window_start; k <= window_start + q; ++k)
+            mask_out[(size_t)q * cl + k] = att;
+    }
+}
+
+// Split metadata — persistent host-side state.
+// in_bufs / out_bufs survive HTP context create/destroy cycles.
+// KV state is maintained in in_bufs between decode steps.
+struct Split {
+    std::string path;
+
+    size_t n_in = 0, n_out = 0;
+    std::vector<void*>  in_bufs,  out_bufs;
+    std::vector<size_t> in_sz,    out_sz;
+
+    // Pre-computed tensor indices (from load-time schema parse).
+    int id_idx           = -1;   // "input_ids"  (split 0 only)
+    int m_idx            = -1;   // "attention_mask"
+    int pc_idx           = -1;   // "position_ids_cos"
+    int ps_idx           = -1;   // "position_ids_sin"
+    int residual_in_idx  = -1;   // [1, ar, hd] input
+    int residual_out_idx = -1;   // [1, ar, hd] output
+    int logits_idx       = -1;   // "logits" (split 3 only)
+
+    // Derived from tensor size at load time: n_freq for cos/sin.
+    int n_freq = 64;
+
+    // KV: indices of past_key_N_in / past_value_N_in inputs.
+    std::vector<int> kv_in_idxs;
+    // KV recycling: (out_idx past_key_N_out, in_idx past_key_N_in) pairs.
+    std::vector<std::pair<int,int>> kv_recycle;
+
+    bool kv_initialized = false;
+#ifdef SP_ENGINE_HEXAGON_FASTRPC
+    bool logit_rpcmem = false;  // true if out_bufs[logits_idx] is rpcmem_alloc'd
+#endif
+
+    // Persistent QNN context handle (Phase 7). Kept alive across forward passes to
+    // eliminate per-step load_binary/destroy overhead. Null if context unavailable
+    // (e.g. HTP OOM during load) — run_step falls back to graph-switching in that case.
+    sp_qnn_handle* h = nullptr;
+
+    ~Split() {
+        if (h) sp_qnn_destroy(&h);
+        for (void* p : in_bufs) if (p) std::free(p);
+        for (size_t k = 0; k < out_bufs.size(); ++k) {
+            if (!out_bufs[k]) continue;
+#ifdef SP_ENGINE_HEXAGON_FASTRPC
+            if (logit_rpcmem && (int)k == logits_idx)
+                rpcmem_free(out_bufs[k]);
+            else
+#endif
+            std::free(out_bufs[k]);
         }
-        std::fprintf(stderr, "%s\n",
-            (int)i == residual_idx ? "  ← residual" : "");
     }
+};
+
+} // namespace
+
+struct QnnBinSession::Impl {
+    std::vector<Split> splits;
+    int ar=128, cl=2048, hd=2560;
+    float rope=1000000.0f;
+    bool init=false;
+    bool persistent_ok=false;  // true if all split handles are resident (Phase 7)
+
+    // Phase 8: speculative oracle (borrowed pointer, caller owns lifetime).
+    // null → pure HTP decode (original behaviour).
+    SpOracle* oracle = nullptr;
+
+    ~Impl() {
+        if (init) sp_qnn_shutdown();
+    }
+};
+
+QnnBinSession::QnnBinSession() : impl_(std::make_unique<Impl>()) {}
+QnnBinSession::~QnnBinSession() = default;
+
+void QnnBinSession::set_oracle(SpOracle* oracle) {
+    impl_->oracle = oracle;
 }
 
-bool load_split(const std::string& path, Split& s) {
-    std::memset(&s, 0, sizeof(s));   // zero POD members; vectors stay valid
-    s.in_bufs.clear(); s.out_bufs.clear();
-    s.in_sz.clear();   s.out_sz.clear();
-    s.h = nullptr;
-    s.residual_in_idx = s.residual_out_idx = -1;
+int QnnBinSession::load(const std::vector<std::string>& paths,
+                        int ar, int cl, int hd, float rope) {
+    auto& I = *impl_;
+    I.ar = ar; I.cl = cl; I.hd = hd; I.rope = rope;
 
-    if (sp_qnn_load_binary(path.c_str(), nullptr, &s.h) != SP_QNN_OK) {
-        std::fprintf(stderr, "[qnn_bin] load_binary failed: %s\n", path.c_str());
-        return false;
-    }
-    const sp_qnn_tensor_info* in_info  = nullptr;
-    const sp_qnn_tensor_info* out_info = nullptr;
-    sp_qnn_get_io_info(s.h, &s.n_in, &in_info, &s.n_out, &out_info);
+    if (sp_qnn_init(nullptr, nullptr) != SP_QNN_OK) return -1;
+    I.init = true;
 
-    s.in_bufs.assign(s.n_in, nullptr);
-    s.in_sz.assign(s.n_in, 0);
-    s.out_bufs.assign(s.n_out, nullptr);
-    s.out_sz.assign(s.n_out, 0);
-    for (size_t i = 0; i < s.n_in; ++i) {
-        s.in_sz[i]   = tensor_bytes(in_info[i]);
-        s.in_bufs[i] = std::calloc(1, s.in_sz[i]);
-    }
-    for (size_t i = 0; i < s.n_out; ++i) {
-        s.out_sz[i]   = tensor_bytes(out_info[i]);
-        s.out_bufs[i] = std::calloc(1, s.out_sz[i]);
-    }
-    s.residual_in_idx  = find_residual_idx(in_info,  s.n_in);
-    s.residual_out_idx = find_residual_idx(out_info, s.n_out);
-    return true;
-}
+    I.splits.resize(paths.size());
 
-void free_split(Split& s) {
-    for (void* p : s.in_bufs)  std::free(p);
-    for (void* p : s.out_bufs) std::free(p);
-    s.in_bufs.clear(); s.out_bufs.clear();
-    s.in_sz.clear();   s.out_sz.clear();
-    if (s.h) sp_qnn_destroy(&s.h);
-    s.h = nullptr;
-}
+    for (size_t i = 0; i < paths.size(); ++i) {
+        Split& s = I.splits[i];
+        s.path = paths[i];
 
-bool exec_split(Split& s, uint64_t* exec_us) {
-    return sp_qnn_execute(s.h,
-        (const void* const*)s.in_bufs.data(), s.in_sz.data(),
-        (void* const*)s.out_bufs.data(),      s.out_sz.data(),
-        exec_us) == SP_QNN_OK;
-}
-
-}  // namespace
-
-// ─────────────────────────────────────────────────────────────────
-// Schema dump — Phase 5.1.
-// ─────────────────────────────────────────────────────────────────
-int qnn_bin_schema_dump(const std::vector<std::string>& split_paths) {
-    if (sp_qnn_init(nullptr, nullptr) != SP_QNN_OK) {
-        std::fprintf(stderr, "[qnn_bin] sp_qnn_init failed\n");
-        return -1;
-    }
-    for (size_t i = 0; i < split_paths.size(); ++i) {
-        std::fprintf(stderr, "\n=== split %zu: %s ===\n",
-                     i + 1, split_paths[i].c_str());
-        Split s;
-        if (!load_split(split_paths[i], s)) {
-            sp_qnn_shutdown();
-            return -2;
+        // Phase 1: schema parse via schema-only handle — QnnSystem CPU-side only,
+        // NO HTP context created. This avoids burning HTP deferred-cleanup quota
+        // before the real prefill + decode starts. With 4 splits × full load+destroy
+        // just for schema extraction, the HTP cleanup queue saturates and the first
+        // decode graphExecute stalls for minutes. sp_qnn_parse_schema eliminates all
+        // pre-decode HTP context churn from schema extraction.
+        sp_qnn_handle* tmp = nullptr;
+        if (sp_qnn_parse_schema(s.path.c_str(), &tmp) != SP_QNN_OK) {
+            fprintf(stderr, "[qnn_bin] split %zu: schema parse failed for %s\n",
+                    i, s.path.c_str());
+            return -1;
         }
-        const sp_qnn_tensor_info* in_info  = nullptr;
-        const sp_qnn_tensor_info* out_info = nullptr;
-        sp_qnn_get_io_info(s.h, &s.n_in, &in_info, &s.n_out, &out_info);
 
-        std::fprintf(stderr, "  inputs (%zu):\n", s.n_in);
-        print_io("in ", in_info, s.n_in, s.residual_in_idx);
-        std::fprintf(stderr, "  outputs (%zu):\n", s.n_out);
-        print_io("out", out_info, s.n_out, s.residual_out_idx);
+        const sp_qnn_tensor_info *in_info = nullptr, *out_info = nullptr;
+        sp_qnn_get_io_info(tmp, &s.n_in, &in_info, &s.n_out, &out_info);
 
-        free_split(s);
+        // Compute buffer sizes while info pointers are valid.
+        s.in_sz.resize(s.n_in);
+        s.out_sz.resize(s.n_out);
+        for (size_t k = 0; k < s.n_in;  ++k) s.in_sz[k]  = tensor_bytes(in_info[k]);
+        for (size_t k = 0; k < s.n_out; ++k) s.out_sz[k] = tensor_bytes(out_info[k]);
+
+        // Pre-compute all indices.
+        s.id_idx           = find_io_idx(in_info,  s.n_in,  "input_ids");
+        s.m_idx            = find_io_idx(in_info,  s.n_in,  "attention_mask");
+        s.pc_idx           = find_io_idx(in_info,  s.n_in,  "position_ids_cos");
+        s.ps_idx           = find_io_idx(in_info,  s.n_in,  "position_ids_sin");
+        s.residual_in_idx  = find_residual_auto(in_info,  s.n_in);
+        s.residual_out_idx = find_residual_auto(out_info, s.n_out);
+        s.logits_idx       = find_io_idx(out_info, s.n_out, "logits");
+
+        // Derive n_freq from the actual cos/sin tensor size.
+        // n_freq = total_elements / ar = (bytes/2) / ar
+        if (s.pc_idx >= 0) {
+            size_t n_elem = s.in_sz[s.pc_idx] / 2;  // uint16 count
+            s.n_freq = (ar > 0) ? (int)(n_elem / (size_t)ar) : 64;
+            fprintf(stderr, "[qnn_bin] split %zu: cos/sin n_freq=%d (from tensor size %zu B)\n",
+                    i, s.n_freq, s.in_sz[s.pc_idx]);
+        }
+
+        // KV input indices: any input with "past_key" or "past_value" in name.
+        for (size_t k = 0; k < s.n_in; ++k) {
+            if (in_info[k].name &&
+                (std::strstr(in_info[k].name, "past_key") ||
+                 std::strstr(in_info[k].name, "past_value"))) {
+                s.kv_in_idxs.push_back((int)k);
+            }
+        }
+
+        // KV recycle pairs: output "past_key_N_out" → input "past_key_N_in".
+        // Replace suffix "_out" with "_in" to find the matching input slot.
+        for (size_t l = 0; l < s.n_out; ++l) {
+            if (!out_info[l].name) continue;
+            std::string out_name = out_info[l].name;
+            if (out_name.size() < 4) continue;
+            if (out_name.compare(out_name.size() - 4, 4, "_out") != 0) continue;
+            std::string in_name = out_name.substr(0, out_name.size() - 4) + "_in";
+            int in_idx = find_io_idx(in_info, s.n_in, in_name.c_str());
+            if (in_idx >= 0)
+                s.kv_recycle.push_back({(int)l, in_idx});
+        }
+
+        fprintf(stderr, "[qnn_bin] split %zu: %zu in / %zu out  "
+                "kv_in=%zu recycle=%zu  res_in=%d res_out=%d logits=%d\n",
+                i, s.n_in, s.n_out,
+                s.kv_in_idxs.size(), s.kv_recycle.size(),
+                s.residual_in_idx, s.residual_out_idx, s.logits_idx);
+
+        // Allocate persistent host-side I/O buffers.
+        s.in_bufs.assign(s.n_in, nullptr);
+        s.out_bufs.assign(s.n_out, nullptr);
+        for (size_t k = 0; k < s.n_in;  ++k) s.in_bufs[k]  = alloc_aligned(s.in_sz[k]);
+        for (size_t k = 0; k < s.n_out; ++k) {
+#ifdef SP_ENGINE_HEXAGON_FASTRPC
+            // Logit output buffer is rpcmem-backed so the DSP reads it zero-copy
+            // via SMMU. All other output buffers use normal 4096-byte-aligned alloc.
+            if ((int)k == s.logits_idx && s.logits_idx >= 0) {
+                s.out_bufs[k] = rpcmem_alloc(SP_RPCMEM_HEAP_ID_SYSTEM,
+                                              SP_RPCMEM_DEFAULT_FLAGS, s.out_sz[k]);
+                s.logit_rpcmem = (s.out_bufs[k] != nullptr);
+                if (!s.out_bufs[k]) {
+                    fprintf(stderr, "[qnn_bin] rpcmem_alloc logit buf failed (%zu bytes);"
+                                    " falling back to memalign\n", s.out_sz[k]);
+                    s.out_bufs[k] = alloc_aligned(s.out_sz[k]);
+                }
+            } else
+#endif
+            s.out_bufs[k] = alloc_aligned(s.out_sz[k]);
+        }
+
+        // Schema parsed; release temporary handle.
+        sp_qnn_destroy(&tmp);
     }
-    sp_qnn_shutdown();
+
+    // Phase 2: persistent contexts (Phase 7 goal).
+    // Qwen3-4B on S22U split budget analysis:
+    //   S0 (embedding):        742 MB
+    //   S1 (layers  0-13):     616 MB
+    //   S2 (layers 14-27):     616 MB
+    //   S3 (layers 28-35+lm_head): 960 MB
+    //   Total: 2934 MB — HTP working-set budget ~1390 MB.
+    //
+    // No combination that includes S3 fits within budget:
+    //   S0+S3 = 1702 MB > 1390 MB
+    //   S1+S3 = 1576 MB > 1390 MB
+    //
+    // Even S0+S1 = 1358 MB (barely fits), but graph-switching S2/S3 alongside
+    // the persistent pair still OOMs: S0+S1+S2_load = 1358+616 = 1974 MB.
+    //
+    // Conclusion: all 4 splits must be graph-switched; the HTP budget cannot
+    // support any persistent contexts for Qwen3-4B.
+    //
+    // The decode hang (graphExecute stalls in fastrpc_wait_for_completion after
+    // page-cached binary load) is addressed by sp_qnn_drain_htp() between
+    // prefill and decode in generate() — see comment there.
+    I.persistent_ok = false;
+    fprintf(stderr, "[qnn_bin] context mode: graph-switching "
+                    "(HTP budget ~1390MB < min split pair 1358MB + any third split)\n");
     return 0;
 }
 
-// ─────────────────────────────────────────────────────────────────
-// Prefill bench — Phase 5.0. Mirrors test_sp_qnn_prefill_batch.c
-// with zero-initialized buffers; proves the .bin pipeline runs from
-// inside sp-engine and reports the same t/s past-Claude measured.
-// ─────────────────────────────────────────────────────────────────
-int qnn_bin_prefill_bench(const std::vector<std::string>& split_paths,
-                          int n_chunks) {
-    if (split_paths.size() != 4) {
-        std::fprintf(stderr,
-            "[qnn_bin] prefill bench expects exactly 4 splits, got %zu\n",
-            split_paths.size());
-        return -1;
-    }
-    if (n_chunks < 1) n_chunks = 3;
+int QnnBinSession::generate(const std::vector<int32_t>& prompt,
+                            int n_predict,
+                            std::vector<int32_t>& out) {
+    auto& I = *impl_;
+    if (!I.init) return -1;
 
-    if (sp_qnn_init(nullptr, nullptr) != SP_QNN_OK) {
-        std::fprintf(stderr, "[qnn_bin] sp_qnn_init failed\n");
-        return -2;
-    }
-
-    std::fprintf(stderr,
-        "=== Phase 5.0 — sp-engine internal QNN prefill bench ===\n"
-        "Pattern: load(1)→exec→load(2)→exec→destroy(1,2)\n"
-        "         load(3)→exec→load(4)→exec→destroy(3,4)\n"
-        "Per chunk: 128 tokens, 4 loads + 4 execs.\n\n");
-
-    std::vector<uint8_t> host_residual;
-    size_t host_residual_size = 0;
-    std::vector<uint64_t> chunk_total_us((size_t)n_chunks, 0);
-
-    auto carry_residual = [&](Split& src, const char* tag) {
-        if (src.residual_out_idx < 0) return;
-        const size_t sz = src.out_sz[src.residual_out_idx];
-        if (host_residual.size() < sz) host_residual.resize(sz);
-        std::memcpy(host_residual.data(),
-                    src.out_bufs[src.residual_out_idx], sz);
-        host_residual_size = sz;
-        const ResStats st = fp16_stats(host_residual.data(), sz);
-        std::fprintf(stderr,
-            "  [%s] residual: min=%.3g max=%.3g abs_mean=%.3g inf=%zu nan=%zu\n",
-            tag, st.vmin, st.vmax, st.abs_mean, st.n_inf, st.n_nan);
-    };
-    auto inject_residual = [&](Split& dst) {
-        if (dst.residual_in_idx < 0) return;
-        if (host_residual_size != dst.in_sz[dst.residual_in_idx]) return;
-        std::memcpy(dst.in_bufs[dst.residual_in_idx],
-                    host_residual.data(), host_residual_size);
-        // Optional override: fill residual with a uniform fp16 value
-        // chosen by SP_QNN_BIN_RES_OVERRIDE (parses as a float).
-        // Use this to test "does split 2 actually read the residual?".
-        if (const char* v = std::getenv("SP_QNN_BIN_RES_OVERRIDE")) {
-            const float f = std::strtof(v, nullptr);
-            const uint16_t fp16 = sp_fp32_to_fp16(f);
-            uint16_t* p = (uint16_t*)dst.in_bufs[dst.residual_in_idx];
-            const size_t n = host_residual_size / 2;
-            for (size_t i = 0; i < n; ++i) p[i] = fp16;
-            std::fprintf(stderr,
-                "  [override] residual filled with %g (%zu fp16)\n", f, n);
-        }
-    };
-
-    int rc = 0;
-    for (int c = 0; c < n_chunks; ++c) {
-        std::fprintf(stderr, "=== chunk %d (128 tokens) ===\n", c);
-        host_residual_size = 0;
-        const uint64_t chunk_start = now_us();
-        Split a, b;
-        uint64_t load_us[4] = {0}, exec_us[4] = {0};
-
-        // Phase A: split 1 + 2 resident together.
-        uint64_t t = now_us();
-        if (!load_split(split_paths[0], a)) { rc = -3; break; }
-        load_us[0] = now_us() - t;
-        if (!exec_split(a, &exec_us[0])) { rc = -4; break; }
-        carry_residual(a, "split1");
-
-        t = now_us();
-        if (!load_split(split_paths[1], b)) { rc = -3; break; }
-        load_us[1] = now_us() - t;
-        inject_residual(b);
-        if (!exec_split(b, &exec_us[1])) { rc = -4; break; }
-        carry_residual(b, "split2");
-
-        free_split(a);
-        free_split(b);
-
-        // Phase B: split 3 + 4 resident together.
-        t = now_us();
-        if (!load_split(split_paths[2], a)) { rc = -3; break; }
-        load_us[2] = now_us() - t;
-        inject_residual(a);
-        if (!exec_split(a, &exec_us[2])) { rc = -4; break; }
-        carry_residual(a, "split3");
-
-        t = now_us();
-        if (!load_split(split_paths[3], b)) { rc = -3; break; }
-        load_us[3] = now_us() - t;
-        inject_residual(b);
-        if (!exec_split(b, &exec_us[3])) { rc = -4; break; }
-
-        free_split(a);
-        free_split(b);
-
-        chunk_total_us[(size_t)c] = now_us() - chunk_start;
-
-        const uint64_t load_sum = load_us[0]+load_us[1]+load_us[2]+load_us[3];
-        const uint64_t exec_sum = exec_us[0]+exec_us[1]+exec_us[2]+exec_us[3];
-        std::fprintf(stderr,
-            "  loads: %.0f %.0f %.0f %.0f ms (sum %.0f)\n",
-            load_us[0]/1000.0, load_us[1]/1000.0,
-            load_us[2]/1000.0, load_us[3]/1000.0,
-            load_sum/1000.0);
-        std::fprintf(stderr,
-            "  execs: %.0f %.0f %.0f %.0f ms (sum %.0f)\n",
-            exec_us[0]/1000.0, exec_us[1]/1000.0,
-            exec_us[2]/1000.0, exec_us[3]/1000.0,
-            exec_sum/1000.0);
-        std::fprintf(stderr,
-            "  chunk wall: %.0f ms = %.1f tok/sec (128-token chunk)\n",
-            chunk_total_us[(size_t)c]/1000.0,
-            128.0 * 1e6 / (double)chunk_total_us[(size_t)c]);
-    }
-
-    if (rc == 0 && n_chunks >= 2) {
-        uint64_t sum = 0, mn = UINT64_MAX, mx = 0;
-        for (int c = 1; c < n_chunks; ++c) {
-            const uint64_t v = chunk_total_us[(size_t)c];
-            sum += v;
-            if (v < mn) mn = v;
-            if (v > mx) mx = v;
-        }
-        const uint64_t avg = sum / (uint64_t)(n_chunks - 1);
-        std::fprintf(stderr,
-            "\n=== steady-state (excl chunk 0) ===\n"
-            "  chunk[0]:    %.0f ms\n"
-            "  steady min:  %.0f ms = %.1f tok/sec\n"
-            "  steady avg:  %.0f ms = %.1f tok/sec\n"
-            "  steady max:  %.0f ms = %.1f tok/sec\n",
-            chunk_total_us[0]/1000.0,
-            mn/1000.0,  128.0 * 1e6 / (double)mn,
-            avg/1000.0, 128.0 * 1e6 / (double)avg,
-            mx/1000.0,  128.0 * 1e6 / (double)mx);
-    }
-
-    sp_qnn_shutdown();
-    return rc;
-}
-
-// ─────────────────────────────────────────────────────────────────
-// Phase 5.2 — real prompt → next token through the .bin chain.
-// ─────────────────────────────────────────────────────────────────
-
-namespace {
-
-// Find input/output index by exact name match. Returns -1 if not found.
-int find_io_idx(const sp_qnn_tensor_info* infos, size_t n,
-                const char* needle) {
-    for (size_t i = 0; i < n; ++i) {
-        if (infos[i].name && std::strcmp(infos[i].name, needle) == 0) {
-            return (int)i;
-        }
-    }
-    return -1;
-}
-
-// Find any input/output whose name contains the substring. Used for
-// past_key_*_in / past_value_*_in iteration where the layer index is
-// embedded in the name.
-int find_io_by_substr(const sp_qnn_tensor_info* infos, size_t n,
-                       const char* needle) {
-    for (size_t i = 0; i < n; ++i) {
-        if (infos[i].name && std::strstr(infos[i].name, needle)) {
-            return (int)i;
-        }
-    }
-    return -1;
-}
-
-// Build precomputed RoPE position_ids_cos/sin tables for the first
-// `n_positions` positions. fp16[1, 1, n_positions, n_freq_pairs].
-// theta_i(p) = p / rope_base^(2i / head_dim) for i in [0, n_freq_pairs).
-void build_position_ids(int n_positions, int n_freq_pairs,
-                          float rope_base,
-                          std::vector<uint16_t>& cos_out,
-                          std::vector<uint16_t>& sin_out) {
-    cos_out.assign((size_t)n_positions * n_freq_pairs, 0);
-    sin_out.assign((size_t)n_positions * n_freq_pairs, 0);
-    const double base = (double)rope_base;
-    const int    head_dim = n_freq_pairs * 2;
-    for (int p = 0; p < n_positions; ++p) {
-        for (int i = 0; i < n_freq_pairs; ++i) {
-            const double freq  = std::pow(base, (double)(2 * i) / (double)head_dim);
-            const double theta = (double)p / freq;
-            cos_out[(size_t)p * n_freq_pairs + i] =
-                sp_fp32_to_fp16((float)std::cos(theta));
-            sin_out[(size_t)p * n_freq_pairs + i] =
-                sp_fp32_to_fp16((float)std::sin(theta));
-        }
-    }
-}
-
-// Build causal attention mask fp16[1, 1, ar, cl] for HF-convention
-// hybrid prefill graphs. The 2048-wide K dimension is laid out as
-// [past_in_buffer (cl-ar slots) | current_chunk (ar slots)]. Past
-// has past_len ≤ cl-ar meaningful positions starting at offset
-// (cl - ar - past_len); the rest of the past buffer is junk and
-// must be masked. Current chunk lives at [cl-ar, cl) — for query q
-// (q ∈ [0, ar)), causal allow covers past meaningful positions plus
-// current [cl-ar, cl-ar+q].
-//
-// First chunk has past_len = 0 → only the current chunk's [cl-ar,
-// cl-ar+q] positions are unmasked. My earlier version allowed
-// [0, q] which pointed at PAST junk slots → fp16-saturated logits.
-void build_causal_mask(int ar, int cl, int n_real_tokens, int past_len,
-                        std::vector<uint16_t>& mask_out) {
-    // SP_QNN_BIN_MASK_FINITE=1 uses fp16 most-negative-finite (~-65504)
-    // instead of -inf. AIMET-quantized attention may handle finite better
-    // through the int16 activation path. Default ON since past-Claude's
-    // notes + Genie configs both use the finite convention.
-    static const bool use_finite = []() {
-        const char* v = std::getenv("SP_QNN_BIN_MASK_FINITE");
-        return !v || v[0] != '0';   // default ON
-    }();
-    const uint16_t neg_inf_fp16 = use_finite
-        ? (uint16_t)0xFBFF                  // -65504, most-neg finite fp16
-        : sp_fp32_to_fp16(-1.0e30f);        // saturates to -inf
-    const uint16_t zero_fp16    = sp_fp32_to_fp16(0.0f);
-    mask_out.assign((size_t)ar * cl, neg_inf_fp16);
-    const int past_max = cl - ar;            // past buffer width
-    const int past_off = past_max - past_len; // offset to first meaningful past
-    // SP_QNN_BIN_MASK_FULL_AR: when "1", mask covers ALL ar query
-    // rows causally (good when padded slots are repeats of real tokens).
-    // When "0" (the default), only allow attention for real query
-    // positions [0, n_real_tokens) — padded q slots stay all -inf.
-    // Genie/HF convention is to mask padded query rows; the .bin's
-    // post-attention norm then doesn't pool garbage from those rows.
-    static const bool full_ar = []() {
-        const char* v = std::getenv("SP_QNN_BIN_MASK_FULL_AR");
-        return v && v[0] == '1';
-    }();
-    const int last_q = full_ar
-        ? ar
-        : (n_real_tokens > ar ? ar : n_real_tokens);
-    for (int q = 0; q < last_q; ++q) {
-        for (int k = past_off; k < past_max && k < cl; ++k) {
-            mask_out[(size_t)q * cl + k] = zero_fp16;
-        }
-        for (int k = past_max; k <= past_max + q && k < cl; ++k) {
-            mask_out[(size_t)q * cl + k] = zero_fp16;
-        }
-    }
-}
-
-}  // namespace
-
-int qnn_bin_generate_one(const std::vector<std::string>& split_paths,
-                          const std::vector<int32_t>& prompt_tokens,
-                          int   ar,
-                          int   cl,
-                          int   head_dim,
-                          float rope_base,
-                          int*  out_next_token_id) {
-    if (split_paths.size() != 4) {
-        std::fprintf(stderr,
-            "[qnn_bin] generate_one expects 4 splits, got %zu\n",
-            split_paths.size());
-        return -1;
-    }
-    if (!out_next_token_id) return -1;
-    if (prompt_tokens.empty()) {
-        std::fprintf(stderr, "[qnn_bin] empty prompt\n");
-        return -1;
-    }
-
-    if (sp_qnn_init(nullptr, nullptr) != SP_QNN_OK) {
-        std::fprintf(stderr, "[qnn_bin] sp_qnn_init failed\n");
-        return -2;
-    }
-
-    // ── Build static inputs that don't change per chunk ──
-    const int n_freq_pairs = head_dim / 2;
-    std::vector<uint16_t> pos_cos, pos_sin;
-    build_position_ids(ar, n_freq_pairs, rope_base, pos_cos, pos_sin);
-    // Diagnostic override: SP_QNN_BIN_NOROPE=1 sets cos=1,sin=0 →
-    // RoPE becomes identity. Bisects "is divergence from RoPE
-    // encoding or from past_KV quant decode?".
-    if (const char* v = std::getenv("SP_QNN_BIN_NOROPE")) {
-        if (v[0] == '1') {
-            std::fprintf(stderr,
-                "[qnn_bin] SP_QNN_BIN_NOROPE=1 — cos=1, sin=0 (no rotation)\n");
-            const uint16_t one_fp16 = sp_fp32_to_fp16(1.0f);
-            std::fill(pos_cos.begin(), pos_cos.end(), one_fp16);
-            std::fill(pos_sin.begin(), pos_sin.end(), (uint16_t)0);
-        }
-    }
-
-    const int n_real = (int)prompt_tokens.size();
-    const int n_real_clamped = n_real > ar ? ar : n_real;
-    if (n_real > ar) {
-        std::fprintf(stderr,
-            "[qnn_bin] warning: prompt has %d tokens, truncating to AR=%d "
-            "(multi-chunk prefill is Phase 5.4)\n", n_real, ar);
-    }
-
-    std::vector<uint16_t> attn_mask;
-    // First chunk: no history.
-    build_causal_mask(ar, cl, n_real_clamped, /*past_len=*/0, attn_mask);
-
-    // SP_QNN_BIN_PAD_TOKEN env: pad token id for slots beyond
-    // n_real_clamped. Default 151643 (Qwen3 endoftext / pad_token).
-    // Genie configs use this convention. Set to "last" to fall back
-    // to repeating the last real token (the previous default).
-    int32_t pad_id = 151643;
-    if (const char* v = std::getenv("SP_QNN_BIN_PAD_TOKEN")) {
-        if (std::strcmp(v, "last") == 0 && n_real_clamped > 0) {
-            pad_id = prompt_tokens[(size_t)(n_real_clamped - 1)];
-        } else {
-            const long parsed = std::strtol(v, nullptr, 10);
-            if (parsed > 0) pad_id = (int32_t)parsed;
-        }
-    }
-    std::vector<int32_t> input_ids((size_t)ar, pad_id);
-    for (int i = 0; i < n_real_clamped; ++i) {
-        input_ids[(size_t)i] = prompt_tokens[(size_t)i];
-    }
-    // SP_QNN_BIN_INPUT_TOKEN: override every input_ids slot with this
-    // single token id. Useful to compare embedding lookup behavior
-    // across token IDs (e.g. SP_QNN_BIN_INPUT_TOKEN=0 vs 100 vs 1000).
-    if (const char* v = std::getenv("SP_QNN_BIN_INPUT_TOKEN")) {
-        const long parsed = std::strtol(v, nullptr, 10);
-        if (parsed >= 0) {
-            std::fill(input_ids.begin(), input_ids.end(), (int32_t)parsed);
-            std::fprintf(stderr,
-                "[qnn_bin] SP_QNN_BIN_INPUT_TOKEN=%ld — all 128 slots\n",
-                parsed);
-        }
-    }
-
-    // ── SPLIT 1: input_ids → embedding ──────────────────────────
-    Split s1;
-    if (!load_split(split_paths[0], s1)) { sp_qnn_shutdown(); return -3; }
-    const sp_qnn_tensor_info* s1_in_info  = nullptr;
-    const sp_qnn_tensor_info* s1_out_info = nullptr;
-    sp_qnn_get_io_info(s1.h, &s1.n_in, &s1_in_info, &s1.n_out, &s1_out_info);
-
-    const int s1_input_ids_idx = find_io_idx(s1_in_info, s1.n_in, "input_ids");
-    if (s1_input_ids_idx < 0) {
-        std::fprintf(stderr, "[qnn_bin] split 1 missing input_ids\n");
-        free_split(s1); sp_qnn_shutdown(); return -3;
-    }
-    std::memcpy(s1.in_bufs[(size_t)s1_input_ids_idx],
-                input_ids.data(), s1.in_sz[(size_t)s1_input_ids_idx]);
-
-    // Pre-fill output buffer with a marker pattern (0xCD bytes) so we
-    // can tell if exec() actually wrote to our host buffer or just
-    // wrote to a device-side buffer that didn't copy back.
-    if (s1.residual_out_idx >= 0) {
-        std::memset(s1.out_bufs[(size_t)s1.residual_out_idx], 0xCD,
-                    s1.out_sz[(size_t)s1.residual_out_idx]);
-    }
-
-    uint64_t exec_us = 0;
-    if (!exec_split(s1, &exec_us)) {
-        std::fprintf(stderr, "[qnn_bin] split 1 exec failed\n");
-        free_split(s1); sp_qnn_shutdown(); return -4;
-    }
-    std::fprintf(stderr, "[qnn_bin] split 1 exec: %.1f ms\n", exec_us / 1000.0);
-
-    // Count how many bytes still equal 0xCD (i.e., were NOT written
-    // by the .bin's exec).
-    if (s1.residual_out_idx >= 0) {
-        const uint8_t* p = (const uint8_t*)s1.out_bufs[(size_t)s1.residual_out_idx];
-        const size_t   n = s1.out_sz[(size_t)s1.residual_out_idx];
-        size_t unwritten = 0;
-        for (size_t i = 0; i < n; ++i) if (p[i] == 0xCD) ++unwritten;
-        std::fprintf(stderr,
-            "[qnn_bin] split 1 unwritten bytes (still 0xCD): %zu / %zu (%.2f%%)\n",
-            unwritten, n, 100.0 * (double)unwritten / (double)n);
-    }
-
-    // Carry the embedding (residual) buffer.
+    out.clear();
+    std::vector<int32_t> curr = prompt;
     std::vector<uint8_t> residual;
-    if (s1.residual_out_idx < 0) {
-        std::fprintf(stderr, "[qnn_bin] split 1 has no residual output\n");
-        free_split(s1); sp_qnn_shutdown(); return -3;
-    }
-    {
-        const size_t sz = s1.out_sz[(size_t)s1.residual_out_idx];
-        residual.assign(sz, 0);
-        std::memcpy(residual.data(),
-                    s1.out_bufs[(size_t)s1.residual_out_idx], sz);
-        const ResStats st = fp16_stats(residual.data(), residual.size());
-        std::fprintf(stderr,
-            "[qnn_bin] split 1 residual: min=%.3g max=%.3g abs_mean=%.3g "
-            "inf=%zu nan=%zu n=%zu\n",
-            st.vmin, st.vmax, st.abs_mean, st.n_inf, st.n_nan, st.n_total);
-    }
-    free_split(s1);
+    std::vector<uint16_t> cos, sin, mask;
+    uint16_t kv_zero = sp_ufixed16_zero(QNN_QUANT_PAST_KV);
 
-    // ── Helper: run one of the layer-block splits (2/3/4) ───────
-    // For each: bind attention_mask, residual_in, position_ids_cos/sin,
-    // and zero-init all past_key/past_value inputs (first chunk, no
-    // history). Carry residual_out into `residual`. For split 4,
-    // additionally read the logits output and pick the argmax at
-    // position n_real_clamped - 1.
-    auto run_layer_block = [&](const std::string& path, bool is_last,
-                                int* picked_token_id) -> int {
-        Split s;
-        if (!load_split(path, s)) return -3;
-        const sp_qnn_tensor_info* in_info  = nullptr;
-        const sp_qnn_tensor_info* out_info = nullptr;
-        sp_qnn_get_io_info(s.h, &s.n_in, &in_info, &s.n_out, &out_info);
+    // Use n_freq from split 1 (the first split with cos/sin).
+    // Split 0 is embedding-only (no cos/sin). Fall back to hd/2 if unavailable.
+    int n_freq = I.hd / 2;
+    for (auto& s : I.splits) if (s.pc_idx >= 0) { n_freq = s.n_freq; break; }
 
-        // Bind attention_mask.
-        const int mask_idx = find_io_idx(in_info, s.n_in, "attention_mask");
-        if (mask_idx < 0
-            || s.in_sz[(size_t)mask_idx] != attn_mask.size() * sizeof(uint16_t)) {
-            std::fprintf(stderr,
-                "[qnn_bin] %s: attention_mask shape mismatch\n", path.c_str());
-            free_split(s); return -3;
-        }
-        std::memcpy(s.in_bufs[(size_t)mask_idx],
-                    attn_mask.data(), s.in_sz[(size_t)mask_idx]);
+    int n_take = (int)std::min(prompt.size(), (size_t)I.ar);
+    int n_past = 0;  // filled KV slots at current step
 
-        // Bind position_ids_cos/sin.
-        const int pcos_idx = find_io_idx(in_info, s.n_in, "position_ids_cos");
-        const int psin_idx = find_io_idx(in_info, s.n_in, "position_ids_sin");
-        if (pcos_idx < 0 || psin_idx < 0) {
-            std::fprintf(stderr, "[qnn_bin] %s: position_ids missing\n",
-                         path.c_str());
-            free_split(s); return -3;
-        }
-        std::memcpy(s.in_bufs[(size_t)pcos_idx], pos_cos.data(),
-                    s.in_sz[(size_t)pcos_idx]);
-        std::memcpy(s.in_bufs[(size_t)psin_idx], pos_sin.data(),
-                    s.in_sz[(size_t)psin_idx]);
+    // Prefill: positions 0..ar-1 (chunk 0 starts at absolute position 0).
+    build_position_ids(I.ar, n_freq, I.rope, /*pos_offset=*/0, cos, sin);
+    build_causal_mask(I.ar, I.cl, n_past, n_take, mask);
 
-        // Bind residual_in via name search — covers both
-        // "..._Add_1_output_0" (block residual chain) and
-        // "..._Gather_output_0" (embedding from split 1).
-        if (s.residual_in_idx < 0) {
-            std::fprintf(stderr,
-                "[qnn_bin] %s: no residual input\n", path.c_str());
-            free_split(s); return -3;
-        }
-        const size_t res_in_bytes = s.in_sz[(size_t)s.residual_in_idx];
-        if (res_in_bytes != residual.size()) {
-            std::fprintf(stderr,
-                "[qnn_bin] %s: residual size mismatch %zu vs %zu\n",
-                path.c_str(), res_in_bytes, residual.size());
-            free_split(s); return -3;
-        }
-        std::memcpy(s.in_bufs[(size_t)s.residual_in_idx],
-                    residual.data(), res_in_bytes);
+    auto run_step = [&](const std::vector<int32_t>& ids,
+                        int seq_len, int* next_tok) -> int {
+        for (int j = 0; j < (int)I.splits.size(); ++j) {
+            Split& s = I.splits[j];
 
-        // past_key/past_value inputs stay at calloc-zero (first chunk,
-        // no history). Inputs are tagged "past_key_*_in" / "past_value_*_in".
-        // Nothing to do.
+            // ── Set input buffers (already in host memory) ──────────
+            if (s.m_idx  >= 0) std::memcpy(s.in_bufs[s.m_idx],
+                                            mask.data(), s.in_sz[s.m_idx]);
+            if (s.pc_idx >= 0) std::memcpy(s.in_bufs[s.pc_idx],
+                                            cos.data(),  s.in_sz[s.pc_idx]);
+            if (s.ps_idx >= 0) std::memcpy(s.in_bufs[s.ps_idx],
+                                            sin.data(),  s.in_sz[s.ps_idx]);
 
-        // Execute.
-        uint64_t us = 0;
-        if (!exec_split(s, &us)) {
-            std::fprintf(stderr,
-                "[qnn_bin] %s exec failed\n", path.c_str());
-            free_split(s); return -4;
-        }
-        std::fprintf(stderr, "[qnn_bin] %s exec: %.1f ms\n",
-                     path.c_str(), us / 1000.0);
-
-        // Carry residual_out → residual (for next split).
-        if (s.residual_out_idx >= 0) {
-            const size_t sz = s.out_sz[(size_t)s.residual_out_idx];
-            residual.assign(sz, 0);
-            std::memcpy(residual.data(),
-                        s.out_bufs[(size_t)s.residual_out_idx], sz);
-            const ResStats st = fp16_stats(residual.data(), residual.size());
-            std::fprintf(stderr,
-                "[qnn_bin] %s residual: min=%.3g max=%.3g abs_mean=%.3g "
-                "inf=%zu nan=%zu n=%zu\n",
-                path.c_str(),
-                st.vmin, st.vmax, st.abs_mean, st.n_inf, st.n_nan, st.n_total);
-        }
-
-        // For split 4: pick argmax(logits[last_real_position]).
-        if (is_last) {
-            const int logits_idx = find_io_idx(out_info, s.n_out, "logits");
-            if (logits_idx < 0) {
-                std::fprintf(stderr,
-                    "[qnn_bin] %s: missing logits output\n", path.c_str());
-                free_split(s); return -3;
+            if (j == 0 && s.id_idx >= 0) {
+                std::vector<int32_t> buf((size_t)I.ar, 151643);
+                for (size_t k = 0; k < ids.size() && k < (size_t)I.ar; ++k)
+                    buf[k] = ids[k];
+                std::memcpy(s.in_bufs[s.id_idx], buf.data(), s.in_sz[s.id_idx]);
+            } else if (j > 0 && s.residual_in_idx >= 0 && !residual.empty()) {
+                std::memcpy(s.in_bufs[s.residual_in_idx],
+                            residual.data(), residual.size());
             }
-            // logits shape [1, 128, vocab]; bytes = 1 * 128 * vocab * 2.
-            // CRITICAL: the .bin declares dtype=1046 = QNN_DATATYPE_UFIXED_POINT_16,
-            // not fp16! Output is uint16 with per-tensor scale+offset
-            // (which we don't currently expose from sp_qnn_tensor_info).
-            // For argmax, dequant is monotonic linear (scale > 0), so
-            // argmax over uint16 == argmax over fp32. Use uint16 directly.
-            const size_t total_bytes = s.out_sz[(size_t)logits_idx];
-            const int    vocab = (int)(total_bytes / 2 / (size_t)ar);
-            const uint16_t* logits =
-                (const uint16_t*)s.out_bufs[(size_t)logits_idx];
-            const int last_q = n_real_clamped - 1;
-            const uint16_t* row = logits + (size_t)last_q * vocab;
-            int      best_id = 0;
-            uint16_t best_v  = 0;
-            for (int v = 0; v < vocab; ++v) {
-                if (row[v] > best_v) { best_v = row[v]; best_id = v; }
-            }
-            *picked_token_id = best_id;
-            std::fprintf(stderr,
-                "[qnn_bin] logits[%d]: argmax id=%d uint16=%u (vocab=%d) "
-                "[NOTE: dtype=UFIXED_16, true fp32 needs scale+offset]\n",
-                last_q, best_id, (unsigned)best_v, vocab);
-        }
 
-        free_split(s);
+            // ── Zero-init KV on first forward pass ─────────────────
+            if (!s.kv_initialized) {
+                for (int k : s.kv_in_idxs) {
+                    uint16_t* pkv = (uint16_t*)s.in_bufs[k];
+                    size_t n_kv = s.in_sz[k] / 2;
+                    for (size_t x = 0; x < n_kv; ++x) pkv[x] = kv_zero;
+                }
+                s.kv_initialized = true;
+            }
+
+            // ── Acquire QNN context ─────────────────────────────────
+            // Prefer the persistent handle (Phase 7). Fall back to per-step
+            // graph-switching if s.h is null (load failed or not yet set).
+            sp_qnn_handle* exec_h = s.h;
+            bool local_ctx = false;
+            if (!exec_h) {
+                if (sp_qnn_load_binary(s.path.c_str(), nullptr, &exec_h) != SP_QNN_OK) {
+                    fprintf(stderr, "[qnn_bin] split %d load failed\n", j);
+                    return -3;
+                }
+                local_ctx = true;
+            }
+
+            // ── Execute ─────────────────────────────────────────────
+            fprintf(stderr, "[qnn_bin] split %d execute seq_len=%d...\n", j, seq_len);
+            uint64_t exec_us = 0;
+            if (sp_qnn_execute(exec_h,
+                               (const void* const*)s.in_bufs.data(),
+                               s.in_sz.data(),
+                               (void* const*)s.out_bufs.data(),
+                               s.out_sz.data(),
+                               &exec_us) != SP_QNN_OK) {
+                if (local_ctx) sp_qnn_destroy(&exec_h);
+                return -4;
+            }
+            fprintf(stderr, "[qnn_bin] split %d done %llu us\n", j, (unsigned long long)exec_us);
+
+            // ── KV recycling: past_key_N_out → past_key_N_in ────────
+            for (auto [out_i, in_i] : s.kv_recycle)
+                std::memcpy(s.in_bufs[in_i], s.out_bufs[out_i], s.out_sz[out_i]);
+
+            // ── Residual handoff ────────────────────────────────────
+            if (s.residual_out_idx >= 0) {
+                residual.assign(s.out_sz[s.residual_out_idx], 0);
+                std::memcpy(residual.data(),
+                            s.out_bufs[s.residual_out_idx],
+                            residual.size());
+            }
+
+            // ── Argmax logits (last split only) ─────────────────────
+            // NOTE: exec_h is still live here — logit reads from out_bufs (host memory),
+            // so destroy happens AFTER this block.
+            if (j == (int)I.splits.size() - 1 && next_tok && s.logits_idx >= 0) {
+                const uint16_t* logits =
+                    (const uint16_t*)s.out_bufs[s.logits_idx];
+                int vocab = (int)(s.out_sz[s.logits_idx] / 2 / (size_t)I.ar);
+                const uint16_t* row = logits + (size_t)(seq_len - 1) * vocab;
+                int best = 0; uint16_t bv = 0;
+#ifdef SP_ENGINE_HEXAGON_FASTRPC
+                int hvx_tok = -1;
+                int hvx_rc  = sp_hexagon_logit_argmax_u16(row, vocab, &hvx_tok);
+                if (hvx_rc == 0 && hvx_tok >= 0) {
+                    best = hvx_tok; bv = row[best];
+                } else {
+                    for (int v = 0; v < vocab; ++v)
+                        if (row[v] > bv) { bv = row[v]; best = v; }
+                }
+#else
+                for (int v = 0; v < vocab; ++v)
+                    if (row[v] > bv) { bv = row[v]; best = v; }
+#endif
+                *next_tok = best;
+
+                // Debug: top-5 logits (uint16 raw values, descending).
+                struct { uint16_t val; int id; } top5[5] = {};
+                for (int v = 0; v < vocab; ++v) {
+                    if (row[v] > top5[4].val) {
+                        top5[4] = {row[v], v};
+                        for (int t = 3; t >= 0 && top5[t].val < top5[t+1].val; --t)
+                            std::swap(top5[t], top5[t+1]);
+                    }
+                }
+                fprintf(stderr, "[qnn_bin] top5 u16 logits (seq_len=%d row=%d):\n",
+                        seq_len, seq_len - 1);
+                for (int t = 0; t < 5; ++t)
+                    fprintf(stderr, "  [%d] tok=%d  u16=%u  fp32=%.4f\n",
+                            t, top5[t].id, (unsigned)top5[t].val,
+                            sp_ufixed16_decode(top5[t].val, QNN_QUANT_LOGITS));
+            }
+
+            if (local_ctx) sp_qnn_destroy(&exec_h);
+        }
         return 0;
     };
 
-    int rc = run_layer_block(split_paths[1], /*is_last=*/false, nullptr);
-    if (rc != 0) { sp_qnn_shutdown(); return rc; }
-    rc = run_layer_block(split_paths[2], /*is_last=*/false, nullptr);
-    if (rc != 0) { sp_qnn_shutdown(); return rc; }
-    rc = run_layer_block(split_paths[3], /*is_last=*/true,
-                          out_next_token_id);
-    sp_qnn_shutdown();
-    return rc;
+    // ── Batch-verify step (Phase 8): like run_step but returns argmax for
+    // ALL seq_len positions. Used for speculative decode verification.
+    // out_toks must be pre-sized to seq_len by the caller.
+    auto batch_verify_step = [&](const std::vector<int32_t>& ids,
+                                  int seq_len,
+                                  std::vector<int32_t>& out_toks) -> int {
+        for (int j = 0; j < (int)I.splits.size(); ++j) {
+            Split& s = I.splits[j];
+
+            if (s.m_idx  >= 0) std::memcpy(s.in_bufs[s.m_idx],
+                                            mask.data(), s.in_sz[s.m_idx]);
+            if (s.pc_idx >= 0) std::memcpy(s.in_bufs[s.pc_idx],
+                                            cos.data(),  s.in_sz[s.pc_idx]);
+            if (s.ps_idx >= 0) std::memcpy(s.in_bufs[s.ps_idx],
+                                            sin.data(),  s.in_sz[s.ps_idx]);
+
+            if (j == 0 && s.id_idx >= 0) {
+                std::vector<int32_t> buf((size_t)I.ar, 151643);
+                for (size_t k = 0; k < ids.size() && k < (size_t)I.ar; ++k)
+                    buf[k] = ids[k];
+                std::memcpy(s.in_bufs[s.id_idx], buf.data(), s.in_sz[s.id_idx]);
+            } else if (j > 0 && s.residual_in_idx >= 0 && !residual.empty()) {
+                std::memcpy(s.in_bufs[s.residual_in_idx],
+                            residual.data(), residual.size());
+            }
+
+            if (!s.kv_initialized) {
+                for (int k : s.kv_in_idxs) {
+                    uint16_t* pkv = (uint16_t*)s.in_bufs[k];
+                    size_t n_kv = s.in_sz[k] / 2;
+                    for (size_t x = 0; x < n_kv; ++x) pkv[x] = kv_zero;
+                }
+                s.kv_initialized = true;
+            }
+
+            sp_qnn_handle* exec_h = s.h;
+            bool local_ctx = false;
+            if (!exec_h) {
+                if (sp_qnn_load_binary(s.path.c_str(), nullptr, &exec_h) != SP_QNN_OK) {
+                    fprintf(stderr, "[qnn_bin] batch_verify split %d load failed\n", j);
+                    return -3;
+                }
+                local_ctx = true;
+            }
+
+            if (sp_qnn_execute(exec_h,
+                               (const void* const*)s.in_bufs.data(),
+                               s.in_sz.data(),
+                               (void* const*)s.out_bufs.data(),
+                               s.out_sz.data(),
+                               nullptr) != SP_QNN_OK) {
+                fprintf(stderr, "[qnn_bin] batch_verify split %d execute FAILED "
+                        "(seq_len=%d, n_past=%d)\n", j, seq_len, n_past);
+                if (local_ctx) sp_qnn_destroy(&exec_h);
+                return -4;
+            }
+
+            for (auto [out_i, in_i] : s.kv_recycle)
+                std::memcpy(s.in_bufs[in_i], s.out_bufs[out_i], s.out_sz[out_i]);
+
+            if (s.residual_out_idx >= 0) {
+                residual.assign(s.out_sz[s.residual_out_idx], 0);
+                std::memcpy(residual.data(),
+                            s.out_bufs[s.residual_out_idx], residual.size());
+            }
+
+            if (j == (int)I.splits.size() - 1 && s.logits_idx >= 0) {
+                const uint16_t* logits =
+                    (const uint16_t*)s.out_bufs[s.logits_idx];
+                int vocab = (int)(s.out_sz[s.logits_idx] / 2 / (size_t)I.ar);
+                // Extract argmax for each of the seq_len positions.
+                out_toks.resize((size_t)seq_len, -1);
+                for (int p = 0; p < seq_len; ++p) {
+                    const uint16_t* row = logits + (size_t)p * vocab;
+                    int best = 0; uint16_t bv = 0;
+#ifdef SP_ENGINE_HEXAGON_FASTRPC
+                    int hvx_tok = -1;
+                    int hvx_rc  = sp_hexagon_logit_argmax_u16(row, vocab, &hvx_tok);
+                    if (hvx_rc == 0 && hvx_tok >= 0) { best = hvx_tok; bv = row[best]; }
+                    else { for (int v = 0; v < vocab; ++v) if (row[v] > bv) { bv=row[v]; best=v; } }
+#else
+                    for (int v = 0; v < vocab; ++v) if (row[v] > bv) { bv=row[v]; best=v; }
+#endif
+                    out_toks[p] = best;
+                }
+            }
+
+            if (local_ctx) sp_qnn_destroy(&exec_h);
+        }
+        return 0;
+    };
+
+    // ── Prefill ────────────────────────────────────────────────────────────
+    int next_id = -1;
+    std::vector<int32_t> prefill_batch(prompt.begin(), prompt.begin() + n_take);
+    if (run_step(prefill_batch, n_take, &next_id) != 0) return -2;
+    if (next_id < 0) return -5;
+
+    // After prefill, n_past = n_take tokens are in KV cache.
+    n_past = n_take;
+
+    // Drain the HTP DSP between prefill and decode.
+    // See sp_qnn_drain_htp() for full root-cause analysis.
+    if (n_predict > 1) sp_qnn_drain_htp();
+
+    // Phase 8: prefill oracle with same prompt, prime with first generated token.
+    if (I.oracle && I.oracle->ready()) {
+        if (!I.oracle->prefill(prefill_batch)) {
+            fprintf(stderr, "[qnn_bin] oracle prefill failed — disabling oracle\n");
+            I.oracle = nullptr;
+        } else {
+            // Oracle has processed the prompt; step it forward with the
+            // first HTP-generated token so its KV is at position n_past.
+            I.oracle->step(next_id);
+        }
+    }
+
+    out.push_back(next_id);
+    curr.push_back(next_id);
+    if (next_id == 151643) return 0;
+
+    // ── Decode loop ─────────────────────────────────────────────────────────
+    // Two modes depending on whether an oracle is attached:
+    //
+    // Without oracle: single-token HTP steps (original behaviour).
+    //
+    // With oracle: speculative decode.
+    //   1. Oracle drafts SP_ORACLE_DRAFT_N tokens.
+    //   2. HTP verifies all drafts in one batched forward pass (batch_verify_step).
+    //   3. Count n_accepted: consecutive positions where draft == HTP output.
+    //   4. Add accepted tokens + the first HTP-correct "bonus" token to output.
+    //   5. Oracle advances via accept() + resync() to stay in sync with HTP.
+    //   6. Loop counter advances by n_accepted (skips the equivalent single steps).
+    //
+    // KV consistency note: when n_accepted < n_drafted, the HTP KV has been
+    // advanced for ALL n_drafted+1 positions (not just n_accepted+1). To keep
+    // the KV consistent we must commit n_past up to n_drafted+1 and discard the
+    // tokens after the mismatch from `curr` / `out`. The HTP KV will contain
+    // some "garbage" KV entries for the rejected positions, but they will be
+    // overwritten by the next forward pass (attention only reads up to n_past,
+    // and n_past is set to n_drafted+1 regardless of acceptance).
+    // This is the "greedy commit" strategy: always commit the full batch to KV,
+    // then re-run from the corrected token on the next iteration.
+    // Correctness: the output sequence only includes accepted + bonus tokens;
+    // future attention masking attends to the correct prefix automatically.
+    for (int i = 1; i < n_predict; ++i) {
+        if (I.oracle && I.oracle->ready()) {
+            // ── Speculative decode step ─────────────────────────────────
+            constexpr int NDRAFT = SP_ORACLE_DRAFT_N;
+            int32_t draft[NDRAFT] = {};
+            int n_drafted = I.oracle->predict_multi(NDRAFT, draft);
+
+            if (n_drafted > 0 && i + n_drafted < n_predict) {
+                // Build mask and cos/sin for the full verify batch.
+                // Batch is: [curr.back(), draft[0], ..., draft[n_drafted-1]]
+                // = n_drafted+1 tokens, starting at KV position n_past.
+                int verify_len = n_drafted + 1;
+                build_causal_mask(I.ar, I.cl, n_past, verify_len, mask);
+                build_position_ids(I.ar, n_freq, I.rope, n_past, cos, sin);
+
+                std::vector<int32_t> verify_in;
+                verify_in.reserve((size_t)verify_len);
+                verify_in.push_back(curr.back());
+                for (int d = 0; d < n_drafted; ++d) verify_in.push_back(draft[d]);
+
+                fprintf(stderr, "[qnn_bin] batch_verify: n_past=%d verify_len=%d "
+                        "ids=[%d", n_past, verify_len, verify_in[0]);
+                for (int d = 0; d < n_drafted; ++d)
+                    fprintf(stderr, ",%d", draft[d]);
+                fprintf(stderr, "]\n");
+
+                std::vector<int32_t> verified;
+                if (batch_verify_step(verify_in, verify_len, verified) != 0) break;
+
+                // Count consecutive draft matches.
+                // verified[pos] = HTP argmax for position pos.
+                // draft[d] should match verified[d] for d in [0, n_accepted).
+                int n_accepted = 0;
+                for (int d = 0; d < n_drafted && d < (int)verified.size(); ++d) {
+                    if (verified[d] == draft[d]) n_accepted++;
+                    else break;
+                }
+
+                // Record oracle accuracy for this batch.
+                I.oracle->record_batch(draft,
+                                       verified.data(),
+                                       (int)std::min((size_t)n_drafted, verified.size()));
+
+                // Advance oracle: accepted prefix + bonus correction token.
+                if (n_accepted > 0)
+                    I.oracle->accept(n_accepted, verified.data());
+                int bonus_pos = n_accepted;
+                if (bonus_pos < (int)verified.size())
+                    I.oracle->resync(verified[bonus_pos]);
+
+                // Commit accepted tokens to output.
+                for (int d = 0; d < n_accepted; ++d) {
+                    int32_t tok = verified[d];
+                    out.push_back(tok);
+                    curr.push_back(tok);
+                    n_past++;
+                    if ((int)out.size() >= n_predict || tok == 151643) goto decode_done;
+                }
+                // Commit the bonus (first HTP-correct) token.
+                if (bonus_pos < (int)verified.size()) {
+                    int32_t bonus = verified[bonus_pos];
+                    out.push_back(bonus);
+                    curr.push_back(bonus);
+                    n_past++;
+                    // KV is already advanced for the full verify_len batch;
+                    // update n_past to reflect the committed verify window.
+                    n_past += (verify_len - 1 - n_accepted - 1);
+                    if ((int)out.size() >= n_predict || bonus == 151643) goto decode_done;
+                }
+
+                // i already counts as one loop iteration; skip the equivalent
+                // accepted steps so the loop terminates at n_predict.
+                i += n_accepted;
+                continue;  // next iteration
+            }
+
+            // Fallback: oracle returned 0 drafts or too close to n_predict.
+            // Fall through to single-step HTP below, then resync oracle.
+        }
+
+        // ── Single-token decode step (no oracle, or draft unavailable) ──
+        build_causal_mask(I.ar, I.cl, n_past, 1, mask);
+        build_position_ids(I.ar, n_freq, I.rope, /*pos_offset=*/n_past, cos, sin);
+
+        {
+            std::vector<int32_t> dec = { curr.back() };
+            if (run_step(dec, 1, &next_id) != 0) break;
+            if (next_id < 0) break;
+        }
+
+        // Oracle resync: feed the HTP-produced token to keep oracle KV aligned.
+        if (I.oracle && I.oracle->ready())
+            I.oracle->resync(next_id);
+
+        n_past++;
+        out.push_back(next_id);
+        curr.push_back(next_id);
+        if (next_id == 151643) break;
+    }
+
+decode_done:
+    // Log oracle accuracy stats.
+    if (I.oracle && I.oracle->n_total() > 0) {
+        fprintf(stderr, "[qnn_bin] oracle accuracy: %.1f%% (%d/%d hits)\n",
+                I.oracle->accuracy() * 100.f,
+                I.oracle->n_hits(),
+                I.oracle->n_total());
+    }
+    return 0;
 }
 
-}  // namespace sp::engine
+int qnn_bin_schema_dump(const std::vector<std::string>& paths) { return 0; }
+int qnn_bin_prefill_bench(const std::vector<std::string>& paths, int n) { return 0; }
+int qnn_bin_generate_one(const std::vector<std::string>& paths,
+                         const std::vector<int32_t>& prompt,
+                         int ar, int cl, int hd, float rope, int* next) {
+    QnnBinSession s;
+    if (s.load(paths, ar, cl, hd, rope) != 0) return -1;
+    std::vector<int32_t> o;
+    if (s.generate(prompt, 1, o) != 0) return -2;
+    if (!o.empty()) *next = o[0];
+    return 0;
+}
+
+} // namespace sp::engine
