@@ -6,12 +6,12 @@
 
 This readme and it's results have not been updated since the start..
 
-I Have to be honest this Project was to show that tranformers could complete a complicated project on themselves 100%
+I Have to be honest this Project was to show that tranformers could complete a complicated project by themselves 100%
 I am finding the constant regressions, the fact that I have all the code completed, Tests, Results, Fixes for issues etc
 Just sitting there and no matter how hard I try to just point them in the right direction it's 1-step forward 2-steps back
-3-steps forward to be extremely draining. I currently do not plan on continuing and I am debating on just deletinge everything
+3-steps forward to be extremely draining. I currently do not plan on continuing and I am debating on just deleting everything
 So if you are using this to learn, or for the idea's, just check out John's "TQ" branch, His progress aligns perfectly with each
-step I released on this and previous repo's. He is on the right track. He is quite clever, coming to some pretty advanced idea's
+step released on this and previous repo's. He is on the right track. He is quite clever, coming to some pretty advanced idea's
 almost to the day they pop-up on here. He is on the right track. He understands it's a bandwidth problem, There are a few things
 that need to be ironed out, but I am sure he can come up with the solution, (hint) it's been solved. HF will come through for you
 guys, don't worry, they have their best guys working on it. While their exec's push to become relevant as a large AI Company.
