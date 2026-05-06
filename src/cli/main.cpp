@@ -266,6 +266,7 @@ static void usage(const char* prog) {
         "\n"
         "System 1↔2 switching (entropy-gated dynamic cache routing):\n"
         "  --system12            enable dual-cache mode (ship + hier/sqfree)\n"
+        "  --crt-split           CRT multi-GPU parallelism (needs n_gpus >= 2)\n"
         "  --s12-threshold <f>   entropy threshold in nats (default: 2.0)\n"
         "  --s12-sys2 <type>     System 2 cache type: hier (default) | sqfree\n"
         "                        (env: SP_ENGINE_SYSTEM12, SP_ENGINE_S12_THRESHOLD)\n"
@@ -331,6 +332,7 @@ int main(int argc, char** argv) {
             else if (a == "--save-cache"      && i + 1 < argc) cc.save_cache_path = argv[++i];
             else if (a == "--load-cache"      && i + 1 < argc) cc.load_cache_path = argv[++i];
             else if (a == "--system12")                         cc.system12       = true;
+            else if (a == "--crt-split")                        cc.crt_split      = true;
             else if (a == "--s12-threshold"   && i + 1 < argc) cc.s12_threshold  = (float)std::atof(argv[++i]);
             else if (a == "--s12-sys2"        && i + 1 < argc) cc.s12_sys2       = argv[++i];
             else if (a.size() >= 2 && a[0] == '-' && a[1] == '-') {
@@ -431,8 +433,8 @@ int main(int argc, char** argv) {
         }
 
         // Create KvCache sized for one chunk at a time. Prefer GPU-resident
-        // when the backend is GPU and the config doesn't select hierarchical
-        // (which is still host-only). Env gate SHANNON_PRIME_GPU_CACHE=0
+        // when the backend is GPU. All cache modes (ship, sqfree, hierarchical)
+        // have GPU-resident CUDA kernels. Env gate SHANNON_PRIME_GPU_CACHE=0
         // forces the host cache for A/B comparison, matching chat / perplexity.
         std::unique_ptr<sp::engine::KvCache> kv;
         {
@@ -443,7 +445,7 @@ int main(int argc, char** argv) {
                 ggml_backend_dev_t dev = ggml_backend_get_device((ggml_backend_t)bk);
                 backend_is_gpu = dev && ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU;
             }
-            const bool gpu_ok = !cc.hierarchical;
+            const bool gpu_ok = true;  // all modes have GPU kernels (ship, sqfree, hier)
             if (prefer_gpu_cache && backend_is_gpu && gpu_ok) {
                 kv = sp::engine::KvCache::create_gpu(n_layer, n_head_kv, head_dim,
                                                       n_ctx, cc, /*stream=*/nullptr);
@@ -817,9 +819,9 @@ int main(int argc, char** argv) {
                 ggml_backend_dev_t dev = ggml_backend_get_device((ggml_backend_t)bk);
                 backend_is_gpu = dev && ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU;
             }
-            // Ship, sqfree, and sqfree+spinor are GPU-resident;
-            // hierarchical still host-side until its GPU cache lands.
-            const bool gpu_ok = !pc.hierarchical;
+            // All cache modes (ship, sqfree, hierarchical) have GPU-resident
+            // CUDA kernels — the hier GPU cache landed in shannon_prime_hier.cu.
+            const bool gpu_ok = true;
             if (prefer_gpu_cache && backend_is_gpu && gpu_ok) {
                 kv = sp::engine::KvCache::create_gpu(fc->n_layer(),
                                                       (int)m->n_head_kv(),
@@ -1050,6 +1052,7 @@ int main(int argc, char** argv) {
             else if (a == "--cold")                             cc.enable_cold = true;
             else if (a == "--evict-keep"      && i + 1 < argc) cc.evict_keep = std::atoi(argv[++i]);
             else if (a == "--system12")                         cc.system12       = true;
+            else if (a == "--crt-split")                        cc.crt_split      = true;
             else if (a == "--s12-threshold"   && i + 1 < argc) cc.s12_threshold  = (float)std::atof(argv[++i]);
             else if (a == "--s12-sys2"        && i + 1 < argc) cc.s12_sys2       = argv[++i];
             else if (a.size() >= 2 && a[0] == '-' && a[1] == '-') {
@@ -1133,9 +1136,8 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "[sp-engine] %s\n", dual->describe().c_str());
             } else {
                 // Standard single-cache path.
-                // Ship, sqfree, and sqfree+spinor are GPU-resident;
-                // hierarchical uses GPU path when available.
-                const bool gpu_ok = !cc.hierarchical;
+                // All modes (ship, sqfree, hierarchical) are GPU-resident.
+                const bool gpu_ok = true;
                 if (prefer_gpu_cache && backend_is_gpu && gpu_ok) {
                     kv = sp::engine::KvCache::create_gpu(fc->n_layer(),
                                                           (int)m->n_head_kv(),
@@ -1398,9 +1400,8 @@ int main(int argc, char** argv) {
         if ((ggml_backend_t)kv_bk) {
             ggml_backend_dev_t dev = ggml_backend_get_device((ggml_backend_t)kv_bk);
             const bool backend_is_gpu = dev && ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU;
-            // Ship, sqfree, and sqfree+spinor are GPU-resident;
-            // hierarchical still falls through to host cache.
-            const bool gpu_ok = !kvc.hierarchical;
+            // All modes (ship, sqfree, hierarchical) are GPU-resident.
+            const bool gpu_ok = true;
             if (backend_is_gpu && gpu_ok) {
                 kv = sp::engine::KvCache::create_gpu(n_layer, n_head_kv, hd, n_tokens, kvc,
                                                       /*stream=*/nullptr);

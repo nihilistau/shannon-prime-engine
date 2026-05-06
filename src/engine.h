@@ -42,7 +42,7 @@ struct Config {
     // Uses Kronecker sub-projection as a small skeleton (~9% of pad_dim)
     // and a calibrated linear map to predict the remaining coefficients.
     // Requires calibration (first prefill). Mutually exclusive with sqfree.
-    bool        hierarchical    = false;
+    bool        hierarchical    = true;
     int         hier_level      = 0;       // 0 = auto (second-to-last prime grouping)
     int         hier_res_bits   = 2;       // 1-4 bits for target residuals
     std::string hier_skel_bits  = "5,5";   // Band bits for skeleton quantisation
@@ -67,6 +67,14 @@ struct Config {
     // an automatic copy node inserted.
     int         n_gpus = 0;
 
+    // CRT (Chinese Remainder Theorem) multi-GPU parallelism.
+    // When true and n_gpus >= 2, uses CRT tensor splitting instead of
+    // layer sharding: each GPU computes in a different residue ring,
+    // then the host recombines via Garner's algorithm. Eliminates all
+    // inter-GPU communication during matmul. Particularly effective
+    // for heterogeneous GPU pairs (e.g., RTX 2060 + Intel UHD).
+    bool        crt_split = false;
+
     // Positional-encoding mode.
     // Default is PrimePe (lattice-aligned RoPE frequencies) — proven −0.6%
     // to −0.8% PPL improvement across architectures at zero runtime cost.
@@ -77,7 +85,7 @@ struct Config {
     int         pe_tier  = 0;
 
     // Cauchy reset system — decode-chain causal stability.
-    int         cauchy_mode     = 0;
+    int         cauchy_mode     = 2;
     int         cauchy_fixed_n  = 512;
     int         cauchy_cooldown = 64;
     int         cauchy_warmup   = 64;
