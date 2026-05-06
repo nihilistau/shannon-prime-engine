@@ -37,6 +37,7 @@ extern "C" {
 #include "ggml-backend.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -1839,7 +1840,7 @@ int main(int argc, char** argv) {
             }
         }
 
-        // CRT path: K × K^T
+        // CRT path: K × K^T — run both CPU and GPU dispatch
         sp_crt_context_t ctx;
         int rc = sp_crt_init(&ctx, n, n, d, nullptr, nullptr);
         if (rc != 0) { std::fprintf(stderr, "sp_crt_init failed: %d\n", rc); return 6; }
@@ -1848,9 +1849,41 @@ int main(int argc, char** argv) {
         sp_crt_quant_calibrate_k(&ctx.act_quant, k_min, k_max, d);
         sp_crt_quant_calibrate_k(&ctx.weight_quant, k_min, k_max, d);
 
+        // CPU reference path
         rc = sp_crt_matmul(&ctx, K_mat.data(), Kt.data(), C_crt.data(), n, n, d);
+        if (rc != 0) { sp_crt_free(&ctx); std::fprintf(stderr, "sp_crt_matmul CPU failed: %d\n", rc); return 6; }
+
+        // GPU dispatch path
+        std::vector<float> C_gpu(out_sz, 0.0f);
+        int gpu_rc = sp_crt_init_gpu(&ctx);
+        if (gpu_rc == 0) {
+            std::printf("\n--- GPU dispatch test ---\n");
+            // Warm up
+            sp_crt_matmul_gpu(&ctx, K_mat.data(), Kt.data(), C_gpu.data(), n, n, d);
+
+            // Timed run
+            auto t0 = std::chrono::high_resolution_clock::now();
+            const int n_iters = 100;
+            for (int iter = 0; iter < n_iters; ++iter) {
+                sp_crt_matmul_gpu(&ctx, K_mat.data(), Kt.data(), C_gpu.data(), n, n, d);
+            }
+            auto t1 = std::chrono::high_resolution_clock::now();
+            double gpu_ms = std::chrono::duration<double, std::milli>(t1 - t0).count() / n_iters;
+
+            // Verify GPU matches CPU CRT
+            double gpu_max_err = 0;
+            for (size_t i = 0; i < out_sz; ++i) {
+                double e = std::fabs((double)C_gpu[i] - (double)C_crt[i]);
+                if (e > gpu_max_err) gpu_max_err = e;
+            }
+            std::printf("  GPU vs CPU CRT max delta: %.8f %s\n",
+                        gpu_max_err, (gpu_max_err < 0.001) ? "(match)" : "(MISMATCH)");
+            std::printf("  GPU dispatch: %.3f ms per %d×%d×%d matmul (%d iters)\n",
+                        gpu_ms, n, n, d, n_iters);
+        } else {
+            std::printf("  (GPU dispatch not available: rc=%d — using CPU path)\n", gpu_rc);
+        }
         sp_crt_free(&ctx);
-        if (rc != 0) { std::fprintf(stderr, "sp_crt_matmul failed: %d\n", rc); return 6; }
 
         // Compare
         double max_abs = 0, sum_abs = 0;
