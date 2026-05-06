@@ -31,6 +31,7 @@ extern "C" {
 
 extern "C" {
 #include "shannon_prime.h"
+#include "sp_crt.h"
 }
 
 #include "ggml-backend.h"
@@ -1507,6 +1508,198 @@ int main(int argc, char** argv) {
         std::printf("V corr: mean=%.4f  min=%.4f\n", v_sum / per, v_min);
         std::printf("compression ratio = %.2fx\n", kv->compression_ratio());
         return 0;
+    }
+
+    // ── CRT multi-GPU smoke test (CPU reference path) ─────────────────
+    //
+    //   sp-engine crt_smoke [--dim N]
+    //
+    // Validates the full CRT pipeline: quantize → split → modular matmul
+    // → Garner reconstruct → dequantize. Runs on CPU (no GPU required).
+    // Tests:
+    //   1. Single-element round-trip (sp_crt_verify_roundtrip)
+    //   2. Small matmul correctness (M×N×K) against naive fp32
+    //   3. Error statistics (max error, mean error, PASS/FAIL)
+
+    if (cmd == "crt_smoke") {
+        int dim = 64;  // default matmul dimension (dim × dim × dim)
+        for (int i = 2; i < argc; ++i) {
+            std::string a = argv[i];
+            if (a == "--dim" && i + 1 < argc) dim = std::atoi(argv[++i]);
+        }
+
+        std::printf("=== CRT Smoke Test ===\n\n");
+
+        // ── Test 1: Round-trip verification (scalar) ────────────────
+        std::printf("--- Test 1: scalar round-trip ---\n");
+        int rt_pass = 0, rt_fail = 0;
+        float rt_max_err = 0.0f;
+        // Sweep representative values including edge cases.
+        float test_vals[] = {
+            0.0f, 1.0f, -1.0f, 0.5f, -0.5f, 3.99f, -3.99f,
+            0.001f, -0.001f, 2.718f, -1.414f, 3.141f, -2.236f
+        };
+        const int n_vals = sizeof(test_vals) / sizeof(test_vals[0]);
+        for (int i = 0; i < n_vals; ++i) {
+            for (int j = 0; j < n_vals; ++j) {
+                float err = 0.0f;
+                int rc = sp_crt_verify_roundtrip(test_vals[i], test_vals[j], &err);
+                if (rc == 0) rt_pass++; else rt_fail++;
+                if (err > rt_max_err) {
+                    rt_max_err = err;
+                    std::printf("  worst so far: a=%.4f b=%.4f expected=%.6f err=%.6f\n",
+                                test_vals[i], test_vals[j],
+                                test_vals[i] * test_vals[j], err);
+                }
+            }
+        }
+        std::printf("  %d / %d round-trips passed, max error = %.6f\n",
+                    rt_pass, rt_pass + rt_fail, rt_max_err);
+        std::printf("  %s\n\n", rt_fail == 0 ? "PASS" : "FAIL");
+
+        // ── Test 2: Matmul correctness (M × K) × (K × N) ───────────
+        std::printf("--- Test 2: %d×%d matmul ---\n", dim, dim);
+
+        const int M = dim, N = dim, K = dim;
+        const size_t a_sz = (size_t)M * K;
+        const size_t b_sz = (size_t)K * N;
+        const size_t c_sz = (size_t)M * N;
+
+        std::vector<float> A(a_sz), B(b_sz), C_crt(c_sz), C_ref(c_sz);
+
+        // Deterministic PRNG fill in [-1, 1]
+        uint64_t s = 0xDEADBEEF12345678ULL;
+        auto rng = [&]() -> float {
+            s ^= s << 13; s ^= s >> 7; s ^= s << 17;
+            return ((float)(s & 0xFFFFFFFF) / 2147483648.0f) - 1.0f;
+        };
+        for (size_t i = 0; i < a_sz; ++i) A[i] = rng();
+        for (size_t i = 0; i < b_sz; ++i) B[i] = rng();
+
+        // Naive fp32 reference
+        for (int i = 0; i < M; ++i) {
+            for (int j = 0; j < N; ++j) {
+                double acc = 0.0;
+                for (int k = 0; k < K; ++k) {
+                    acc += (double)A[i * K + k] * (double)B[k * N + j];
+                }
+                C_ref[i * N + j] = (float)acc;
+            }
+        }
+
+        // CRT matmul (CPU reference path)
+        sp_crt_context_t ctx;
+        int rc = sp_crt_init(&ctx, M, N, K, nullptr, nullptr);
+        if (rc != 0) {
+            std::fprintf(stderr, "sp_crt_init failed: %d\n", rc);
+            return 2;
+        }
+
+        // Calibrate from actual data range
+        float a_min = A[0], a_max = A[0];
+        float b_min = B[0], b_max = B[0];
+        for (size_t i = 1; i < a_sz; ++i) {
+            if (A[i] < a_min) a_min = A[i];
+            if (A[i] > a_max) a_max = A[i];
+        }
+        for (size_t i = 1; i < b_sz; ++i) {
+            if (B[i] < b_min) b_min = B[i];
+            if (B[i] > b_max) b_max = B[i];
+        }
+        sp_crt_quant_calibrate_k(&ctx.act_quant, a_min, a_max, K);
+        sp_crt_quant_calibrate_k(&ctx.weight_quant, b_min, b_max, K);
+
+        rc = sp_crt_matmul(&ctx, A.data(), B.data(), C_crt.data(), M, N, K);
+        sp_crt_free(&ctx);
+        if (rc != 0) {
+            std::fprintf(stderr, "sp_crt_matmul failed: %d\n", rc);
+            return 2;
+        }
+
+        // Compare CRT vs reference
+        double max_abs_err = 0.0, sum_abs_err = 0.0;
+        double max_rel_err = 0.0, sum_rel_err = 0.0;
+        for (size_t i = 0; i < c_sz; ++i) {
+            double err = std::fabs((double)C_crt[i] - (double)C_ref[i]);
+            double rel = (std::fabs(C_ref[i]) > 1e-6)
+                       ? err / std::fabs((double)C_ref[i])
+                       : err;
+            if (err > max_abs_err) max_abs_err = err;
+            if (rel > max_rel_err) max_rel_err = rel;
+            sum_abs_err += err;
+            sum_rel_err += rel;
+        }
+
+        std::printf("  ref range: [%.4f, %.4f]\n",
+                    *std::min_element(C_ref.begin(), C_ref.end()),
+                    *std::max_element(C_ref.begin(), C_ref.end()));
+        std::printf("  abs error: max=%.6f  mean=%.6f\n",
+                    max_abs_err, sum_abs_err / c_sz);
+        std::printf("  rel error: max=%.6f  mean=%.6f\n",
+                    max_rel_err, sum_rel_err / c_sz);
+
+        // Pass criterion: mean relative error < 1%
+        bool matmul_pass = (sum_rel_err / c_sz) < 0.01;
+        std::printf("  %s\n\n", matmul_pass ? "PASS" : "FAIL");
+
+        // ── Test 3: Identity matrix — Residue Integrity Test ────────
+        //
+        // Feed A × I through CRT. If Garner merges correctly on the host,
+        // the output must be A (within quantization tolerance). A "ghost"
+        // value here means the residue rings are aliasing.
+        std::printf("--- Test 3: identity matrix (residue integrity) ---\n");
+
+        const int idim = std::min(dim, 128);  // cap for speed
+        const size_t id_sz = (size_t)idim * idim;
+
+        std::vector<float> Id(id_sz, 0.0f);
+        for (int i = 0; i < idim; ++i) Id[i * idim + i] = 1.0f;
+
+        // Random A matrix in [-1, 1]
+        std::vector<float> A_id(id_sz);
+        s = 0xCAFEBABE42424242ULL;  // fresh seed
+        for (size_t i = 0; i < id_sz; ++i) {
+            s ^= s << 13; s ^= s >> 7; s ^= s << 17;
+            A_id[i] = ((float)(s & 0xFFFFFFFF) / 2147483648.0f) - 1.0f;
+        }
+
+        std::vector<float> C_id(id_sz);
+        sp_crt_context_t id_ctx;
+        rc = sp_crt_init(&id_ctx, idim, idim, idim, nullptr, nullptr);
+        if (rc != 0) {
+            std::fprintf(stderr, "sp_crt_init failed for identity test: %d\n", rc);
+            return 2;
+        }
+        // Identity matrix is in [0,1], A is in [-1,1]
+        sp_crt_quant_calibrate_k(&id_ctx.act_quant, -1.0f, 1.0f, idim);
+        sp_crt_quant_calibrate_k(&id_ctx.weight_quant, 0.0f, 1.0f, idim);
+
+        rc = sp_crt_matmul(&id_ctx, A_id.data(), Id.data(), C_id.data(),
+                           idim, idim, idim);
+        sp_crt_free(&id_ctx);
+        if (rc != 0) {
+            std::fprintf(stderr, "sp_crt_matmul identity failed: %d\n", rc);
+            return 2;
+        }
+
+        double id_max_err = 0.0, id_ghost_count = 0;
+        for (size_t i = 0; i < id_sz; ++i) {
+            double err = std::fabs((double)C_id[i] - (double)A_id[i]);
+            if (err > id_max_err) id_max_err = err;
+            if (err > 0.1) id_ghost_count++;
+        }
+        std::printf("  dim: %d×%d, max error vs input: %.8f\n", idim, idim, id_max_err);
+        std::printf("  ghost values (err > 0.1): %d / %zu\n",
+                    (int)id_ghost_count, id_sz);
+        bool id_pass = (id_ghost_count == 0) && (id_max_err < 0.01);
+        std::printf("  Garner merger returns: %s\n",
+                    id_pass ? "1.0000 (clean)" : "GHOST detected");
+        std::printf("  %s\n\n", id_pass ? "PASS" : "FAIL");
+
+        // ── Summary ─────────────────────────────────────────────────
+        bool all_pass = (rt_fail == 0) && matmul_pass && id_pass;
+        std::printf("=== CRT Smoke: %s ===\n", all_pass ? "ALL PASS" : "FAIL");
+        return all_pass ? 0 : 1;
     }
 
     if (cmd == "banner") {
