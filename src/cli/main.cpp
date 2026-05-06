@@ -444,8 +444,8 @@ int main(int argc, char** argv) {
         {
             const char* env_gpu = std::getenv("SHANNON_PRIME_GPU_CACHE");
             const bool prefer_gpu_cache = (env_gpu == nullptr) || (std::atoi(env_gpu) != 0);
-            bool backend_is_gpu = false;
-            if ((ggml_backend_t)bk) {
+            bool backend_is_gpu = !mgpu.backends.empty();  // multi-GPU → always GPU
+            if (!backend_is_gpu && (ggml_backend_t)bk) {
                 ggml_backend_dev_t dev = ggml_backend_get_device((ggml_backend_t)bk);
                 backend_is_gpu = dev && ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU;
             }
@@ -820,8 +820,8 @@ int main(int argc, char** argv) {
             // the host cache even on GPU, for A/B comparisons.
             const char* env_gpu = std::getenv("SHANNON_PRIME_GPU_CACHE");
             bool prefer_gpu_cache = (env_gpu == nullptr) || (std::atoi(env_gpu) != 0);
-            bool backend_is_gpu = false;
-            if ((ggml_backend_t)bk) {
+            bool backend_is_gpu = !mgpu_ppl.backends.empty();
+            if (!backend_is_gpu && (ggml_backend_t)bk) {
                 ggml_backend_dev_t dev = ggml_backend_get_device((ggml_backend_t)bk);
                 backend_is_gpu = dev && ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU;
             }
@@ -1117,8 +1117,8 @@ int main(int argc, char** argv) {
         {
             const char* env_gpu = std::getenv("SHANNON_PRIME_GPU_CACHE");
             const bool prefer_gpu_cache = (env_gpu == nullptr) || (std::atoi(env_gpu) != 0);
-            bool backend_is_gpu = false;
-            if ((ggml_backend_t)bk) {
+            bool backend_is_gpu = !mgpu_chat.backends.empty();
+            if (!backend_is_gpu && (ggml_backend_t)bk) {
                 ggml_backend_dev_t dev = ggml_backend_get_device((ggml_backend_t)bk);
                 backend_is_gpu = dev && ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU;
             }

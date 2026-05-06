@@ -249,6 +249,14 @@ int  KvCache::max_seq()    const { return impl_->max_seq; }
 bool KvCache::is_sqfree()  const { return impl_->sqfree; }
 
 float KvCache::compression_ratio() const {
+    if (impl_->hier_inited) {
+        // Hierarchical path: use actual k/v bytes_per_pos which account for
+        // ternary mask, split K/V residual bits, and skeleton band config.
+        int baseline = impl_->head_dim * 2;  // fp16 per element
+        int compressed = impl_->hier.k_bytes_per_pos + impl_->hier.v_bytes_per_pos;
+        if (compressed <= 0) return 1.0f;
+        return 2.0f * (float)baseline / (float)compressed;
+    }
     return sp_compression_ratio(&impl_->cfg);
 }
 
@@ -269,12 +277,15 @@ std::string KvCache::describe() const {
                   impl_->n_layer, impl_->n_head_kv, impl_->head_dim,
                   impl_->pad_dim, impl_->max_seq, compression_ratio());
     if (impl_->hier_inited) {
-        char extra[128];
-        std::snprintf(extra, sizeof(extra), " skel=%d/%d (%.0f%%)",
+        char extra[192];
+        std::snprintf(extra, sizeof(extra),
+                      " skel=%d/%d (%.0f%%) K=%dB/pos V=%dB/pos",
                       impl_->hier.predictors[0].n_skeleton,
                       impl_->hier.predictors[0].pad_dim,
                       100.0f * impl_->hier.predictors[0].n_skeleton /
-                      impl_->hier.predictors[0].pad_dim);
+                      impl_->hier.predictors[0].pad_dim,
+                      impl_->hier.k_bytes_per_pos,
+                      impl_->hier.v_bytes_per_pos);
         std::strncat(buf, extra, sizeof(buf) - std::strlen(buf) - 1);
     }
     return std::string(buf);
