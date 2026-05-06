@@ -1937,6 +1937,7 @@ int main(int argc, char** argv) {
         return server.listen_and_serve(host, port);
     }
 
+#ifdef SP_ENGINE_WITH_QNN
     if (cmd == "qnn_bin_serve") {
         std::string tok_path, host = "0.0.0.0", model_id = "shannon-prime-htp", www_root;
         int port = 8080, ar = 128, cl = 2048, hd = 2560;
@@ -2022,6 +2023,7 @@ int main(int argc, char** argv) {
         svr.listen(host, port);
         return 0;
     }
+#endif // SP_ENGINE_WITH_QNN
 
     // Flag parser — extracts known flags and stashes positional args in `rest`.
     // Per-command handlers below can consume those positionals however they like.

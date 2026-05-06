@@ -75,7 +75,10 @@ static int fp32_argmax(const float* v, int n) {
 
 // ─── NEON softmax in-place over a fp32 vector ─────────────────────────────
 // Used by moe_gate_topk (Phase 9 stub). Suppressed-unused warning via attribute.
-__attribute__((unused))
+#ifdef _MSC_VER
+#pragma warning(push)
+#pragma warning(disable: 4505) // unreferenced local function
+#endif
 static void fp32_softmax_inplace(float* v, int n) {
     float mx = v[0];
     for (int i = 1; i < n; ++i) if (v[i] > mx) mx = v[i];
