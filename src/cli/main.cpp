@@ -245,8 +245,10 @@ static void usage(const char* prog) {
         "Hierarchical Vilenkin predictor (maximum compression):\n"
         "  --hierarchical       enable hierarchical predictor (~9%% skeleton)\n"
         "  --hier-level <n>     0 = auto, 1..n_primes-1 = explicit\n"
-        "  --hier-res-bits <n>  target residual bits, 1-4 (default: 2)\n"
+        "  --hier-res-bits <n>  K target residual bits, 1-4 (default: 2)\n"
+        "  --hier-res-bits-v <n>  V target residual bits; 0 = same as K\n"
         "  --hier-skel-bits <csv>  skeleton band bits (default: 5,5)\n"
+        "  --hier-ternary-mask <hex>  ternary band mask, e.g. 0x8 for band 3\n"
         "\n"
         "PrimePE-RoPE-ALiBi:\n"
         "  --pe-mode <name>     standard|primepe|primepe_alibi|alibi (default: standard)\n"
@@ -314,7 +316,9 @@ int main(int argc, char** argv) {
             else if (a == "--model-preset"   && i + 1 < argc) cc.model_preset   = argv[++i];
             else if (a == "--hier-level"     && i + 1 < argc) cc.hier_level     = std::atoi(argv[++i]);
             else if (a == "--hier-res-bits"  && i + 1 < argc) cc.hier_res_bits  = std::atoi(argv[++i]);
+            else if (a == "--hier-res-bits-v" && i + 1 < argc) cc.hier_res_bits_v = std::atoi(argv[++i]);
             else if (a == "--hier-skel-bits" && i + 1 < argc) cc.hier_skel_bits = argv[++i];
+            else if (a == "--hier-ternary-mask" && i + 1 < argc) cc.hier_skel_ternary = (uint32_t)std::strtoul(argv[++i], nullptr, 0);
             else if (a == "--pe-mode"        && i + 1 < argc) {
                 std::string m = argv[++i];
                 if      (m == "standard")      cc.pe_mode = sp::engine::Config::PeMode::Standard;
@@ -696,7 +700,9 @@ int main(int argc, char** argv) {
             else if (a == "--model-preset"  && i + 1 < argc) pc.model_preset  = argv[++i];
             else if (a == "--hier-level"    && i + 1 < argc) pc.hier_level    = std::atoi(argv[++i]);
             else if (a == "--hier-res-bits" && i + 1 < argc) pc.hier_res_bits = std::atoi(argv[++i]);
+            else if (a == "--hier-res-bits-v" && i + 1 < argc) pc.hier_res_bits_v = std::atoi(argv[++i]);
             else if (a == "--hier-skel-bits"&& i + 1 < argc) pc.hier_skel_bits= argv[++i];
+            else if (a == "--hier-ternary-mask" && i + 1 < argc) pc.hier_skel_ternary = (uint32_t)std::strtoul(argv[++i], nullptr, 0);
             else if (a == "--cauchy-mode"     && i + 1 < argc) pc.cauchy_mode     = std::atoi(argv[++i]);
             else if (a == "--cauchy-fixed-n"  && i + 1 < argc) pc.cauchy_fixed_n  = std::atoi(argv[++i]);
             else if (a == "--cauchy-cooldown" && i + 1 < argc) pc.cauchy_cooldown = std::atoi(argv[++i]);
@@ -1027,7 +1033,9 @@ int main(int argc, char** argv) {
             else if (a == "--ctx"       && i + 1 < argc) cc.n_ctx      = std::atoi(argv[++i]);
             else if (a == "--hier-level"     && i + 1 < argc) cc.hier_level     = std::atoi(argv[++i]);
             else if (a == "--hier-res-bits"  && i + 1 < argc) cc.hier_res_bits  = std::atoi(argv[++i]);
+            else if (a == "--hier-res-bits-v" && i + 1 < argc) cc.hier_res_bits_v = std::atoi(argv[++i]);
             else if (a == "--hier-skel-bits" && i + 1 < argc) cc.hier_skel_bits = argv[++i];
+            else if (a == "--hier-ternary-mask" && i + 1 < argc) cc.hier_skel_ternary = (uint32_t)std::strtoul(argv[++i], nullptr, 0);
             else if (a == "--pe-mode"   && i + 1 < argc) {
                 std::string m = argv[++i];
                 if      (m == "standard")      cc.pe_mode = sp::engine::Config::PeMode::Standard;
@@ -1388,7 +1396,9 @@ int main(int argc, char** argv) {
             else if (a == "--residual-bits" && i + 1 < argc) kvc.residual_bits = std::atoi(argv[++i]);
             else if (a == "--hier-level"     && i + 1 < argc) kvc.hier_level     = std::atoi(argv[++i]);
             else if (a == "--hier-res-bits"  && i + 1 < argc) kvc.hier_res_bits  = std::atoi(argv[++i]);
+            else if (a == "--hier-res-bits-v" && i + 1 < argc) kvc.hier_res_bits_v = std::atoi(argv[++i]);
             else if (a == "--hier-skel-bits" && i + 1 < argc) kvc.hier_skel_bits = argv[++i];
+            else if (a == "--hier-ternary-mask" && i + 1 < argc) kvc.hier_skel_ternary = (uint32_t)std::strtoul(argv[++i], nullptr, 0);
             else { std::fprintf(stderr, "kv_smoke: unknown arg %s\n", a.c_str()); return 2; }
         }
 
@@ -2049,6 +2059,8 @@ int main(int argc, char** argv) {
         else if (a == "--residual-bits" && i + 1 < argc)     cfg.residual_bits  = std::atoi(argv[++i]);
         else if (a == "--hier-level" && i + 1 < argc)        cfg.hier_level     = std::atoi(argv[++i]);
         else if (a == "--hier-res-bits" && i + 1 < argc)     cfg.hier_res_bits  = std::atoi(argv[++i]);
+        else if (a == "--hier-res-bits-v" && i + 1 < argc)   cfg.hier_res_bits_v = std::atoi(argv[++i]);
+        else if (a == "--hier-ternary-mask" && i + 1 < argc) cfg.hier_skel_ternary = (uint32_t)std::strtoul(argv[++i], nullptr, 0);
         else if (a == "--pe-mode" && i + 1 < argc) {
             std::string m = argv[++i];
             if      (m == "standard")      cfg.pe_mode = sp::engine::Config::PeMode::Standard;
