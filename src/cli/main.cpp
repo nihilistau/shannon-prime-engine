@@ -1702,6 +1702,190 @@ int main(int argc, char** argv) {
         return all_pass ? 0 : 1;
     }
 
+    // ── CRT model-level test — real activations through CRT pipeline ───
+    //
+    //   sp-engine crt_model --model <path.gguf> [--ctx N] [--layer L]
+    //
+    // Loads a GGUF model, runs one forward chunk to capture per-layer K
+    // tensors (real activations from real weights), then replays head 0's
+    // K × K^T (the attention score inner product) through both CRT and
+    // fp32 reference. Reports error statistics.
+    //
+    // This proves CRT works with real model weight distributions —
+    // not just synthetic random data.
+
+    if (cmd == "crt_model") {
+        std::string model_path;
+        int n_ctx   = 128;
+        int layer   = 0;
+        int ngl     = sp_default_n_gpu_layers();
+        for (int i = 2; i < argc; ++i) {
+            std::string a = argv[i];
+            if      (a == "--model" && i + 1 < argc) model_path = argv[++i];
+            else if (a == "--ctx"   && i + 1 < argc) n_ctx  = std::atoi(argv[++i]);
+            else if (a == "--layer" && i + 1 < argc) layer  = std::atoi(argv[++i]);
+            else if ((a == "--n-gpu-layers" || a == "-ngl") && i + 1 < argc) ngl = std::atoi(argv[++i]);
+        }
+        if (model_path.empty()) {
+            std::fprintf(stderr, "crt_model requires --model <path.gguf>\n");
+            return 1;
+        }
+
+        std::printf("=== CRT Model-Level Test ===\n\n");
+
+        // Load model
+        auto m = sp::engine::Model::load(model_path);
+        if (!m) { std::fprintf(stderr, "failed to load model\n"); return 2; }
+
+        SpBackendGuard bk(sp_select_backend());
+        auto W = sp::engine::LlamaWeights::load(*m, bk, ngl);
+        if (!W) { std::fprintf(stderr, "failed to load weights\n"); return 3; }
+
+        auto v  = sp::engine::Vocab::load(*m);
+        auto tk = v ? sp::engine::Tokenizer::create(*v) : nullptr;
+        if (!tk) { std::fprintf(stderr, "failed to create tokenizer\n"); return 3; }
+
+        const int n_layer   = (int)m->n_layer();
+        const int head_dim  = (int)m->head_dim();
+        const int n_head_kv = (int)m->n_head_kv();
+
+        if (layer >= n_layer) {
+            std::fprintf(stderr, "layer %d >= n_layer %d\n", layer, n_layer);
+            return 2;
+        }
+
+        std::printf("  model:     %s\n", model_path.c_str());
+        std::printf("  arch:      %s\n", m->architecture().c_str());
+        std::printf("  n_layer:   %d\n", n_layer);
+        std::printf("  head_dim:  %d\n", head_dim);
+        std::printf("  n_head_kv: %d\n", n_head_kv);
+        std::printf("  test ctx:  %d tokens\n", n_ctx);
+        std::printf("  test layer: %d\n\n", layer);
+
+        // Create forward context
+        sp::engine::PeSettings pe{};
+        auto fc = sp::engine::ForwardContext::create(*m, *W, 1024 * 1024 * 1024, pe, bk);
+        if (!fc) { std::fprintf(stderr, "failed to create forward context\n"); return 4; }
+
+        // Generate token IDs — use a simple repeated sequence.
+        // We don't need meaningful text, just real model activations.
+        std::vector<int32_t> toks(n_ctx);
+        toks[0] = 1; // BOS
+        for (int i = 1; i < n_ctx; ++i) toks[i] = 100 + (i % 500);
+
+        // Forward pass — capture per-layer K and V
+        std::printf("--- Forward pass (capturing K/V) ---\n");
+        std::vector<float> logits;
+        int n_vocab_local = 0;
+        std::vector<std::vector<float>> per_K, per_V;
+        if (!fc->forward_full(toks, logits, n_vocab_local, &per_K, &per_V)) {
+            std::fprintf(stderr, "forward_full failed\n"); return 5;
+        }
+        std::printf("  logits shape: [%d, %d]\n", n_ctx, n_vocab_local);
+
+        if (per_K[layer].empty()) {
+            std::fprintf(stderr, "layer %d K not captured\n", layer);
+            return 5;
+        }
+
+        // K shape: [head_dim, n_head_kv, n_tokens] stored flat.
+        // Extract head 0: stride = head_dim, step = head_dim * n_head_kv.
+        // Reshape as K_head0: [n_tokens × head_dim] row-major.
+        const float* K_raw = per_K[layer].data();
+        const int n = n_ctx;
+        const int d = head_dim;
+        std::vector<float> K_mat(n * d);
+        for (int t = 0; t < n; ++t) {
+            for (int h = 0; h < d; ++h) {
+                // K is [head_dim, n_head_kv, n_tokens] → element [h, 0, t]
+                // = K_raw[h + 0*head_dim + t*head_dim*n_head_kv]
+                //   but ggml stores in [head_dim, n_head_kv, n] order:
+                //   index = h + head*head_dim + t*(head_dim*n_head_kv)
+                K_mat[t * d + h] = K_raw[h + t * d * n_head_kv];
+            }
+        }
+
+        // Report K statistics
+        float k_min = K_mat[0], k_max = K_mat[0];
+        double k_abssum = 0;
+        for (size_t i = 0; i < K_mat.size(); ++i) {
+            if (K_mat[i] < k_min) k_min = K_mat[i];
+            if (K_mat[i] > k_max) k_max = K_mat[i];
+            k_abssum += std::fabs(K_mat[i]);
+        }
+        std::printf("  K head-0 range: [%.4f, %.4f], mean_abs: %.4f\n\n",
+                    k_min, k_max, k_abssum / K_mat.size());
+
+        // Compute K × K^T — fp32 reference
+        // K_mat: [n × d], result: [n × n]
+        std::printf("--- K×K^T: %d×%d × %d×%d → %d×%d ---\n", n, d, d, n, n, n);
+
+        // K^T: [d × n]
+        std::vector<float> Kt(d * n);
+        for (int t = 0; t < n; ++t)
+            for (int h = 0; h < d; ++h)
+                Kt[h * n + t] = K_mat[t * d + h];
+
+        const size_t out_sz = (size_t)n * n;
+        std::vector<float> C_ref(out_sz), C_crt(out_sz);
+
+        // fp32 reference: K × K^T
+        for (int i = 0; i < n; ++i) {
+            for (int j = 0; j < n; ++j) {
+                double acc = 0.0;
+                for (int k = 0; k < d; ++k)
+                    acc += (double)K_mat[i * d + k] * (double)Kt[k * n + j];
+                C_ref[i * n + j] = (float)acc;
+            }
+        }
+
+        // CRT path: K × K^T
+        sp_crt_context_t ctx;
+        int rc = sp_crt_init(&ctx, n, n, d, nullptr, nullptr);
+        if (rc != 0) { std::fprintf(stderr, "sp_crt_init failed: %d\n", rc); return 6; }
+
+        // Calibrate from actual K value range
+        sp_crt_quant_calibrate_k(&ctx.act_quant, k_min, k_max, d);
+        sp_crt_quant_calibrate_k(&ctx.weight_quant, k_min, k_max, d);
+
+        rc = sp_crt_matmul(&ctx, K_mat.data(), Kt.data(), C_crt.data(), n, n, d);
+        sp_crt_free(&ctx);
+        if (rc != 0) { std::fprintf(stderr, "sp_crt_matmul failed: %d\n", rc); return 6; }
+
+        // Compare
+        double max_abs = 0, sum_abs = 0;
+        double max_rel = 0, sum_rel = 0;
+        float ref_min = C_ref[0], ref_max = C_ref[0];
+        for (size_t i = 0; i < out_sz; ++i) {
+            if (C_ref[i] < ref_min) ref_min = C_ref[i];
+            if (C_ref[i] > ref_max) ref_max = C_ref[i];
+            double err = std::fabs((double)C_crt[i] - (double)C_ref[i]);
+            double rel = (std::fabs(C_ref[i]) > 1e-6)
+                       ? err / std::fabs((double)C_ref[i]) : err;
+            if (err > max_abs) max_abs = err;
+            if (rel > max_rel) max_rel = rel;
+            sum_abs += err;
+            sum_rel += rel;
+        }
+
+        std::printf("  ref range: [%.4f, %.4f]\n", ref_min, ref_max);
+        std::printf("  abs error: max=%.6f  mean=%.6f\n", max_abs, sum_abs / out_sz);
+        std::printf("  rel error: max=%.6f  mean=%.6f\n", max_rel, sum_rel / out_sz);
+
+        bool pass = (sum_rel / out_sz) < 0.01;
+        std::printf("  %s\n\n", pass ? "PASS" : "FAIL");
+
+        // Diagonal check — self-attention scores K[i]·K[i] should be positive
+        int diag_ok = 0;
+        for (int i = 0; i < n; ++i) {
+            if (C_crt[i * n + i] > 0.0f) diag_ok++;
+        }
+        std::printf("  diagonal (self-dot) positive: %d / %d\n", diag_ok, n);
+
+        std::printf("\n=== CRT Model: %s ===\n", pass ? "PASS" : "FAIL");
+        return pass ? 0 : 1;
+    }
+
     if (cmd == "banner") {
         std::printf("Shannon-Prime Engine — reference inference with compressed KV cache\n");
         std::printf("  linked: shannon-prime core (AGPLv3)\n");
