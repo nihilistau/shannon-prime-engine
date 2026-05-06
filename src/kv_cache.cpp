@@ -389,11 +389,14 @@ std::unique_ptr<KvCache> KvCache::create(int n_layer, int n_head_kv,
         if ((int)skel_bits.size() > SP_MAX_BANDS) skel_bits.resize(SP_MAX_BANDS);
         const int res_bits = (cfg.hier_res_bits >= 1 && cfg.hier_res_bits <= 4)
                              ? cfg.hier_res_bits : 2;
+        const int res_bits_v = (cfg.hier_res_bits_v >= 1 && cfg.hier_res_bits_v <= 4)
+                               ? cfg.hier_res_bits_v : 0;  // 0 → defaults to K
 
         if (sp_hier_cache_init(&kv->impl_->hier, sc, max_seq,
                                cfg.hier_level,
                                (int)skel_bits.size(), skel_bits.data(),
-                               res_bits) != 0) {
+                               res_bits, res_bits_v,
+                               cfg.hier_skel_ternary) != 0) {
             std::fprintf(stderr, "[sp-engine] KvCache: hier_cache_init failed\n");
             return nullptr;
         }
@@ -963,13 +966,16 @@ std::unique_ptr<KvCache> KvCache::create_gpu(int n_layer, int n_head_kv,
         if (skel_bits.empty()) skel_bits = {5, 5};
         int hier_res_bits = (cfg.hier_res_bits >= 1 && cfg.hier_res_bits <= 4)
                             ? cfg.hier_res_bits : 2;
+        int hier_res_bits_v = (cfg.hier_res_bits_v >= 1 && cfg.hier_res_bits_v <= 4)
+                              ? cfg.hier_res_bits_v : 0;  // 0 → defaults to K
         int hier_level = cfg.hier_level;
 
         // Init CPU companion for calibration
         if (sp_hier_cache_init(&kv->impl_->hier, sc, max_seq,
                                 hier_level,
                                 (int)skel_bits.size(), skel_bits.data(),
-                                hier_res_bits) != 0) {
+                                hier_res_bits, hier_res_bits_v,
+                                cfg.hier_skel_ternary) != 0) {
             std::fprintf(stderr, "[sp-engine] KvCache::create_gpu: "
                          "sp_hier_cache_init (companion) failed\n");
             return nullptr;

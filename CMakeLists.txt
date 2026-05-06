@@ -112,9 +112,12 @@ set(SP_CORE_SRC
     ${SP_CORE_DIR}/core/shannon_prime.c
     ${SP_CORE_DIR}/core/shannon_prime_sqfree.c
     ${SP_CORE_DIR}/core/shannon_prime_cauchy.c
-    ${SP_CORE_DIR}/core/shannon_prime_modelpack.c)
+    ${SP_CORE_DIR}/core/shannon_prime_modelpack.c
+    ${SP_CORE_DIR}/backends/crt/sp_crt.c)
 add_library(shannon_prime_core STATIC ${SP_CORE_SRC})
-target_include_directories(shannon_prime_core PUBLIC ${SP_CORE_DIR}/core)
+target_include_directories(shannon_prime_core PUBLIC
+    ${SP_CORE_DIR}/core
+    ${SP_CORE_DIR}/backends/crt)
 target_compile_features(shannon_prime_core PUBLIC c_std_11)
 if(MSVC)
     target_compile_options(shannon_prime_core PRIVATE /W3)
@@ -148,7 +151,8 @@ if(SP_ENGINE_WITH_CUDA)
     set(_SP_CUDA_SOURCES
         ${SP_CORE_DIR}/backends/cuda/shannon_prime_cuda.cu
         ${SP_CORE_DIR}/backends/cuda/shannon_prime_sqfree.cu
-        ${SP_CORE_DIR}/backends/cuda/shannon_prime_hier.cu)
+        ${SP_CORE_DIR}/backends/cuda/shannon_prime_hier.cu
+        ${SP_CORE_DIR}/backends/crt/sp_crt_cuda.cu)
 
     # FP8 quantization kernels (E4M3 for values, E5M2 for scales)
     if(SP_ENGINE_FP8)
@@ -169,6 +173,7 @@ if(SP_ENGINE_WITH_CUDA)
     add_library(shannon_prime_cuda_backend STATIC ${_SP_CUDA_SOURCES})
     target_include_directories(shannon_prime_cuda_backend PUBLIC
         ${SP_CORE_DIR}/backends/cuda
+        ${SP_CORE_DIR}/backends/crt
         ${SP_CORE_DIR}/core)
     target_link_libraries(shannon_prime_cuda_backend PUBLIC shannon_prime_core)
     set_target_properties(shannon_prime_cuda_backend PROPERTIES

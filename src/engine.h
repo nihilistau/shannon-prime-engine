@@ -44,8 +44,10 @@ struct Config {
     // Requires calibration (first prefill). Mutually exclusive with sqfree.
     bool        hierarchical    = true;
     int         hier_level      = 0;       // 0 = auto (second-to-last prime grouping)
-    int         hier_res_bits   = 2;       // 1-4 bits for target residuals
+    int         hier_res_bits   = 2;       // 1-4 bits for K target residuals
+    int         hier_res_bits_v = 0;       // V target residuals; 0 → same as K
     std::string hier_skel_bits  = "5,5";   // Band bits for skeleton quantisation
+    uint32_t    hier_skel_ternary = 0;     // Ternary band mask for skeleton (0x8 = band 3)
 
     // Backend selection.
     enum class Backend { CPU, CUDA, Vulkan };
