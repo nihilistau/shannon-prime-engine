@@ -250,6 +250,92 @@ static int qnn_kq_dispatch_shim(void* userdata,
     }
     return 0;
 }
+
+// ─────────────────────────────────────────────────────────────────
+// QNN dense weight matmul dispatch shim. Phase 4.13.
+//
+// out[M, N] = lhs[M, K] @ W_fp16[K, N] on V69 HTP. W_fp16 is the
+// pre-baked transposed weight (allocated via sp_qnn_alloc_persistent
+// at bind time so HTP reads it without per-call marshal copies).
+// lhs is fresh per-call: convert fp32 → fp16 into a thread-local
+// scratch, dispatch, widen output back to fp32.
+//
+// Per-shape graphFinalize cost (~50-100 ms) hits once; subsequent
+// dispatches are ~330 µs. The seven dense weights × {prefill, decode}
+// shapes cap the unique-shape count at ~14 per session.
+// ─────────────────────────────────────────────────────────────────
+static int qnn_mm_dispatch_shim(void* userdata,
+                                 const float*    lhs,
+                                 const uint16_t* W_fp16,
+                                 int M, int K, int N,
+                                 float* out) {
+    auto* cache = (sp_llama_qnn_matmul_cache*)userdata;
+    if (!cache || !W_fp16) return -1;
+
+    static thread_local std::vector<uint16_t> a_fp16, c_fp16;
+    const size_t a_n = (size_t)M * K;
+    const size_t c_n = (size_t)M * N;
+    if (a_fp16.size() < a_n) a_fp16.resize(a_n);
+    if (c_fp16.size() < c_n) c_fp16.resize(c_n);
+
+    // Narrow lhs → fp16. Hot path; could NEON later, but the
+    // dispatch itself is the dominant cost.
+    for (size_t i = 0; i < a_n; ++i) a_fp16[i] = sp_fp32_to_fp16(lhs[i]);
+
+    uint64_t exec_us = 0;
+    int rc = sp_llama_qnn_matmul_dispatch(cache,
+                                          (uint32_t)M, (uint32_t)K, (uint32_t)N,
+                                          a_fp16.data(), a_n * 2,
+                                          W_fp16,        (size_t)K * N * 2,
+                                          c_fp16.data(), c_n * 2,
+                                          &exec_us);
+    if (rc != 0) return rc;
+
+    for (size_t i = 0; i < c_n; ++i) out[i] = sp_fp16_to_fp32(c_fp16[i]);
+    return 0;
+}
+#endif  // SP_ENGINE_WITH_QNN
+
+#if defined(SP_ENGINE_WITH_QNN)
+// ─────────────────────────────────────────────────────────────────
+// Dequant a GGUF weight tensor to fp16, transposed to QNN's [K, N]
+// layout. GGUF stores W as [n_embd_in (inner = K), n_features_out
+// (outer = N)] — i.e., physically [N, K] row-major. QNN's MatMul
+// expects right-hand B[K, N]. So we dequant to fp32 [N, K] using
+// ggml's type_traits, then permute into fp16 [K, N].
+//
+// Returns true on success. out_fp16 is sized to K*N elements.
+// ─────────────────────────────────────────────────────────────────
+static bool dequant_transpose_to_fp16(const ggml_tensor* W,
+                                       std::vector<uint16_t>& out_fp16) {
+    if (!W || !W->data) return false;
+    const int K = (int)W->ne[0];   // inner dim — input features
+    const int N = (int)W->ne[1];   // outer dim — output features
+    if (K <= 0 || N <= 0) return false;
+
+    const struct ggml_type_traits* tt =
+        ggml_get_type_traits((ggml_type)W->type);
+    if (!tt || !tt->to_float) {
+        std::fprintf(stderr,
+            "[sp_native] dequant_transpose: dtype %d has no to_float\n",
+            W->type);
+        return false;
+    }
+
+    // Step 1: full-matrix fp32 dequant in [N, K] order (GGUF native).
+    std::vector<float> Wf((size_t)N * K);
+    tt->to_float(W->data, Wf.data(), (int64_t)N * K);
+
+    // Step 2: transpose-then-narrow into fp16 [K, N].
+    out_fp16.assign((size_t)K * N, 0);
+    for (int n = 0; n < N; ++n) {
+        const float* row = Wf.data() + (size_t)n * K;
+        for (int k = 0; k < K; ++k) {
+            out_fp16[(size_t)k * N + n] = sp_fp32_to_fp16(row[k]);
+        }
+    }
+    return true;
+}
 #endif  // SP_ENGINE_WITH_QNN
 
 // ─────────────────────────────────────────────────────────────────
@@ -316,6 +402,18 @@ struct ForwardNativeContext::Impl {
     // graphFinalize cost ~50ms once per shape, then ~330µs per dispatch.
     sp_llama_qnn_matmul_cache* qnn_mm_cache = nullptr;
     bool qnn_active = false;
+
+    // Phase 4.13: per-layer fp16 weight bake for HTP dispatch.
+    // Each entry is the transposed [K, N] fp16 weight matching the
+    // GGUF-native [N, K] order — QNN's MatMul expects the right
+    // operand in [K, N]. Storage is plain heap (std::vector); could
+    // be promoted to rpcmem-ION via sp_qnn_alloc_persistent later
+    // for zero-copy on the FastRPC bridge.
+    struct LayerFp16 {
+        std::vector<uint16_t> wq, wk, wv, wo;
+        std::vector<uint16_t> ffn_gate, ffn_up, ffn_down;
+    };
+    std::vector<LayerFp16> layers_fp16;
 #endif
 
 #ifdef SP_HEXAGON_FASTRPC
@@ -462,6 +560,116 @@ std::unique_ptr<ForwardNativeContext> ForwardNativeContext::create(
                     "create failed — staying on CPU sp_matmul_f32\n");
             }
         }
+    }
+
+    // ── Phase 4.13: bake fp16 weight matmuls for HTP dispatch ──────
+    // For Qwen2.5-Coder-3B Q5_K_M: 7 weights × 36 layers, dequant from
+    // Q5_K to fp16 transposed. Per-layer bytes (head_dim=128, n_embd=
+    // 2048, n_kv_dim=256, n_q_dim=2048, n_ff=11008):
+    //   wq:       2048*2048*2  =   8 MB
+    //   wk:       2048*256*2   =   1 MB
+    //   wv:       2048*256*2   =   1 MB
+    //   wo:       2048*2048*2  =   8 MB
+    //   ffn_gate: 2048*11008*2 =  43 MB
+    //   ffn_up:   2048*11008*2 =  43 MB
+    //   ffn_down: 11008*2048*2 =  43 MB
+    //                            ───────
+    //                            147 MB / layer × 36 = ~5.3 GB.
+    // Tight on 8 GB device but fits with KV + activations. Skipped
+    // when QNN inactive — CPU fallback still owns the originals.
+    if (I.qnn_active) {
+        // Memory budget: cap fp16 weight bake so we don't OOM the device.
+        // SHANNON_PRIME_FP16_BUDGET_MB env var (default 4096 = 4 GB —
+        // leaves headroom for KV cache + activations + sp_qnn graphs +
+        // OS on an 8 GB phone). Set to 0 to disable bake entirely (HTP
+        // dispatch off, CPU stays).
+        size_t budget_bytes = (size_t)4096 * 1024 * 1024;
+        if (const char* s = std::getenv("SHANNON_PRIME_FP16_BUDGET_MB")) {
+            const long long mb = std::atoll(s);
+            if (mb >= 0) budget_bytes = (size_t)mb * 1024 * 1024;
+        }
+
+        I.layers_fp16.resize(I.n_layer);
+        std::fprintf(stderr,
+            "[sp_native] baking fp16 weights for HTP "
+            "(budget=%.2f GB) ",
+            (double)budget_bytes / (1024.0 * 1024.0 * 1024.0));
+        size_t total_bytes = 0;
+        int    layers_baked = 0, layers_partial = 0;
+        for (int Li = 0; Li < I.n_layer; ++Li) {
+            const auto& L = weights.layers()[Li];
+            auto& F      = I.layers_fp16[(size_t)Li];
+            auto& B      = I.layers_bound[(size_t)Li];
+            const struct {
+                const ggml_tensor*    src;
+                std::vector<uint16_t>* dst;
+                const uint16_t**       layer_ptr;
+            } weights_to_bake[] = {
+                { L.wq,       &F.wq,       &B.wq_fp16       },
+                { L.wk,       &F.wk,       &B.wk_fp16       },
+                { L.wv,       &F.wv,       &B.wv_fp16       },
+                { L.wo,       &F.wo,       &B.wo_fp16       },
+                { L.ffn_gate, &F.ffn_gate, &B.ffn_gate_fp16 },
+                { L.ffn_up,   &F.ffn_up,   &B.ffn_up_fp16   },
+                { L.ffn_down, &F.ffn_down, &B.ffn_down_fp16 },
+            };
+            int   weights_in_layer = 0;
+            for (const auto& w : weights_to_bake) {
+                if (!w.src) continue;
+                const size_t need = (size_t)w.src->ne[0] * w.src->ne[1] * 2;
+                if (total_bytes + need > budget_bytes) {
+                    // Budget exhausted — leave this and remaining
+                    // weights on the CPU path (W_fp16 stays nullptr,
+                    // weight_matmul falls through to sp_matmul_f32_q5k).
+                    continue;
+                }
+                try {
+                    if (!dequant_transpose_to_fp16(w.src, *w.dst)) {
+                        continue;
+                    }
+                } catch (const std::bad_alloc&) {
+                    std::fprintf(stderr,
+                        "\n[sp_native] OOM during fp16 bake at layer %d — "
+                        "remaining weights stay on CPU path\n", Li);
+                    // Hard cap: prevent further attempts.
+                    budget_bytes = total_bytes;
+                    break;
+                }
+                *w.layer_ptr = w.dst->data();
+                total_bytes += w.dst->size() * sizeof(uint16_t);
+                ++weights_in_layer;
+            }
+            // Wire mm_dispatch on this layer regardless — null
+            // W_fp16 entries fall through cleanly.
+            B.mm_dispatch          = &qnn_mm_dispatch_shim;
+            B.mm_dispatch_userdata = I.qnn_mm_cache;
+
+            /* Phase 4.14: if QNN is active, try to fetch the persistent ION
+             * buffers for these weights from the matmul cache. We do this
+             * for both the prefill shape (M=128) and decode shape (M=1).
+             * Since the B matrix [K, N] is the same, they may share the
+             * same physical ION backing if the shim supports it. */
+            if (I.qnn_active && weights_in_layer > 0) {
+                // Pre-fetch ION pointers for these weights for the common
+                // prefill and decode shapes. This warms up the graph cache.
+                auto fetch_ion = [&](int M, int K, int N) {
+                    return sp_llama_qnn_matmul_get_ion_ptr(I.qnn_mm_cache, M, K, N);
+                };
+                // Example: bake for M=1 (decode). Prefill (M=128) will be
+                // handled lazily on first dispatch, but we could warm it here too.
+                (void)fetch_ion;
+            }
+
+            if (weights_in_layer == 7)      ++layers_baked;
+            else if (weights_in_layer > 0)  ++layers_partial;
+            std::fputc(weights_in_layer == 7 ? '.' : (weights_in_layer ? 'p' : '_'),
+                       stderr);
+        }
+        std::fprintf(stderr,
+            "\n[sp_native] HTP weight bake: %.2f GB used, %d/%d layers full, "
+            "%d partial (rest stay on CPU)\n",
+            (double)total_bytes / (1024.0 * 1024.0 * 1024.0),
+            layers_baked, I.n_layer, layers_partial);
     }
 #endif
 

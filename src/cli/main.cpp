@@ -15,6 +15,20 @@
 #include "tokenizer.h"
 #include "vocab.h"
 
+#if defined(SP_ENGINE_WITH_QNN)
+#include "qnn_bin_driver.h"
+#include "speculative_oracle.h"
+#endif
+
+#if defined(SP_ENGINE_HEXAGON_FASTRPC)
+extern "C" {
+#include "shannon_prime_hexagon.h"
+#include "rpcmem.h"
+}
+#endif
+
+#include <httplib.h>
+
 extern "C" {
 #include "shannon_prime.h"
 }
@@ -1492,6 +1506,322 @@ int main(int argc, char** argv) {
         return 0;
     }
 
+#if defined(SP_ENGINE_WITH_QNN)
+    // Phase 5.0: prefill bench against AI Hub-compiled V69 .bins,
+    // mirroring lib/shannon-prime/backends/qnn_aihub/sp_qnn_runner/
+    // test_sp_qnn_prefill_batch.c — but called from sp-engine so the
+    // same load+exec lifecycle runs from inside the engine binary.
+    //   sp-engine qnn_bin_bench [--n-chunks N] split1 split2 split3 split4
+    if (cmd == "qnn_bin_bench") {
+        int n_chunks = 3;
+        std::vector<std::string> splits;
+        for (int i = 2; i < argc; ++i) {
+            std::string a = argv[i];
+            if (a == "--n-chunks" && i + 1 < argc) n_chunks = std::atoi(argv[++i]);
+            else splits.emplace_back(std::move(a));
+        }
+        if (splits.size() != 4) {
+            std::fprintf(stderr,
+                "qnn_bin_bench: expects exactly 4 split paths, got %zu\n",
+                splits.size());
+            return 1;
+        }
+        return sp::engine::qnn_bin_prefill_bench(splits, n_chunks);
+    }
+
+    // Phase 5.1: schema dump for the .bins. Prints input/output
+    // tensor name+dtype+rank+dims for each split — needed to identify
+    // which input is tokens, which is position_ids, which is residual,
+    // which is KV cache, before wiring real prompts in Phase 5.2.
+    //   sp-engine qnn_bin_schema split1 [split2 ...]
+    if (cmd == "qnn_bin_schema") {
+        std::vector<std::string> splits;
+        for (int i = 2; i < argc; ++i) splits.emplace_back(argv[i]);
+        if (splits.empty()) {
+            std::fprintf(stderr,
+                "qnn_bin_schema: expects at least 1 split path\n");
+            return 1;
+        }
+        return sp::engine::qnn_bin_schema_dump(splits);
+    }
+
+    // Phase 5.2: real prompt → next token through the .bin chain.
+    //   sp-engine qnn_bin_run --tokenizer <gguf> --prompt "..." \
+    //                         [--ar 128] [--cl 2048] [--head-dim 128] \
+    //                         [--rope-base 1000000] \
+    //                         split1 split2 split3 split4
+    if (cmd == "qnn_bin_run") {
+        std::string tok_path, prompt;
+        int   ar = 128, cl = 2048, hd = 128;
+        float rope_base = 1000000.0f;
+        std::vector<std::string> splits;
+        for (int i = 2; i < argc; ++i) {
+            std::string a = argv[i];
+            if      (a == "--tokenizer" && i + 1 < argc) tok_path = argv[++i];
+            else if (a == "--prompt"    && i + 1 < argc) prompt   = argv[++i];
+            else if (a == "--ar"        && i + 1 < argc) ar = std::atoi(argv[++i]);
+            else if (a == "--cl"        && i + 1 < argc) cl = std::atoi(argv[++i]);
+            else if (a == "--head-dim"  && i + 1 < argc) hd = std::atoi(argv[++i]);
+            else if (a == "--rope-base" && i + 1 < argc) rope_base = (float)std::atof(argv[++i]);
+            else splits.emplace_back(std::move(a));
+        }
+        if (tok_path.empty() || prompt.empty() || splits.size() != 4) {
+            std::fprintf(stderr,
+                "qnn_bin_run: needs --tokenizer <gguf> --prompt <text> "
+                "and exactly 4 split paths\n");
+            return 1;
+        }
+
+        // Load model just for vocab/tokenizer.
+        auto m = sp::engine::Model::load(tok_path);
+        if (!m) { std::fprintf(stderr, "Model::load failed\n"); return 2; }
+        auto v  = sp::engine::Vocab::load(*m);
+        auto tk = v ? sp::engine::Tokenizer::create(*v) : nullptr;
+        if (!tk) { std::fprintf(stderr, "tokenizer init failed\n"); return 3; }
+
+        std::vector<int32_t> ids;
+        tk->encode(prompt, /*add_bos=*/true, ids);
+        std::fprintf(stderr,
+            "[qnn_bin_run] prompt encoded to %zu tokens (ar=%d, cl=%d)\n",
+            ids.size(), ar, cl);
+
+        int next_id = -1;
+        const int rc = sp::engine::qnn_bin_generate_one(
+            splits, ids, ar, cl, hd, rope_base, &next_id);
+        if (rc != 0) {
+            std::fprintf(stderr, "qnn_bin_generate_one failed rc=%d\n", rc);
+            return 4;
+        }
+
+        // Decode the predicted token back to text.
+        const std::string next_text = tk->decode({next_id});
+        std::fprintf(stderr,
+            "[qnn_bin_run] next token id=%d text='%s'\n",
+            next_id, next_text.c_str());
+        std::printf("PROMPT: %s\nNEXT  : %s (id=%d)\n",
+                    prompt.c_str(), next_text.c_str(), next_id);
+        return 0;
+    }
+
+    // Phase 8: speculative oracle benchmark.
+    //   sp-engine qnn_oracle_bench
+    //     --tokenizer  <main_gguf>
+    //     --oracle     <draft_gguf>
+    //     --prompt     <text>
+    //     [--n-predict N]   (default 64)
+    //     [--ar 128] [--cl 2048] [--head-dim 2560] [--rope-base 1000000]
+    //     split1 split2 split3 split4
+    //
+    // Runs QnnBinSession::generate() with the draft oracle attached.
+    // Prints oracle accuracy and token-per-second stats.
+    if (cmd == "qnn_oracle_bench") {
+        std::string tok_path, oracle_path, prompt;
+        int   ar = 128, cl = 2048, hd = 2560, n_predict = 64;
+        float rope_base = 1000000.0f;
+        std::vector<std::string> splits;
+        for (int i = 2; i < argc; ++i) {
+            std::string a = argv[i];
+            if      (a == "--tokenizer"  && i + 1 < argc) tok_path     = argv[++i];
+            else if (a == "--oracle"     && i + 1 < argc) oracle_path  = argv[++i];
+            else if (a == "--prompt"     && i + 1 < argc) prompt       = argv[++i];
+            else if (a == "--n-predict"  && i + 1 < argc) n_predict    = std::atoi(argv[++i]);
+            else if (a == "--ar"         && i + 1 < argc) ar           = std::atoi(argv[++i]);
+            else if (a == "--cl"         && i + 1 < argc) cl           = std::atoi(argv[++i]);
+            else if (a == "--head-dim"   && i + 1 < argc) hd           = std::atoi(argv[++i]);
+            else if (a == "--rope-base"  && i + 1 < argc) rope_base    = (float)std::atof(argv[++i]);
+            else splits.emplace_back(std::move(a));
+        }
+        if (tok_path.empty() || prompt.empty() || splits.size() != 4) {
+            std::fprintf(stderr,
+                "qnn_oracle_bench: needs --tokenizer <gguf> --prompt <text> "
+                "and exactly 4 split paths\n"
+                "  optional: --oracle <draft_gguf>  --n-predict N\n");
+            return 1;
+        }
+
+        // Tokenize the prompt.
+        auto m  = sp::engine::Model::load(tok_path);
+        if (!m) { std::fprintf(stderr, "Model::load failed: %s\n", tok_path.c_str()); return 2; }
+        auto v  = sp::engine::Vocab::load(*m);
+        auto tk = v ? sp::engine::Tokenizer::create(*v) : nullptr;
+        if (!tk) { std::fprintf(stderr, "tokenizer init failed\n"); return 3; }
+        std::vector<int32_t> ids;
+        tk->encode(prompt, /*add_bos=*/true, ids);
+        std::fprintf(stderr, "[qnn_oracle_bench] prompt: %zu tokens, n_predict=%d\n",
+                     ids.size(), n_predict);
+
+        // Load HTP session.
+        sp::engine::QnnBinSession session;
+        if (session.load(splits, ar, cl, hd, rope_base) != 0) {
+            std::fprintf(stderr, "[qnn_oracle_bench] QnnBinSession::load failed\n");
+            return 4;
+        }
+
+        // Optionally load oracle.
+        sp::engine::SpOracle oracle;
+        if (!oracle_path.empty()) {
+            int orc = oracle.load(oracle_path.c_str());
+            if (orc != 0) {
+                std::fprintf(stderr, "[qnn_oracle_bench] oracle load failed (rc=%d) "
+                             "— continuing without oracle\n", orc);
+            } else {
+                session.set_oracle(&oracle);
+                std::fprintf(stderr, "[qnn_oracle_bench] oracle attached: %s\n",
+                             oracle_path.c_str());
+            }
+        } else {
+            std::fprintf(stderr, "[qnn_oracle_bench] no --oracle given — "
+                         "running baseline HTP-only decode\n");
+        }
+
+        // Run generation, timed.
+        std::vector<int32_t> out_ids;
+        auto t0 = std::chrono::steady_clock::now();
+        int grc = session.generate(ids, n_predict, out_ids);
+        auto t1 = std::chrono::steady_clock::now();
+
+        if (grc != 0) {
+            std::fprintf(stderr, "[qnn_oracle_bench] generate failed rc=%d\n", grc);
+            return 5;
+        }
+
+        double elapsed = std::chrono::duration<double>(t1 - t0).count();
+        double tps     = (double)out_ids.size() / std::max(elapsed, 1e-9);
+
+        std::string gen_text = tk->decode(out_ids);
+        std::printf("PROMPT : %s\nOUTPUT : %s\n", prompt.c_str(), gen_text.c_str());
+        std::fprintf(stderr, "[qnn_oracle_bench] generated %zu tokens in %.3fs = %.1f tok/s\n",
+                     out_ids.size(), elapsed, tps);
+
+        if (!oracle_path.empty() && oracle.n_total() > 0) {
+            std::fprintf(stderr,
+                "[qnn_oracle_bench] oracle accuracy: %.1f%% (%d/%d) — "
+                "effective spec speedup estimate: %.2fx\n",
+                oracle.accuracy() * 100.f, oracle.n_hits(), oracle.n_total(),
+                // Expected tokens per step with p=accuracy, K=SP_ORACLE_DRAFT_N:
+                // sum_{k=0}^{K} p^k = (1 - p^{K+1}) / (1 - p)
+                [&]() -> double {
+                    float p = oracle.accuracy();
+                    int K   = sp::engine::SP_ORACLE_DRAFT_N;
+                    if (p >= 1.0f) return (double)(K + 1);
+                    double sum = 0.0;
+                    double pk  = 1.0;
+                    for (int k = 0; k <= K; ++k) { sum += pk; pk *= (double)p; }
+                    return sum;
+                }());
+        }
+        return 0;
+    }
+
+    // Phase 8: full multi-token decode via QnnBinSession.
+    //   sp-engine qnn_bin_generate
+    //     --tokenizer  <gguf>
+    //     --prompt     <text>
+    //     [--n-predict N]  (default 128)
+    //     [--ar 128] [--cl 2048] [--head-dim 2560] [--rope-base 1000000]
+    //     split1 split2 split3 split4
+    if (cmd == "qnn_bin_generate") {
+        std::string tok_path, prompt;
+        int   ar = 128, cl = 2048, hd = 2560, n_predict = 128;
+        float rope_base = 1000000.0f;
+        std::vector<std::string> splits;
+        for (int i = 2; i < argc; ++i) {
+            std::string a = argv[i];
+            if      (a == "--tokenizer" && i + 1 < argc) tok_path  = argv[++i];
+            else if (a == "--prompt"    && i + 1 < argc) prompt    = argv[++i];
+            else if (a == "--n-predict" && i + 1 < argc) n_predict = std::atoi(argv[++i]);
+            else if (a == "--ar"        && i + 1 < argc) ar        = std::atoi(argv[++i]);
+            else if (a == "--cl"        && i + 1 < argc) cl        = std::atoi(argv[++i]);
+            else if (a == "--head-dim"  && i + 1 < argc) hd        = std::atoi(argv[++i]);
+            else if (a == "--rope-base" && i + 1 < argc) rope_base = (float)std::atof(argv[++i]);
+            else splits.emplace_back(std::move(a));
+        }
+        if (tok_path.empty() || prompt.empty() || splits.size() != 4) {
+            std::fprintf(stderr,
+                "qnn_bin_generate: needs --tokenizer <gguf> --prompt <text> "
+                "and exactly 4 split paths\n");
+            return 1;
+        }
+        auto m  = sp::engine::Model::load(tok_path);
+        if (!m) { std::fprintf(stderr, "Model::load failed\n"); return 2; }
+        auto v  = sp::engine::Vocab::load(*m);
+        auto tk = v ? sp::engine::Tokenizer::create(*v) : nullptr;
+        if (!tk) { std::fprintf(stderr, "tokenizer init failed\n"); return 3; }
+        std::vector<int32_t> ids;
+        tk->encode(prompt, /*add_bos=*/true, ids);
+
+        sp::engine::QnnBinSession session;
+        if (session.load(splits, ar, cl, hd, rope_base) != 0) return 4;
+
+        std::vector<int32_t> out_ids;
+        auto t0 = std::chrono::steady_clock::now();
+        int grc = session.generate(ids, n_predict, out_ids);
+        auto t1 = std::chrono::steady_clock::now();
+        if (grc != 0) {
+            std::fprintf(stderr, "qnn_bin_generate failed rc=%d\n", grc);
+            return 5;
+        }
+        double elapsed = std::chrono::duration<double>(t1 - t0).count();
+        std::string gen = tk->decode(out_ids);
+        std::printf("PROMPT : %s\nOUTPUT : %s\n", prompt.c_str(), gen.c_str());
+        std::fprintf(stderr, "[qnn_bin_generate] %zu tokens in %.3fs = %.1f tok/s\n",
+                     out_ids.size(), elapsed,
+                     (double)out_ids.size() / std::max(elapsed, 1e-9));
+        return 0;
+    }
+#endif  // SP_ENGINE_WITH_QNN
+
+#if defined(SP_ENGINE_HEXAGON_FASTRPC)
+    // Phase 7B: raw DMA probe via dmaWrapper.h.
+    //   sp-engine qnn_probe_dma [--bytes N]
+    // Allocates an rpcmem buffer of N bytes (default 1 MB), fills it with a
+    // known pattern, and calls sp_hexagon_probe_dma_raw. Prints the result
+    // code and transfer time. Exit 0 = DMA engine accepted; non-zero = blocked.
+    if (cmd == "qnn_probe_dma") {
+        int probe_bytes = 1024 * 1024;  // 1 MB default
+        for (int i = 2; i < argc; ++i) {
+            std::string a = argv[i];
+            if (a == "--bytes" && i + 1 < argc) probe_bytes = std::atoi(argv[++i]);
+        }
+        if (probe_bytes <= 0 || (probe_bytes & 1)) {
+            std::fprintf(stderr, "qnn_probe_dma: --bytes must be a positive even integer\n");
+            return 1;
+        }
+
+        rpcmem_init();
+        void *buf = rpcmem_alloc(RPCMEM_HEAP_ID_SYSTEM, RPCMEM_DEFAULT_FLAGS, probe_bytes);
+        if (!buf) {
+            std::fprintf(stderr, "qnn_probe_dma: rpcmem_alloc(%d) failed\n", probe_bytes);
+            return 1;
+        }
+
+        // Fill with known pattern so we can verify correctness on pass.
+        uint8_t *b = (uint8_t *)buf;
+        for (int i = 0; i < probe_bytes; ++i) b[i] = (uint8_t)(i & 0xFF);
+
+        int result = 0, timing_us = -1;
+        int rpc = sp_hexagon_probe_dma_raw(buf, probe_bytes, &result, &timing_us);
+
+        rpcmem_free(buf);
+        rpcmem_deinit();
+
+        if (rpc == 0 && result == 0) {
+            std::printf("[qnn_probe_dma] PASS: DMA engine accepted raw bytes. "
+                        "bytes=%d timing_us=%d\n", probe_bytes, timing_us);
+            return 0;
+        } else if (result == 0x4E) {
+            std::printf("[qnn_probe_dma] BLOCKED: DMA engine inaccessible in unsigned PD "
+                        "(0x4E EPERM — same as Halide DMA result). "
+                        "Weight streaming requires signed PD / testsig.\n");
+            return 2;  // distinct from general failure (1) — caller can check
+        } else {
+            std::printf("[qnn_probe_dma] FAIL: rpc=%d result=%d timing_us=%d\n",
+                        rpc, result, timing_us);
+            return 1;
+        }
+    }
+#endif  // SP_ENGINE_HEXAGON_FASTRPC
+
     // `run` is dispatched here (before the global flag parser) so its
     // verb-local flags — --n-predict in particular — aren't rejected as
     // unknown by the strict global parser below. Same pattern as cache_ppl,
@@ -1569,6 +1899,7 @@ int main(int argc, char** argv) {
         std::string host = "0.0.0.0";
         int port = 8082;
         std::string model_id;
+        std::string www_root;
         for (int i = 2; i < argc; ++i) {
             std::string a = argv[i];
             if      (a == "--model" && i + 1 < argc) rcfg.model_path = argv[++i];
@@ -1576,6 +1907,7 @@ int main(int argc, char** argv) {
             else if (a == "--host"  && i + 1 < argc) host             = argv[++i];
             else if (a == "--port"  && i + 1 < argc) port             = std::atoi(argv[++i]);
             else if (a == "--name"  && i + 1 < argc) model_id         = argv[++i];
+            else if (a == "--www"   && i + 1 < argc) www_root         = argv[++i];
             else if (a.size() >= 2 && a[0] == '-' && a[1] == '-') {
                 std::fprintf(stderr, "serve: unknown flag %s\n", a.c_str()); return 2;
             }
@@ -1600,8 +1932,94 @@ int main(int argc, char** argv) {
         }
         std::fprintf(stderr, "[sp-engine:serve] model loaded; binding HTTP server\n");
         sp::engine::HttpServer server;
-        server.bind(&engine, model_id);
+        server.bind(&engine, model_id, www_root);
         return server.listen_and_serve(host, port);
+    }
+
+    if (cmd == "qnn_bin_serve") {
+        std::string tok_path, host = "0.0.0.0", model_id = "shannon-prime-htp", www_root;
+        int port = 8080, ar = 128, cl = 2048, hd = 2560;
+        float rope_base = 1000000.0f;
+        std::vector<std::string> splits;
+        for (int i = 2; i < argc; ++i) {
+            std::string a = argv[i];
+            if      (a == "--tokenizer" && i + 1 < argc) tok_path = argv[++i];
+            else if (a == "--host"      && i + 1 < argc) host     = argv[++i];
+            else if (a == "--port"      && i + 1 < argc) port     = std::atoi(argv[++i]);
+            else if (a == "--name"      && i + 1 < argc) model_id = argv[++i];
+            else if (a == "--www"       && i + 1 < argc) www_root = argv[++i];
+            else if (a == "--ar"        && i + 1 < argc) ar = std::atoi(argv[++i]);
+            else if (a == "--cl"        && i + 1 < argc) cl = std::atoi(argv[++i]);
+            else if (a == "--head-dim"  && i + 1 < argc) hd = std::atoi(argv[++i]);
+            else if (a == "--rope-base" && i + 1 < argc) rope_base = (float)std::atof(argv[++i]);
+            else splits.push_back(std::move(a));
+        }
+        if (tok_path.empty() || splits.size() != 4) {
+            std::fprintf(stderr, "qnn_bin_serve: needs --tokenizer <gguf> and 4 split paths\n");
+            return 1;
+        }
+        sp::engine::QnnBinSession session;
+        if (session.load(splits, ar, cl, hd, rope_base) != 0) return 2;
+
+        // Load tokenizer
+        auto m = sp::engine::Model::load(tok_path);
+        auto v = m ? sp::engine::Vocab::load(*m) : nullptr;
+        auto tk = v ? sp::engine::Tokenizer::create(*v) : nullptr;
+        if (!tk) { std::fprintf(stderr, "tokenizer init failed\n"); return 3; }
+
+        httplib::Server svr;
+        // CORS
+        svr.set_pre_routing_handler([](const httplib::Request& req, httplib::Response& res) {
+            res.set_header("Access-Control-Allow-Origin", "*");
+            res.set_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+            res.set_header("Access-Control-Allow-Headers", "Content-Type, Authorization");
+            if (req.method == "OPTIONS") { res.status = 204; return httplib::Server::HandlerResponse::Handled; }
+            return httplib::Server::HandlerResponse::Unhandled;
+        });
+
+        if (!www_root.empty()) {
+            std::fprintf(stderr, "[qnn_bin_serve] serving static files from %s\n", www_root.c_str());
+            svr.set_mount_point("/", www_root);
+        }
+
+        svr.Get("/v1/models", [&](const httplib::Request&, httplib::Response& res) {
+            res.set_content("{\"data\":[{\"id\":\"" + model_id + "\",\"object\":\"model\"}]}", "application/json");
+        });
+
+        svr.Post("/v1/chat/completions", [&](const httplib::Request& req, httplib::Response& res) {
+            // Minimal ChatML extraction for testing
+            size_t p = req.body.find("\"content\":");
+            if (p == std::string::npos) {
+                res.status = 400; res.set_content("{\"error\":\"missing content\"}", "application/json");
+                return;
+            }
+            size_t q = req.body.find("\"", p + 10);
+            size_t r = req.body.find("\"", q + 1);
+            std::string prompt = req.body.substr(q + 1, r - q - 1);
+
+            std::vector<int32_t> ids, out_ids;
+            tk->encode(prompt, true, ids);
+            std::fprintf(stderr, "[qnn_bin_serve] generating for %zu tokens...\n", ids.size());
+            
+            // Note: generate() in QnnBinSession currently needs to be implemented
+            // to use the persistent splits. For this test, we'll use a 1-token 
+            // placeholder or ensure generate() is fully wired.
+            session.generate(ids, 128, out_ids);
+            
+            std::string text = tk->decode(out_ids);
+            std::string escaped; 
+            for (char c : text) {
+                if (c == '"') escaped += "\\\"";
+                else if (c == '\n') escaped += "\\n";
+                else escaped += c;
+            }
+
+            res.set_content("{\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"" + escaped + "\"}}]}", "application/json");
+        });
+
+        std::fprintf(stderr, "[qnn_bin_serve] listening on %s:%d\n", host.c_str(), port);
+        svr.listen(host, port);
+        return 0;
     }
 
     // Flag parser — extracts known flags and stashes positional args in `rest`.

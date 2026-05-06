@@ -92,6 +92,25 @@ static int matmul_fp32_lhs(const float* lhs, const void* W, sp_dtype W_dtype,
     }
 }
 
+// Phase 4.13: dense weight matmul with optional HTP dispatch. Tries
+// layer.mm_dispatch + the matching fp16 weight first; falls through
+// to CPU matmul_fp32_lhs on hook absence or non-zero return. The fp16
+// weight is [K, N] layout (transposed at bind time vs GGUF [N, K]),
+// matching QNN's MatMul B-tensor expectation.
+static int weight_matmul(const ForwardNativeLayer& layer,
+                          const float* lhs,
+                          const void* W_quant, sp_dtype W_dtype,
+                          const uint16_t* W_fp16,
+                          int m, int k, int n, float* out) {
+    if (W_fp16 && layer.mm_dispatch) {
+        const int rc = layer.mm_dispatch(layer.mm_dispatch_userdata,
+                                         lhs, W_fp16, m, k, n, out);
+        if (rc == 0) return 0;
+        // Hook returned an error — fall through to CPU.
+    }
+    return matmul_fp32_lhs(lhs, W_quant, W_dtype, m, k, n, out);
+}
+
 // ─────────────────────────────────────────────────────────────────
 // Attention block
 // ─────────────────────────────────────────────────────────────────
@@ -162,12 +181,12 @@ int forward_native_attention(const ForwardNativeLayer&   layer,
     float* V = arena_f32(arena, (size_t)n_kv_dim * n_seq);
     if (!Q || !K || !V) return -2;
 
-    if (matmul_fp32_lhs(xn, layer.wq, layer.wq_dtype,
-                         n_seq, n_embd, n_q_dim,  Q) != 0) return -3;
-    if (matmul_fp32_lhs(xn, layer.wk, layer.wk_dtype,
-                         n_seq, n_embd, n_kv_dim, K) != 0) return -3;
-    if (matmul_fp32_lhs(xn, layer.wv, layer.wv_dtype,
-                         n_seq, n_embd, n_kv_dim, V) != 0) return -3;
+    if (weight_matmul(layer, xn, layer.wq, layer.wq_dtype, layer.wq_fp16,
+                       n_seq, n_embd, n_q_dim,  Q) != 0) return -3;
+    if (weight_matmul(layer, xn, layer.wk, layer.wk_dtype, layer.wk_fp16,
+                       n_seq, n_embd, n_kv_dim, K) != 0) return -3;
+    if (weight_matmul(layer, xn, layer.wv, layer.wv_dtype, layer.wv_fp16,
+                       n_seq, n_embd, n_kv_dim, V) != 0) return -3;
 
     // Apply Q/K/V biases when present (Qwen2 has them; Qwen3 omits).
     sp_bias_add_f32_rows(Q, layer.bq, n_q_dim,  n_seq);
@@ -424,8 +443,8 @@ int forward_native_attention(const ForwardNativeLayer&   layer,
     // contiguous over n_q_dim). wo: [n_embd, n_q_dim] → out[n_embd,
     // n_seq]. Same matmul shape as Q/K/V proj just with different
     // dims. lhs[n_seq, n_q_dim], W[n_embd, n_q_dim], out[n_seq, n_embd].
-    if (matmul_fp32_lhs(attn_out, layer.wo, layer.wo_dtype,
-                         n_seq, n_q_dim, n_embd, out_residual) != 0) return -3;
+    if (weight_matmul(layer, attn_out, layer.wo, layer.wo_dtype, layer.wo_fp16,
+                       n_seq, n_q_dim, n_embd, out_residual) != 0) return -3;
     sp_bias_add_f32_rows(out_residual, layer.bo, n_embd, n_seq);
     return 0;
 }
@@ -457,15 +476,18 @@ int forward_native_ffn(const ForwardNativeLayer&   layer,
     sp_rms_norm_f32_rows(x, layer.ffn_norm,
                          n_embd, n_seq, hp.rms_norm_eps, xn);
 
-    if (matmul_fp32_lhs(xn, layer.ffn_gate, layer.ffn_gate_dtype,
-                         n_seq, n_embd, n_ff, gate) != 0) return -3;
-    if (matmul_fp32_lhs(xn, layer.ffn_up, layer.ffn_up_dtype,
-                         n_seq, n_embd, n_ff, up) != 0) return -3;
+    if (weight_matmul(layer, xn, layer.ffn_gate, layer.ffn_gate_dtype,
+                       layer.ffn_gate_fp16,
+                       n_seq, n_embd, n_ff, gate) != 0) return -3;
+    if (weight_matmul(layer, xn, layer.ffn_up, layer.ffn_up_dtype,
+                       layer.ffn_up_fp16,
+                       n_seq, n_embd, n_ff, up) != 0) return -3;
 
     sp_silu_mul_f32(gate, up, n_seq * n_ff, h);
 
-    if (matmul_fp32_lhs(h, layer.ffn_down, layer.ffn_down_dtype,
-                         n_seq, n_ff, n_embd, out_residual) != 0) return -3;
+    if (weight_matmul(layer, h, layer.ffn_down, layer.ffn_down_dtype,
+                       layer.ffn_down_fp16,
+                       n_seq, n_ff, n_embd, out_residual) != 0) return -3;
     return 0;
 }
 

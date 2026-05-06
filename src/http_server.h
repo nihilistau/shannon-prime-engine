@@ -26,8 +26,9 @@ public:
     ~HttpServer();
 
     // Bind to the given engine (must outlive the server). Engine::load
-    // should already have been called.
-    void bind(Engine* engine, const std::string& model_name);
+    // should already have been called. web_root is the directory to serve
+    // static files from (optional).
+    void bind(Engine* engine, const std::string& model_name, const std::string& web_root = "");
 
     // Start listening on host:port. Blocks until stop() is called from
     // another thread or the process exits. Returns 0 on clean shutdown,

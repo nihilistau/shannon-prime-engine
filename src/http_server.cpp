@@ -261,6 +261,7 @@ static std::string strip_chatml_tail(const std::string& s) {
 struct HttpServer::Impl {
     Engine*               engine = nullptr;
     std::string           model_name;
+    std::string           web_root;
     httplib::Server       svr;
     std::atomic<bool>     running{false};
 };
@@ -268,9 +269,10 @@ struct HttpServer::Impl {
 HttpServer::HttpServer() : impl_(std::make_unique<Impl>()) {}
 HttpServer::~HttpServer() = default;
 
-void HttpServer::bind(Engine* engine, const std::string& model_name) {
+void HttpServer::bind(Engine* engine, const std::string& model_name, const std::string& web_root) {
     impl_->engine = engine;
     impl_->model_name = model_name;
+    impl_->web_root = web_root;
 }
 
 int HttpServer::listen_and_serve(const std::string& host, int port) {
@@ -281,6 +283,27 @@ int HttpServer::listen_and_serve(const std::string& host, int port) {
 
     Engine* engine = impl_->engine;
     const std::string& model_name = impl_->model_name;
+    const std::string& web_root   = impl_->web_root;
+
+    // ── Static files ──────────────────────────────────────────────
+    if (!web_root.empty()) {
+        std::fprintf(stderr, "[sp-engine:http] serving static files from %s\n", web_root.c_str());
+        impl_->svr.set_mount_point("/", web_root);
+    }
+
+    // ── CORS — allow any origin so the frontend can connect from
+    //    file:// or a different dev-server port. ───────────────────
+    impl_->svr.set_pre_routing_handler(
+        [](const httplib::Request& req, httplib::Response& res) -> httplib::Server::HandlerResponse {
+            res.set_header("Access-Control-Allow-Origin", "*");
+            res.set_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+            res.set_header("Access-Control-Allow-Headers", "Content-Type, Authorization");
+            if (req.method == "OPTIONS") {
+                res.status = 204;
+                return httplib::Server::HandlerResponse::Handled;
+            }
+            return httplib::Server::HandlerResponse::Unhandled;
+        });
 
     // ── Health ────────────────────────────────────────────────────
     impl_->svr.Get("/health", [](const httplib::Request&, httplib::Response& res) {
