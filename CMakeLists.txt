@@ -119,17 +119,35 @@ set(SP_CORE_SRC
     ${SP_CORE_DIR}/backends/crt/sp_crt.c
     ${SP_CORE_DIR}/backends/crt/sp_crt_dispatch.c
     ${SP_CORE_DIR}/backends/crt/sp_theoretical.c)
-# When CUDA is OFF, link stubs for the CRT CUDA/Vulkan symbols so the
+# When CUDA is OFF, link stubs for the CRT CUDA symbols so the
 # pure-C dispatch code resolves without the real .cu implementations.
 if(NOT SP_ENGINE_WITH_CUDA)
     list(APPEND SP_CORE_SRC ${SP_CORE_DIR}/backends/crt/sp_crt_cuda_stub.c)
+endif()
+
+# CRT Vulkan compute dispatch (Ring M2 on Intel UHD / any Vulkan GPU).
+# Compiled when Vulkan SDK is available — links vulkan-1.lib.
+if(SP_ENGINE_WITH_VULKAN OR SP_ENGINE_BEAST_VULKAN)
+    list(APPEND SP_CORE_SRC ${SP_CORE_DIR}/backends/crt/sp_crt_vulkan.c)
 endif()
 add_library(shannon_prime_core STATIC ${SP_CORE_SRC})
 target_include_directories(shannon_prime_core PUBLIC
     ${SP_CORE_DIR}/core
     ${SP_CORE_DIR}/backends/crt
+    ${SP_CORE_DIR}/backends/beast_canyon
     ${CMAKE_SOURCE_DIR}/vendor/ggml/include)
 target_compile_features(shannon_prime_core PUBLIC c_std_11)
+
+# Vulkan headers + library for CRT Vulkan dispatch
+if(SP_ENGINE_WITH_VULKAN OR SP_ENGINE_BEAST_VULKAN)
+    find_package(Vulkan QUIET)
+    if(Vulkan_FOUND)
+        target_include_directories(shannon_prime_core PUBLIC ${Vulkan_INCLUDE_DIRS})
+        target_link_libraries(shannon_prime_core PUBLIC Vulkan::Vulkan)
+        target_compile_definitions(shannon_prime_core PUBLIC SP_WITH_VULKAN)
+        message(STATUS "Shannon-Prime CRT Vulkan: ON (${Vulkan_LIBRARY})")
+    endif()
+endif()
 if(MSVC)
     target_compile_options(shannon_prime_core PRIVATE /W3)
 else()
