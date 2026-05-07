@@ -83,6 +83,9 @@ Device                   = S22 Ultra (SM8450 / Waipio / Hexagon V69)
   - [x] Dual-GPU auto-detection: RTX 2060 (12 GB CUDA) + Intel UHD (16 GB Vulkan)
   - [x] CUDA stream/event + Vulkan instance auto-provisioned at boot
   - [x] MinGW cudart linkage: gendef+dlltool import lib from DLL (no nvcc needed)
+  - [x] MSVC+CUDA build complete: 131 targets (SM75 .cu kernels + ggml-cuda.dll)
+  - [ ] CRT model-level test: BLOCKED — build-cuda missing ggml-base.dll (shared lib not output)
+  - [ ] Need VS developer shell rebuild with CMAKE_RUNTIME_OUTPUT_DIRECTORY fix
 - [x] CLI unified flag parser -- all verbs accept all engine Config flags (a379442)
 - [x] Prefill (single forward pass, 4 splits) -- works every time
 - [ ] **Decode (multi-token generation) -- BLOCKED by 5th-execute hang**
