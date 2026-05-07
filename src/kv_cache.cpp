@@ -1724,15 +1724,25 @@ int KvCache::load_from_disk(const std::string& prefix, uint64_t expected_hash) {
 int KvCache::load_from_disk_partial(const std::string& prefix,
                                      uint64_t expected_hash,
                                      int max_bands) {
-    // Currently only the shadow (ship) cache has v3 / partial support.
-    // sqfree and hier still use v2 per-vec layout — partial reads on
-    // those routes are deferred to follow-up work. Fall back to a full
-    // load with a one-shot warning.
-    if (impl_->hier_inited || impl_->sq_inited) {
+    // Hierarchical cache: partial load via skeleton band limiting.
+    // The full blob is loaded from disk, but max_skel_bands is set on the
+    // cache so that subsequent reads use sp_band_dequantize_partial,
+    // zeroing higher skeleton bands for reduced-fidelity reconstruction.
+    if (impl_->hier_inited) {
+        int rc = sp_hier_cache_load_partial(&impl_->hier, prefix.c_str(),
+                                             expected_hash, max_bands);
+        if (rc >= 0) {
+            std::fprintf(stderr,
+                "[sp-engine] cache loaded (partial): hierarchical n_pos=%d "
+                "max_skel_bands=%d prefix=%s\n", rc, max_bands, prefix.c_str());
+        }
+        return rc;
+    }
+    // sqfree still uses v2 layout — partial reads deferred.
+    if (impl_->sq_inited) {
         std::fprintf(stderr,
-            "[sp-engine] load_from_disk_partial: %s cache uses v2 layout; "
-            "max_bands=%d ignored, falling back to full load\n",
-            impl_->hier_inited ? "hierarchical" : "sqfree", max_bands);
+            "[sp-engine] load_from_disk_partial: sqfree cache uses v2 layout; "
+            "max_bands=%d ignored, falling back to full load\n", max_bands);
         return load_from_disk(prefix, expected_hash);
     }
     if (!impl_->shadow_inited) {

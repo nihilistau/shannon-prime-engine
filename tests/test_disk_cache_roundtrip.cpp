@@ -288,7 +288,7 @@ int main() {
             return 1;
         }
 
-        const int max_bands = 2;   // K is 5/5/4/3 → bands 2 and 3 zeroed
+        const int max_bands = 1;   // hier skeleton defaults to {5,5} (2 bands) → band 1 zeroed
         const int loaded = cache->load_from_disk_partial(prefix, model_hash, max_bands);
         if (loaded != n_pos) {
             std::fprintf(stderr,
@@ -310,11 +310,11 @@ int main() {
             if (exactly_equal(K_partial, ref_K[il])) {
                 std::fprintf(stderr,
                     "disk_cache: layer %d K partial-load matched full reference exactly — "
-                    "bands 2-3 didn't get zeroed\n", il);
+                    "higher skeleton bands didn't get zeroed\n", il);
                 return 1;
             }
 
-            // Sub-property B: NOT all-zero (bands 0+1 carried real signal)
+            // Sub-property B: NOT all-zero (band 0 carried real signal)
             bool any_nonzero = false;
             for (float v : K_partial) {
                 if (std::fabs(v) > 1e-6f) { any_nonzero = true; break; }
@@ -322,7 +322,7 @@ int main() {
             if (!any_nonzero) {
                 std::fprintf(stderr,
                     "disk_cache: layer %d K partial-load returned all-zero — "
-                    "bands 0+1 didn't reconstruct\n", il);
+                    "band 0 didn't reconstruct\n", il);
                 return 1;
             }
 
