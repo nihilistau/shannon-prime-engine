@@ -308,7 +308,7 @@ int main(int argc, char** argv) {
             else if (a == "--chunks"         && i + 1 < argc) n_chunks          = std::atoi(argv[++i]);
             else if ((a == "--n-gpu-layers" || a == "-ngl") && i + 1 < argc) ngl = std::atoi(argv[++i]);
             else if (a == "--n-gpus"        && i + 1 < argc) cc.n_gpus         = std::atoi(argv[++i]);
-            else if (a == "--sqfree")        cc.sqfree = true;
+            else if (a == "--sqfree")       { cc.sqfree = true; cc.hierarchical = false; }
             else if (a == "--spinor")        { cc.spinor = true; cc.sqfree = true; }
             else if (a == "--no-mobius")     cc.mobius = false;
             else if (a == "--hierarchical") cc.hierarchical = true;
@@ -710,7 +710,7 @@ int main(int argc, char** argv) {
             else if ((a == "--n-gpu-layers" || a == "-ngl") && i + 1 < argc) ngl = std::atoi(argv[++i]);
             else if (a == "--n-gpus"        && i + 1 < argc) pc.n_gpus        = std::atoi(argv[++i]);
             else if (a == "--cache")        use_cache       = true;
-            else if (a == "--sqfree")       pc.sqfree       = true;
+            else if (a == "--sqfree")       { pc.sqfree = true; pc.hierarchical = false; }
             else if (a == "--spinor")       { pc.spinor = true; pc.sqfree = true; }
             else if (a == "--hierarchical") pc.hierarchical = true;
             else if (a == "--no-mobius")    pc.mobius       = false;
@@ -1037,8 +1037,8 @@ int main(int argc, char** argv) {
         std::string text;
         for (int i = 2; i < argc; ++i) {
             std::string a = argv[i];
-            if      (a == "--sqfree")       cc.sqfree = true;
-            else if (a == "--spinor")       { cc.spinor = true; cc.sqfree = true; }
+            if      (a == "--sqfree")       { cc.sqfree = true; cc.hierarchical = false; }
+            else if (a == "--spinor")       { cc.spinor = true; cc.sqfree = true; cc.hierarchical = false; }
             else if (a == "--no-mobius")    cc.mobius  = false;
             else if (a == "--hierarchical") cc.hierarchical = true;
             else if (a == "--naive")        naive      = true;
@@ -1422,8 +1422,8 @@ int main(int argc, char** argv) {
         int hd = 128, n_tokens = 32, n_head_kv = 4, n_layer = 2;
         for (int i = 2; i < argc; ++i) {
             std::string a = argv[i];
-            if      (a == "--sqfree")    kvc.sqfree = true;
-            else if (a == "--spinor")    { kvc.spinor = true; kvc.sqfree = true; }
+            if      (a == "--sqfree")    { kvc.sqfree = true; kvc.hierarchical = false; }
+            else if (a == "--spinor")    { kvc.spinor = true; kvc.sqfree = true; kvc.hierarchical = false; }
             else if (a == "--no-mobius") kvc.mobius = false;
             else if (a == "--hierarchical") kvc.hierarchical = true;
             else if (a == "--head-dim"  && i + 1 < argc) hd        = std::atoi(argv[++i]);
@@ -2493,8 +2493,8 @@ int main(int argc, char** argv) {
             if (a == key && i + 1 < argc) { dst = argv[++i]; return true; }
             return false;
         };
-        if      (a == "--sqfree")       cfg.sqfree = true;
-        else if (a == "--spinor")       cfg.spinor = true;
+        if      (a == "--sqfree")       { cfg.sqfree = true; cfg.hierarchical = false; }
+        else if (a == "--spinor")       { cfg.spinor = true; cfg.sqfree = true; cfg.hierarchical = false; }
         else if (a == "--no-mobius")    cfg.mobius = false;
         else if (a == "--hierarchical") cfg.hierarchical = true;
         else if (next("--model",   cfg.model_path)) {}
