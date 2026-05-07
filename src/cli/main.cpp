@@ -259,6 +259,11 @@ static void usage(const char* prog) {
         "  --hier-skel-bits <csv>  skeleton band bits (default: 5,5)\n"
         "  --hier-ternary-mask <hex>  ternary band mask, e.g. 0x8 for band 3\n"
         "\n"
+        "Main K/V ternary + FP8:\n"
+        "  --ternary-k <hex>    ternary band mask for main K quant\n"
+        "  --ternary-v <hex>    ternary band mask for main V quant\n"
+        "  --fp8                use FP8 (E4M3) for V cache\n"
+        "\n"
         "PrimePE-RoPE-ALiBi:\n"
         "  --pe-mode <name>     standard|primepe|primepe_alibi|alibi (default: standard)\n"
         "  --pe-alpha <f>       blend factor 0..1 (default: 0.0 = identity)\n"
@@ -316,6 +321,11 @@ static int parse_config_flag(sp::engine::Config& cfg, const char* a, const char*
     if (a_eq("--hier-res-bits-v") && has_next) { cfg.hier_res_bits_v = std::atoi(next); return 2; }
     if (a_eq("--hier-skel-bits") && has_next) { cfg.hier_skel_bits = next; return 2; }
     if (a_eq("--hier-ternary-mask") && has_next) { cfg.hier_skel_ternary = (uint32_t)std::strtoul(next, nullptr, 0); return 2; }
+
+    // -- Main K/V ternary + FP8 --
+    if (a_eq("--ternary-k") && has_next) { cfg.k_ternary_mask = (uint32_t)std::stoul(next, nullptr, 0); return 2; }
+    if (a_eq("--ternary-v") && has_next) { cfg.v_ternary_mask = (uint32_t)std::stoul(next, nullptr, 0); return 2; }
+    if (a_eq("--fp8"))                   { cfg.use_fp8 = true; return 1; }
 
     // -- PrimePE / RoPE --
     if (a_eq("--pe-mode") && has_next) {
@@ -1455,6 +1465,9 @@ int main(int argc, char** argv) {
             else if (a == "--hier-res-bits-v" && i + 1 < argc) kvc.hier_res_bits_v = std::atoi(argv[++i]);
             else if (a == "--hier-skel-bits" && i + 1 < argc) kvc.hier_skel_bits = argv[++i];
             else if (a == "--hier-ternary-mask" && i + 1 < argc) kvc.hier_skel_ternary = (uint32_t)std::strtoul(argv[++i], nullptr, 0);
+            else if (a == "--ternary-k" && i + 1 < argc) kvc.k_ternary_mask = (uint32_t)std::stoul(argv[++i], nullptr, 0);
+            else if (a == "--ternary-v" && i + 1 < argc) kvc.v_ternary_mask = (uint32_t)std::stoul(argv[++i], nullptr, 0);
+            else if (a == "--fp8") kvc.use_fp8 = true;
             else { std::fprintf(stderr, "kv_smoke: unknown arg %s\n", a.c_str()); return 2; }
         }
 

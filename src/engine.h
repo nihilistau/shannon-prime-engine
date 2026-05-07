@@ -26,6 +26,9 @@ struct Config {
     int         residual_bits = 3;     // Sqfree residual depth
     std::string k_bits_csv  = "5,5,4,3"; // Per-band K bit allocation
     std::string v_bits_csv  = "3";       // Per-band V (default flat)
+    uint32_t    k_ternary_mask = 0;  // Ternary band mask for main K quant (0x8 = band 3)
+    uint32_t    v_ternary_mask = 0;  // Ternary band mask for main V quant
+    bool        use_fp8       = false; // FP8 (E4M3) for V cache (smooth distributions)
 
     // Model-pack preset selection — arch-aware defaults.
     //   ""    / "off"  — use shipping defaults / explicit flags (default)

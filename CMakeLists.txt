@@ -117,7 +117,8 @@ set(SP_CORE_SRC
     ${SP_CORE_DIR}/core/shannon_prime_cauchy.c
     ${SP_CORE_DIR}/core/shannon_prime_modelpack.c
     ${SP_CORE_DIR}/backends/crt/sp_crt.c
-    ${SP_CORE_DIR}/backends/crt/sp_crt_dispatch.c)
+    ${SP_CORE_DIR}/backends/crt/sp_crt_dispatch.c
+    ${SP_CORE_DIR}/backends/crt/sp_theoretical.c)
 # When CUDA is OFF, link stubs for the CRT CUDA/Vulkan symbols so the
 # pure-C dispatch code resolves without the real .cu implementations.
 if(NOT SP_ENGINE_WITH_CUDA)

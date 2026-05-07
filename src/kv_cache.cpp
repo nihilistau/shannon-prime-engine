@@ -375,6 +375,9 @@ std::unique_ptr<KvCache> KvCache::create(int n_layer, int n_head_kv,
     sp_config_t* sc = &kv->impl_->cfg;
     sp_config_init(sc, head_dim, n_layer, n_head_kv);
     sc->use_mobius_mask = cfg.mobius;
+    sc->k_ternary_mask = cfg.k_ternary_mask;
+    sc->v_ternary_mask = cfg.v_ternary_mask;
+    sc->use_fp8 = cfg.use_fp8;
 
     auto kbits = parse_csv_bits(cfg.k_bits_csv);
     auto vbits = parse_csv_bits(cfg.v_bits_csv);
@@ -971,6 +974,9 @@ std::unique_ptr<KvCache> KvCache::create_gpu(int n_layer, int n_head_kv,
         sp_config_t* sc = &kv->impl_->cfg;
         sp_config_init(sc, head_dim, n_layer, n_head_kv);
         sc->use_mobius_mask = false;  // hier doesn't use Möbius
+        sc->k_ternary_mask = cfg.k_ternary_mask;
+        sc->v_ternary_mask = cfg.v_ternary_mask;
+        sc->use_fp8 = cfg.use_fp8;
 
         // Parse skeleton band bits
         auto skel_bits = parse_csv_bits(cfg.hier_skel_bits);
@@ -1060,6 +1066,9 @@ std::unique_ptr<KvCache> KvCache::create_gpu(int n_layer, int n_head_kv,
     sp_config_t* sc = &kv->impl_->cfg;
     sp_config_init(sc, head_dim, n_layer, n_head_kv);
     sc->use_mobius_mask = cfg.mobius;
+    sc->k_ternary_mask = cfg.k_ternary_mask;
+    sc->v_ternary_mask = cfg.v_ternary_mask;
+    sc->use_fp8 = cfg.use_fp8;
 
     auto kbits = parse_csv_bits(cfg.k_bits_csv);
     auto vbits = parse_csv_bits(cfg.v_bits_csv);
