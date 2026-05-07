@@ -125,8 +125,9 @@ larger models (27B MoE) where we can't fit everything in memory at once.
 
 ---
 
-## Phase 8: NEON Oracle — Speculative Prefetch & MoE Routing
-**Status:** IMPLEMENTED (2026-05-05) — pending on-device validation
+## Phase 8: NEON Oracle + MoE Expert Curriculum
+**Status:** IMPLEMENTED (2026-05-07) — NEON oracle pending device validation;
+MoE curriculum + Top-2 prefetch validated on desktop (Qwen3.6-35B-A3B, 256 experts)
 **Goal:** Use ARM NEON cores for speculative token prediction, MoE expert
 routing, and high-speed tokenization. The CPU becomes the "brain" while
 the DSP is the "muscle."
@@ -140,11 +141,19 @@ in advance, Halide DMA can pre-stream just those experts from UFS.
 1. **Speculative Draft Model** — tiny Qwen-Lite (~100M params) running in
    NEON-optimized fp32 on one ARM core. Predicts next 3–4 tokens to prime
    the DMA prefetch pipeline.
-2. **MoE Gating Logic** — NEON-vectorized router that computes top-2 expert
+2. **MoE Expert Curriculum** — EWMA heatmap tracks per-layer expert activation
+   rates. Curriculum Pulse (every 128 tokens) re-ranks experts and assigns them
+   to GPU tiers (hot → RTX 2060 / Powerhouse, cool → Intel UHD / Proximity).
+   Validated on Qwen3.6-35B-A3B (256 experts, top-8, 40 layers).
+3. **Top-2 Speculative Prefetch** — dual-slot shadow buffers pre-shred the TWO
+   hottest predicted experts for layer L+1. Hit → pointer swap (~10ns), miss →
+   standard shred (~2ms). Confidence gate (tau=0.75) skips speculation when
+   the heatmap is too flat to predict reliably.
+4. **MoE Gating Logic** — NEON-vectorized router that computes top-2 expert
    selection from the gating scores. Feeds selection to Halide DMA.
-3. **Tokenization** — BPE encode/decode stays on ARM (string manipulation
+5. **Tokenization** — BPE encode/decode stays on ARM (string manipulation
    is ARM's strength, not DSP's).
-4. **Agentic Parsing** — real-time text parsing for tool-call triggers and
+6. **Agentic Parsing** — real-time text parsing for tool-call triggers and
    safety guardrails while HTP generates tokens.
 
 ### Entry Points
