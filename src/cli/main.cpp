@@ -31,11 +31,13 @@ extern "C" {
 
 extern "C" {
 #include "shannon_prime.h"
+#include "sp_crt.h"
 }
 
 #include "ggml-backend.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -337,6 +339,7 @@ int main(int argc, char** argv) {
             else if (a == "--load-cache"      && i + 1 < argc) cc.load_cache_path = argv[++i];
             else if (a == "--system12")                         cc.system12       = true;
             else if (a == "--crt-split")                        cc.crt_split      = true;
+            else if (a == "--moe-curriculum")                   cc.moe_curriculum = true;
             else if (a == "--s12-threshold"   && i + 1 < argc) cc.s12_threshold  = (float)std::atof(argv[++i]);
             else if (a == "--s12-sys2"        && i + 1 < argc) cc.s12_sys2       = argv[++i];
             else if (a.size() >= 2 && a[0] == '-' && a[1] == '-') {
@@ -395,6 +398,23 @@ int main(int argc, char** argv) {
         }
         if (!fc) return 5;
 
+        // CRT multi-GPU tensor splitting (Beast Canyon)
+        if (cc.crt_split) {
+            const int max_dim = m->n_embd();
+            if (fc->enable_crt(max_dim))
+                std::fprintf(stderr, "[sp-engine] CRT multi-GPU enabled (max_dim=%d)\n", max_dim);
+            else
+                std::fprintf(stderr, "[sp-engine] CRT init failed — falling back to standard matmul\n");
+        }
+
+        // MoE expert curriculum (Beast Canyon homeostatic balancer)
+        if (cc.moe_curriculum) {
+            if (fc->enable_moe_curriculum())
+                std::fprintf(stderr, "[sp-engine] MoE curriculum active\n");
+            else
+                std::fprintf(stderr, "[sp-engine] MoE curriculum not available (non-MoE model?)\n");
+        }
+
         // Hybrid-arch (qwen35moe / qwen35): allocate and bind a GdnStateCache
         // so the per-layer delta-rule recurrent state persists across chunks.
         const std::string& cp_arch = m->architecture();
@@ -444,8 +464,8 @@ int main(int argc, char** argv) {
         {
             const char* env_gpu = std::getenv("SHANNON_PRIME_GPU_CACHE");
             const bool prefer_gpu_cache = (env_gpu == nullptr) || (std::atoi(env_gpu) != 0);
-            bool backend_is_gpu = false;
-            if ((ggml_backend_t)bk) {
+            bool backend_is_gpu = !mgpu.backends.empty();  // multi-GPU → always GPU
+            if (!backend_is_gpu && (ggml_backend_t)bk) {
                 ggml_backend_dev_t dev = ggml_backend_get_device((ggml_backend_t)bk);
                 backend_is_gpu = dev && ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU;
             }
@@ -820,8 +840,8 @@ int main(int argc, char** argv) {
             // the host cache even on GPU, for A/B comparisons.
             const char* env_gpu = std::getenv("SHANNON_PRIME_GPU_CACHE");
             bool prefer_gpu_cache = (env_gpu == nullptr) || (std::atoi(env_gpu) != 0);
-            bool backend_is_gpu = false;
-            if ((ggml_backend_t)bk) {
+            bool backend_is_gpu = !mgpu_ppl.backends.empty();
+            if (!backend_is_gpu && (ggml_backend_t)bk) {
                 ggml_backend_dev_t dev = ggml_backend_get_device((ggml_backend_t)bk);
                 backend_is_gpu = dev && ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU;
             }
@@ -1061,6 +1081,7 @@ int main(int argc, char** argv) {
             else if (a == "--evict-keep"      && i + 1 < argc) cc.evict_keep = std::atoi(argv[++i]);
             else if (a == "--system12")                         cc.system12       = true;
             else if (a == "--crt-split")                        cc.crt_split      = true;
+            else if (a == "--moe-curriculum")                   cc.moe_curriculum = true;
             else if (a == "--s12-threshold"   && i + 1 < argc) cc.s12_threshold  = (float)std::atof(argv[++i]);
             else if (a == "--s12-sys2"        && i + 1 < argc) cc.s12_sys2       = argv[++i];
             else if (a.size() >= 2 && a[0] == '-' && a[1] == '-') {
@@ -1111,14 +1132,32 @@ int main(int argc, char** argv) {
         }
         if (!fc) return 4;
 
+        // CRT multi-GPU tensor splitting (Beast Canyon)
+        if (cc.crt_split) {
+            const int max_dim = m->n_embd();
+            if (fc->enable_crt(max_dim)) {
+                std::fprintf(stderr, "[sp-engine] CRT multi-GPU enabled (max_dim=%d)\n", max_dim);
+            } else {
+                std::fprintf(stderr, "[sp-engine] CRT init failed — falling back to standard matmul\n");
+            }
+        }
+
+        // MoE expert curriculum (Beast Canyon homeostatic balancer)
+        if (cc.moe_curriculum) {
+            if (fc->enable_moe_curriculum())
+                std::fprintf(stderr, "[sp-engine] MoE curriculum active\n");
+            else
+                std::fprintf(stderr, "[sp-engine] MoE curriculum not available (non-MoE model?)\n");
+        }
+
         // Prefer GPU-resident cache when backend is GPU + ship path.
         std::unique_ptr<sp::engine::KvCache> kv;
         std::unique_ptr<sp::engine::DualKvCache> dual;
         {
             const char* env_gpu = std::getenv("SHANNON_PRIME_GPU_CACHE");
             const bool prefer_gpu_cache = (env_gpu == nullptr) || (std::atoi(env_gpu) != 0);
-            bool backend_is_gpu = false;
-            if ((ggml_backend_t)bk) {
+            bool backend_is_gpu = !mgpu_chat.backends.empty();
+            if (!backend_is_gpu && (ggml_backend_t)bk) {
                 ggml_backend_dev_t dev = ggml_backend_get_device((ggml_backend_t)bk);
                 backend_is_gpu = dev && ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU;
             }
@@ -1507,6 +1546,414 @@ int main(int argc, char** argv) {
         std::printf("V corr: mean=%.4f  min=%.4f\n", v_sum / per, v_min);
         std::printf("compression ratio = %.2fx\n", kv->compression_ratio());
         return 0;
+    }
+
+    // ── CRT multi-GPU smoke test (CPU reference path) ─────────────────
+    //
+    //   sp-engine crt_smoke [--dim N]
+    //
+    // Validates the full CRT pipeline: quantize → split → modular matmul
+    // → Garner reconstruct → dequantize. Runs on CPU (no GPU required).
+    // Tests:
+    //   1. Single-element round-trip (sp_crt_verify_roundtrip)
+    //   2. Small matmul correctness (M×N×K) against naive fp32
+    //   3. Error statistics (max error, mean error, PASS/FAIL)
+
+    if (cmd == "crt_smoke") {
+        int dim = 64;  // default matmul dimension (dim × dim × dim)
+        for (int i = 2; i < argc; ++i) {
+            std::string a = argv[i];
+            if (a == "--dim" && i + 1 < argc) dim = std::atoi(argv[++i]);
+        }
+
+        std::printf("=== CRT Smoke Test ===\n\n");
+
+        // ── Test 1: Round-trip verification (scalar) ────────────────
+        std::printf("--- Test 1: scalar round-trip ---\n");
+        int rt_pass = 0, rt_fail = 0;
+        float rt_max_err = 0.0f;
+        // Sweep representative values including edge cases.
+        float test_vals[] = {
+            0.0f, 1.0f, -1.0f, 0.5f, -0.5f, 3.99f, -3.99f,
+            0.001f, -0.001f, 2.718f, -1.414f, 3.141f, -2.236f
+        };
+        const int n_vals = sizeof(test_vals) / sizeof(test_vals[0]);
+        for (int i = 0; i < n_vals; ++i) {
+            for (int j = 0; j < n_vals; ++j) {
+                float err = 0.0f;
+                int rc = sp_crt_verify_roundtrip(test_vals[i], test_vals[j], &err);
+                if (rc == 0) rt_pass++; else rt_fail++;
+                if (err > rt_max_err) {
+                    rt_max_err = err;
+                    std::printf("  worst so far: a=%.4f b=%.4f expected=%.6f err=%.6f\n",
+                                test_vals[i], test_vals[j],
+                                test_vals[i] * test_vals[j], err);
+                }
+            }
+        }
+        std::printf("  %d / %d round-trips passed, max error = %.6f\n",
+                    rt_pass, rt_pass + rt_fail, rt_max_err);
+        std::printf("  %s\n\n", rt_fail == 0 ? "PASS" : "FAIL");
+
+        // ── Test 2: Matmul correctness (M × K) × (K × N) ───────────
+        std::printf("--- Test 2: %d×%d matmul ---\n", dim, dim);
+
+        const int M = dim, N = dim, K = dim;
+        const size_t a_sz = (size_t)M * K;
+        const size_t b_sz = (size_t)K * N;
+        const size_t c_sz = (size_t)M * N;
+
+        std::vector<float> A(a_sz), B(b_sz), C_crt(c_sz), C_ref(c_sz);
+
+        // Deterministic PRNG fill in [-1, 1]
+        uint64_t s = 0xDEADBEEF12345678ULL;
+        auto rng = [&]() -> float {
+            s ^= s << 13; s ^= s >> 7; s ^= s << 17;
+            return ((float)(s & 0xFFFFFFFF) / 2147483648.0f) - 1.0f;
+        };
+        for (size_t i = 0; i < a_sz; ++i) A[i] = rng();
+        for (size_t i = 0; i < b_sz; ++i) B[i] = rng();
+
+        // Naive fp32 reference
+        for (int i = 0; i < M; ++i) {
+            for (int j = 0; j < N; ++j) {
+                double acc = 0.0;
+                for (int k = 0; k < K; ++k) {
+                    acc += (double)A[i * K + k] * (double)B[k * N + j];
+                }
+                C_ref[i * N + j] = (float)acc;
+            }
+        }
+
+        // CRT matmul (CPU reference path)
+        sp_crt_context_t ctx;
+        int rc = sp_crt_init(&ctx, M, N, K, nullptr, nullptr);
+        if (rc != 0) {
+            std::fprintf(stderr, "sp_crt_init failed: %d\n", rc);
+            return 2;
+        }
+
+        // Calibrate from actual data range
+        float a_min = A[0], a_max = A[0];
+        float b_min = B[0], b_max = B[0];
+        for (size_t i = 1; i < a_sz; ++i) {
+            if (A[i] < a_min) a_min = A[i];
+            if (A[i] > a_max) a_max = A[i];
+        }
+        for (size_t i = 1; i < b_sz; ++i) {
+            if (B[i] < b_min) b_min = B[i];
+            if (B[i] > b_max) b_max = B[i];
+        }
+        sp_crt_quant_calibrate_k(&ctx.act_quant, a_min, a_max, K);
+        sp_crt_quant_calibrate_k(&ctx.weight_quant, b_min, b_max, K);
+
+        rc = sp_crt_matmul(&ctx, A.data(), B.data(), C_crt.data(), M, N, K);
+        sp_crt_free(&ctx);
+        if (rc != 0) {
+            std::fprintf(stderr, "sp_crt_matmul failed: %d\n", rc);
+            return 2;
+        }
+
+        // Compare CRT vs reference
+        double max_abs_err = 0.0, sum_abs_err = 0.0;
+        double max_rel_err = 0.0, sum_rel_err = 0.0;
+        for (size_t i = 0; i < c_sz; ++i) {
+            double err = std::fabs((double)C_crt[i] - (double)C_ref[i]);
+            double rel = (std::fabs(C_ref[i]) > 1e-6)
+                       ? err / std::fabs((double)C_ref[i])
+                       : err;
+            if (err > max_abs_err) max_abs_err = err;
+            if (rel > max_rel_err) max_rel_err = rel;
+            sum_abs_err += err;
+            sum_rel_err += rel;
+        }
+
+        std::printf("  ref range: [%.4f, %.4f]\n",
+                    *std::min_element(C_ref.begin(), C_ref.end()),
+                    *std::max_element(C_ref.begin(), C_ref.end()));
+        std::printf("  abs error: max=%.6f  mean=%.6f\n",
+                    max_abs_err, sum_abs_err / c_sz);
+        std::printf("  rel error: max=%.6f  mean=%.6f\n",
+                    max_rel_err, sum_rel_err / c_sz);
+
+        // Pass criterion: mean relative error < 1%
+        bool matmul_pass = (sum_rel_err / c_sz) < 0.01;
+        std::printf("  %s\n\n", matmul_pass ? "PASS" : "FAIL");
+
+        // ── Test 3: Identity matrix — Residue Integrity Test ────────
+        //
+        // Feed A × I through CRT. If Garner merges correctly on the host,
+        // the output must be A (within quantization tolerance). A "ghost"
+        // value here means the residue rings are aliasing.
+        std::printf("--- Test 3: identity matrix (residue integrity) ---\n");
+
+        const int idim = std::min(dim, 128);  // cap for speed
+        const size_t id_sz = (size_t)idim * idim;
+
+        std::vector<float> Id(id_sz, 0.0f);
+        for (int i = 0; i < idim; ++i) Id[i * idim + i] = 1.0f;
+
+        // Random A matrix in [-1, 1]
+        std::vector<float> A_id(id_sz);
+        s = 0xCAFEBABE42424242ULL;  // fresh seed
+        for (size_t i = 0; i < id_sz; ++i) {
+            s ^= s << 13; s ^= s >> 7; s ^= s << 17;
+            A_id[i] = ((float)(s & 0xFFFFFFFF) / 2147483648.0f) - 1.0f;
+        }
+
+        std::vector<float> C_id(id_sz);
+        sp_crt_context_t id_ctx;
+        rc = sp_crt_init(&id_ctx, idim, idim, idim, nullptr, nullptr);
+        if (rc != 0) {
+            std::fprintf(stderr, "sp_crt_init failed for identity test: %d\n", rc);
+            return 2;
+        }
+        // Identity matrix is in [0,1], A is in [-1,1]
+        sp_crt_quant_calibrate_k(&id_ctx.act_quant, -1.0f, 1.0f, idim);
+        sp_crt_quant_calibrate_k(&id_ctx.weight_quant, 0.0f, 1.0f, idim);
+
+        rc = sp_crt_matmul(&id_ctx, A_id.data(), Id.data(), C_id.data(),
+                           idim, idim, idim);
+        sp_crt_free(&id_ctx);
+        if (rc != 0) {
+            std::fprintf(stderr, "sp_crt_matmul identity failed: %d\n", rc);
+            return 2;
+        }
+
+        double id_max_err = 0.0, id_ghost_count = 0;
+        for (size_t i = 0; i < id_sz; ++i) {
+            double err = std::fabs((double)C_id[i] - (double)A_id[i]);
+            if (err > id_max_err) id_max_err = err;
+            if (err > 0.1) id_ghost_count++;
+        }
+        std::printf("  dim: %d×%d, max error vs input: %.8f\n", idim, idim, id_max_err);
+        std::printf("  ghost values (err > 0.1): %d / %zu\n",
+                    (int)id_ghost_count, id_sz);
+        bool id_pass = (id_ghost_count == 0) && (id_max_err < 0.01);
+        std::printf("  Garner merger returns: %s\n",
+                    id_pass ? "1.0000 (clean)" : "GHOST detected");
+        std::printf("  %s\n\n", id_pass ? "PASS" : "FAIL");
+
+        // ── Summary ─────────────────────────────────────────────────
+        bool all_pass = (rt_fail == 0) && matmul_pass && id_pass;
+        std::printf("=== CRT Smoke: %s ===\n", all_pass ? "ALL PASS" : "FAIL");
+        return all_pass ? 0 : 1;
+    }
+
+    // ── CRT model-level test — real activations through CRT pipeline ───
+    //
+    //   sp-engine crt_model --model <path.gguf> [--ctx N] [--layer L]
+    //
+    // Loads a GGUF model, runs one forward chunk to capture per-layer K
+    // tensors (real activations from real weights), then replays head 0's
+    // K × K^T (the attention score inner product) through both CRT and
+    // fp32 reference. Reports error statistics.
+    //
+    // This proves CRT works with real model weight distributions —
+    // not just synthetic random data.
+
+    if (cmd == "crt_model") {
+        std::string model_path;
+        int n_ctx   = 128;
+        int layer   = 0;
+        int ngl     = sp_default_n_gpu_layers();
+        for (int i = 2; i < argc; ++i) {
+            std::string a = argv[i];
+            if      (a == "--model" && i + 1 < argc) model_path = argv[++i];
+            else if (a == "--ctx"   && i + 1 < argc) n_ctx  = std::atoi(argv[++i]);
+            else if (a == "--layer" && i + 1 < argc) layer  = std::atoi(argv[++i]);
+            else if ((a == "--n-gpu-layers" || a == "-ngl") && i + 1 < argc) ngl = std::atoi(argv[++i]);
+        }
+        if (model_path.empty()) {
+            std::fprintf(stderr, "crt_model requires --model <path.gguf>\n");
+            return 1;
+        }
+
+        std::printf("=== CRT Model-Level Test ===\n\n");
+
+        // Load model
+        auto m = sp::engine::Model::load(model_path);
+        if (!m) { std::fprintf(stderr, "failed to load model\n"); return 2; }
+
+        SpBackendGuard bk(sp_select_backend());
+        auto W = sp::engine::LlamaWeights::load(*m, bk, ngl);
+        if (!W) { std::fprintf(stderr, "failed to load weights\n"); return 3; }
+
+        auto v  = sp::engine::Vocab::load(*m);
+        auto tk = v ? sp::engine::Tokenizer::create(*v) : nullptr;
+        if (!tk) { std::fprintf(stderr, "failed to create tokenizer\n"); return 3; }
+
+        const int n_layer   = (int)m->n_layer();
+        const int head_dim  = (int)m->head_dim();
+        const int n_head_kv = (int)m->n_head_kv();
+
+        if (layer >= n_layer) {
+            std::fprintf(stderr, "layer %d >= n_layer %d\n", layer, n_layer);
+            return 2;
+        }
+
+        std::printf("  model:     %s\n", model_path.c_str());
+        std::printf("  arch:      %s\n", m->architecture().c_str());
+        std::printf("  n_layer:   %d\n", n_layer);
+        std::printf("  head_dim:  %d\n", head_dim);
+        std::printf("  n_head_kv: %d\n", n_head_kv);
+        std::printf("  test ctx:  %d tokens\n", n_ctx);
+        std::printf("  test layer: %d\n\n", layer);
+
+        // Create forward context
+        sp::engine::PeSettings pe{};
+        auto fc = sp::engine::ForwardContext::create(*m, *W, 1024 * 1024 * 1024, pe, bk);
+        if (!fc) { std::fprintf(stderr, "failed to create forward context\n"); return 4; }
+
+        // Generate token IDs — use a simple repeated sequence.
+        // We don't need meaningful text, just real model activations.
+        std::vector<int32_t> toks(n_ctx);
+        toks[0] = 1; // BOS
+        for (int i = 1; i < n_ctx; ++i) toks[i] = 100 + (i % 500);
+
+        // Forward pass — capture per-layer K and V
+        std::printf("--- Forward pass (capturing K/V) ---\n");
+        std::vector<float> logits;
+        int n_vocab_local = 0;
+        std::vector<std::vector<float>> per_K, per_V;
+        if (!fc->forward_full(toks, logits, n_vocab_local, &per_K, &per_V)) {
+            std::fprintf(stderr, "forward_full failed\n"); return 5;
+        }
+        std::printf("  logits shape: [%d, %d]\n", n_ctx, n_vocab_local);
+
+        if (per_K[layer].empty()) {
+            std::fprintf(stderr, "layer %d K not captured\n", layer);
+            return 5;
+        }
+
+        // K shape: [head_dim, n_head_kv, n_tokens] stored flat.
+        // Extract head 0: stride = head_dim, step = head_dim * n_head_kv.
+        // Reshape as K_head0: [n_tokens × head_dim] row-major.
+        const float* K_raw = per_K[layer].data();
+        const int n = n_ctx;
+        const int d = head_dim;
+        std::vector<float> K_mat(n * d);
+        for (int t = 0; t < n; ++t) {
+            for (int h = 0; h < d; ++h) {
+                // K is [head_dim, n_head_kv, n_tokens] → element [h, 0, t]
+                // = K_raw[h + 0*head_dim + t*head_dim*n_head_kv]
+                //   but ggml stores in [head_dim, n_head_kv, n] order:
+                //   index = h + head*head_dim + t*(head_dim*n_head_kv)
+                K_mat[t * d + h] = K_raw[h + t * d * n_head_kv];
+            }
+        }
+
+        // Report K statistics
+        float k_min = K_mat[0], k_max = K_mat[0];
+        double k_abssum = 0;
+        for (size_t i = 0; i < K_mat.size(); ++i) {
+            if (K_mat[i] < k_min) k_min = K_mat[i];
+            if (K_mat[i] > k_max) k_max = K_mat[i];
+            k_abssum += std::fabs(K_mat[i]);
+        }
+        std::printf("  K head-0 range: [%.4f, %.4f], mean_abs: %.4f\n\n",
+                    k_min, k_max, k_abssum / K_mat.size());
+
+        // Compute K × K^T — fp32 reference
+        // K_mat: [n × d], result: [n × n]
+        std::printf("--- K×K^T: %d×%d × %d×%d → %d×%d ---\n", n, d, d, n, n, n);
+
+        // K^T: [d × n]
+        std::vector<float> Kt(d * n);
+        for (int t = 0; t < n; ++t)
+            for (int h = 0; h < d; ++h)
+                Kt[h * n + t] = K_mat[t * d + h];
+
+        const size_t out_sz = (size_t)n * n;
+        std::vector<float> C_ref(out_sz), C_crt(out_sz);
+
+        // fp32 reference: K × K^T
+        for (int i = 0; i < n; ++i) {
+            for (int j = 0; j < n; ++j) {
+                double acc = 0.0;
+                for (int k = 0; k < d; ++k)
+                    acc += (double)K_mat[i * d + k] * (double)Kt[k * n + j];
+                C_ref[i * n + j] = (float)acc;
+            }
+        }
+
+        // CRT path: K × K^T — run both CPU and GPU dispatch
+        sp_crt_context_t ctx;
+        int rc = sp_crt_init(&ctx, n, n, d, nullptr, nullptr);
+        if (rc != 0) { std::fprintf(stderr, "sp_crt_init failed: %d\n", rc); return 6; }
+
+        // Calibrate from actual K value range
+        sp_crt_quant_calibrate_k(&ctx.act_quant, k_min, k_max, d);
+        sp_crt_quant_calibrate_k(&ctx.weight_quant, k_min, k_max, d);
+
+        // CPU reference path
+        rc = sp_crt_matmul(&ctx, K_mat.data(), Kt.data(), C_crt.data(), n, n, d);
+        if (rc != 0) { sp_crt_free(&ctx); std::fprintf(stderr, "sp_crt_matmul CPU failed: %d\n", rc); return 6; }
+
+        // GPU dispatch path
+        std::vector<float> C_gpu(out_sz, 0.0f);
+        int gpu_rc = sp_crt_init_gpu(&ctx);
+        if (gpu_rc == 0) {
+            std::printf("\n--- GPU dispatch test ---\n");
+            // Warm up
+            sp_crt_matmul_gpu(&ctx, K_mat.data(), Kt.data(), C_gpu.data(), n, n, d);
+
+            // Timed run
+            auto t0 = std::chrono::high_resolution_clock::now();
+            const int n_iters = 100;
+            for (int iter = 0; iter < n_iters; ++iter) {
+                sp_crt_matmul_gpu(&ctx, K_mat.data(), Kt.data(), C_gpu.data(), n, n, d);
+            }
+            auto t1 = std::chrono::high_resolution_clock::now();
+            double gpu_ms = std::chrono::duration<double, std::milli>(t1 - t0).count() / n_iters;
+
+            // Verify GPU matches CPU CRT
+            double gpu_max_err = 0;
+            for (size_t i = 0; i < out_sz; ++i) {
+                double e = std::fabs((double)C_gpu[i] - (double)C_crt[i]);
+                if (e > gpu_max_err) gpu_max_err = e;
+            }
+            std::printf("  GPU vs CPU CRT max delta: %.8f %s\n",
+                        gpu_max_err, (gpu_max_err < 0.001) ? "(match)" : "(MISMATCH)");
+            std::printf("  GPU dispatch: %.3f ms per %d×%d×%d matmul (%d iters)\n",
+                        gpu_ms, n, n, d, n_iters);
+        } else {
+            std::printf("  (GPU dispatch not available: rc=%d — using CPU path)\n", gpu_rc);
+        }
+        sp_crt_free(&ctx);
+
+        // Compare
+        double max_abs = 0, sum_abs = 0;
+        double max_rel = 0, sum_rel = 0;
+        float ref_min = C_ref[0], ref_max = C_ref[0];
+        for (size_t i = 0; i < out_sz; ++i) {
+            if (C_ref[i] < ref_min) ref_min = C_ref[i];
+            if (C_ref[i] > ref_max) ref_max = C_ref[i];
+            double err = std::fabs((double)C_crt[i] - (double)C_ref[i]);
+            double rel = (std::fabs(C_ref[i]) > 1e-6)
+                       ? err / std::fabs((double)C_ref[i]) : err;
+            if (err > max_abs) max_abs = err;
+            if (rel > max_rel) max_rel = rel;
+            sum_abs += err;
+            sum_rel += rel;
+        }
+
+        std::printf("  ref range: [%.4f, %.4f]\n", ref_min, ref_max);
+        std::printf("  abs error: max=%.6f  mean=%.6f\n", max_abs, sum_abs / out_sz);
+        std::printf("  rel error: max=%.6f  mean=%.6f\n", max_rel, sum_rel / out_sz);
+
+        bool pass = (sum_rel / out_sz) < 0.01;
+        std::printf("  %s\n\n", pass ? "PASS" : "FAIL");
+
+        // Diagonal check — self-attention scores K[i]·K[i] should be positive
+        int diag_ok = 0;
+        for (int i = 0; i < n; ++i) {
+            if (C_crt[i * n + i] > 0.0f) diag_ok++;
+        }
+        std::printf("  diagonal (self-dot) positive: %d / %d\n", diag_ok, n);
+
+        std::printf("\n=== CRT Model: %s ===\n", pass ? "PASS" : "FAIL");
+        return pass ? 0 : 1;
     }
 
     if (cmd == "banner") {
@@ -2071,6 +2518,8 @@ int main(int argc, char** argv) {
         }
         else if (a == "--pe-alpha" && i + 1 < argc) cfg.pe_alpha = (float)std::atof(argv[++i]);
         else if (a == "--pe-tier"  && i + 1 < argc) cfg.pe_tier  = std::atoi(argv[++i]);
+        else if (a == "--crt-split")                 cfg.crt_split = true;
+        else if (a == "--moe-curriculum")             cfg.moe_curriculum = true;
         else if (a.size() >= 2 && a[0] == '-' && a[1] == '-') {
             std::fprintf(stderr, "unknown flag: %s\n", a.c_str());
             return 2;

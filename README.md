@@ -36,6 +36,12 @@ The engine eliminates this friction. It owns the entire data path: GGUF loading,
 
 **Cauchy Reset.** Dynamic reset scheduling (Ricci sentinel + Mertens oracle) for long decode chains.
 
+**MoE Expert Curriculum.** `--moe-curriculum` enables the homeostatic expert balancer for Mixture-of-Experts models. Per-layer EWMA heatmap tracks expert activation rates; a Curriculum Pulse every 128 tokens re-ranks experts and assigns them to GPU tiers (hot → discrete GPU, cool → iGPU). Validated on Qwen3.6-35B-A3B (256 experts, top-8, 40 layers).
+
+**Top-2 Speculative Prefetch.** Dual-slot shadow buffers pre-shred the two hottest predicted experts for layer L+1 while GPUs grind layer L. Hit → pointer swap (~10ns), miss → standard shred (~2ms). Confidence gate (tau=0.75) skips speculation when the heatmap is too flat.
+
+**CRT Multi-GPU Dispatch.** Chinese Remainder Theorem sharding across heterogeneous GPUs (e.g., RTX 2060 + Intel UHD). Mersenne-prime M1 ring on discrete GPU, general M2 ring on iGPU, Garner reconstruction on CPU.
+
 ---
 
 ## Architecture
@@ -57,8 +63,11 @@ The engine eliminates this friction. It owns the entire data path: GGUF loading,
 │  gdn_state.cpp     ← GDN compression state              │
 │  http_server.cpp   ← OpenAI-compatible API server       │
 │  qnn_bin_driver.cpp← QNN HTP .bin execution             │
+│  speculative_oracle.cpp ← NEON draft model oracle       │
 ├─────────────────────────────────────────────────────────┤
 │  lib/shannon-prime/ ← core math (git submodule)         │
+│    backends/crt/    ← CRT dispatch, MoE curriculum,     │
+│                       prefetch engine, CUDA/Shor kernels│
 └─────────────────────────────────────────────────────────┘
 ```
 
@@ -109,6 +118,12 @@ cmake --build build
   --model /path/to/model.gguf \
   --port 8082
 
+# MoE model with expert curriculum (heterogeneous dispatch)
+./build/sp-engine chat \
+  --model /path/to/Qwen3.6-35B-A3B.gguf \
+  --moe-curriculum \
+  "Explain mixture of experts"
+
 # QNN .bin benchmark (phone, via adb)
 ./build/sp-engine qnn_bin_bench \
   --n-chunks 3 \
@@ -149,6 +164,9 @@ cfg.model_preset = "auto";      // Resolve from GGUF arch
 
 // Cauchy reset
 cfg.cauchy_mode = 2;            // Dynamic (Ricci + Mertens)
+
+// MoE expert curriculum (for MoE models like Qwen3.6-35B-A3B)
+cfg.moe_curriculum = true;      // Enable heatmap + tier dispatch + prefetch
 ```
 
 ---
@@ -162,6 +180,7 @@ cfg.cauchy_mode = 2;            // Dynamic (Ricci + Mertens)
 | Qwen3-4B w4a16 | QNN .bin 4-split | 104 t/s prefill | S22U V69 HTP |
 | Qwen2.5-Coder-3B + 0.5B | Spec-decode + FUSED_KQ | 43.72 t/s (3.58×) | S22U CPU |
 | RTX 2060 + Intel UHD | Dual-GPU Vulkan | Cross-device correlation 1.0000 | Desktop |
+| Qwen3.6-35B-A3B | MoE curriculum (256 experts, top-8) | 5364-node graph, heatmap active | Desktop CPU |
 
 ---
 

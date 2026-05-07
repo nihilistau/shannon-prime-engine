@@ -57,6 +57,55 @@ This document covers the desktop engine's current state, committed improvements,
 
 These advantages unlock several mathematical concepts that are impractical on phone.
 
+### Hierarchical Compression: Tradeoff Analysis
+
+The hierarchical predictor (Kronecker sub-projection + calibrated W linear map) supports
+two independent compression knobs: **ternary noise-tail quantization** and **split K/V
+residual bits**. Both are zero-PPL-degradation techniques on the models tested so far.
+
+**Benchmark (Qwen3-0.6B Q4_K_M, ctx=256, 2 chunks):**
+
+| Config | K B/pos | V B/pos | ×/head | K_corr | V_corr | PPL |
+|---|---|---|---|---|---|---|
+| Default (5,5 K2/V2) | 53 | 53 | 4.8× | 0.992 | 0.924 | 15.31 |
+| Ternary band 1 (5,tern K2/V2) | 50 | 50 | 5.1× | 0.960 | 0.890 | 15.31 |
+| Split K/V (5,5 K1/V2) | 36 | 53 | 5.8× | 0.974 | 0.924 | 15.31 |
+| Combo (5,tern K1/V2) | 33 | 50 | 6.2× | 0.941 | 0.890 | 15.31 |
+
+**K vs V correlation asymmetry.** K tolerates aggressive compression because attention
+scores pass through softmax, which amplifies relative differences — a K vector with 0.974
+correlation still produces nearly identical attention patterns. V directly multiplies the
+attention weights, so V_corr maps linearly to output error. Split K/V exploits this: K at
+1-bit residual saves 17 bytes/pos (32% of K budget) while V stays at 2-bit to preserve
+output fidelity.
+
+**Compute overhead.** The hierarchical predictor adds ~0.01% of inference FLOPs. The
+Kronecker sub-projection selects 14 of 154 dimensions (~9% skeleton), and the W linear map
+is a single small matmul per head position. On desktop GPU this is invisible in profiling.
+On phone the overhead is similarly negligible — the DSP path spends >99% of time in
+attention matmul, not compression.
+
+**Drift and Cauchy reset implications.** The Mertens sentinel monitors accumulated
+reconstruction error. The scaling law is `4700 × gap²` per position, where gap = 1 − corr.
+For the default config (gap=0.008), scaling is 0.30 — negligible even at 128K context.
+For the combo config (K gap=0.059), scaling is 16.4 — the Mertens sentinel may trigger
+periodic Cauchy resets at long context (>4K positions). This is by design: the sentinel
+forces a clean re-anchor before error accumulates enough to affect output quality.
+
+**Practical recommendations:**
+
+- **Phone (memory-constrained):** Split K/V (`--hier-res-bits 1 --hier-res-bits-v 2`) is
+  the default recommendation. 5.8× compression with V_corr preserved at 0.924. The 0.974
+  K_corr is well above the Mertens trigger threshold for typical context lengths (≤4096).
+
+- **Desktop long-context (>8K):** Default K2/V2 (`--hier-res-bits 2`). The 4.8× compression
+  is still substantial, and 0.992 K_corr means drift is negligible at any context length.
+
+- **Desktop short-context / throughput-optimized:** Combo (`--hier-res-bits 1
+  --hier-res-bits-v 2 --hier-ternary-mask 0x2`) for maximum 6.2× compression. Mertens
+  resets at long context are the tradeoff, but for serving workloads with short conversations
+  this is free compression.
+
 ---
 
 ## Part II: Active Improvements

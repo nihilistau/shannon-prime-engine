@@ -200,6 +200,25 @@ int Engine::load(const Config& cfg) {
     }
     if (!impl_->fc) return 6;
 
+    // ── CRT multi-GPU tensor splitting (Beast Canyon) ──────────────
+    if (cfg.crt_split) {
+        const int max_dim = impl_->model->n_embd();
+        if (impl_->fc->enable_crt(max_dim)) {
+            std::fprintf(stderr, "[sp-engine] CRT multi-GPU enabled (max_dim=%d)\n", max_dim);
+        } else {
+            std::fprintf(stderr, "[sp-engine] CRT init failed — falling back to standard matmul\n");
+        }
+    }
+
+    // ── MoE expert curriculum (Beast Canyon homeostatic balancer) ────
+    if (cfg.moe_curriculum) {
+        if (impl_->fc->enable_moe_curriculum()) {
+            std::fprintf(stderr, "[sp-engine] MoE curriculum active\n");
+        } else {
+            std::fprintf(stderr, "[sp-engine] MoE curriculum not available (non-MoE model?)\n");
+        }
+    }
+
     // ── Native forward (Phase 4) ────────────────────────────────────
     // When SHANNON_PRIME_NATIVE=1 in env (or SP_ENGINE_NATIVE=1, both
     // accepted), build a parallel ForwardNativeContext that drives

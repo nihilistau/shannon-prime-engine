@@ -547,3 +547,67 @@ codebase differs from the state when 128 tokens were validated. Possible causes:
   state, not treat the hang as unsolvable.
 - **COMMIT working code immediately** when something validates on device
 
+---
+
+## Session: 2026-05-07 — MoE Expert Curriculum + Top-2 Speculative Prefetch
+
+### What Was Done
+
+Built and shipped the complete MoE expert management system for heterogeneous
+multi-GPU dispatch (Beast Canyon: RTX 2060 + Intel UHD).
+
+**New CRT backend headers (lib/shannon-prime/backends/crt/):**
+- `sp_moe_curriculum.h` — EWMA heatmap with Curriculum Pulse rebalancing
+- `sp_prefetch_engine.h` — Top-2 speculative prefetch with confidence gate
+- `sp_crt_cuda_stub.c` — link stubs for non-CUDA builds
+
+**MoE Expert Curriculum:**
+- Per-layer EWMA scores track expert activation rates (alpha=0.05, configurable)
+- Curriculum Pulse every 128 tokens: re-ranks experts, assigns to GPU tiers
+  (top 50% → RTX 2060 Powerhouse tier, bottom 50% → Intel UHD Proximity tier)
+- Supports up to 256 experts (SP_MOE_MAX_EXPERTS=256)
+- Confidence query API: `sp_moe_get_top_k_confidence()`, `sp_moe_top_k_confidence()`
+
+**Top-2 Speculative Prefetch:**
+- Dual-slot shadow buffers: each slot holds primary (#1) + secondary (#2) experts
+- `sp_prefetch_shred_dual()`: shreds both predicted experts via weight callback
+- Confidence gate: skips speculation when combined top-K probability < tau (0.75)
+- Adaptive alpha: auto-tunes EWMA decay based on hit rate (70% floor, 90% ceiling)
+- Full telemetry: primary_hits, secondary_hits, misses, gated_skips, rates
+
+**Engine integration:**
+- `--moe-curriculum` CLI flag enables the full system
+- `forward.cpp`: curriculum init from GGUF expert_count, tick on decode, adapt on pulse
+- `engine.cpp`: curriculum enable block after CRT init
+- Graceful decline for dense (non-MoE) models
+
+**CUDA stubs for non-CUDA builds:**
+- `sp_crt_cuda_stub.c` provides no-op symbols for all CRT CUDA/Vulkan functions
+- CMakeLists.txt conditionally includes stubs when SP_ENGINE_WITH_CUDA=OFF
+- Fixes LNK2019 unresolved externals that blocked non-CUDA builds
+
+### What Was Proven
+- **Qwen3.6-35B-A3B** (256 experts, top-8, 40 layers): curriculum initialised,
+  5364-node MoE graph built, prefill completed, decode started (CPU-only, no GPU)
+- **Qwen3-0.6B** (dense): graceful decline ("requires n_expert >= 2"), normal inference
+- **Clean build**: 69/69 targets linked (VS18 + Ninja, non-CUDA)
+- **Tag**: `v0.7.0-moe-curriculum` (engine d1421f7, submodule a9b8d10)
+
+### Files Modified
+| File | Change |
+|------|--------|
+| `lib/shannon-prime/backends/crt/sp_moe_curriculum.h` | NEW: EWMA heatmap + tier assignment + confidence queries |
+| `lib/shannon-prime/backends/crt/sp_prefetch_engine.h` | NEW→REWRITTEN: Top-2 dual-slot prefetch + confidence gate |
+| `lib/shannon-prime/backends/crt/sp_crt_cuda_stub.c` | NEW: non-CUDA link stubs |
+| `CMakeLists.txt` | CUDA stub conditional, CRT include paths |
+| `src/forward.cpp` | Curriculum init/tick/adapt, prefetch stats update |
+| `src/forward.h` | `enable_moe_curriculum()`, `print_moe_curriculum_stats()` |
+| `src/engine.cpp` | Curriculum enable block |
+| `src/engine.h` | `moe_curriculum` config field |
+| `src/cli/main.cpp` | `--moe-curriculum` flag |
+
+### What's Next
+1. **Beast Canyon dual-GPU validation** — run with CUDA enabled, both GPUs, real heatmap accumulation
+2. **GPU offload MoE decode** — Qwen3.6-35B-A3B with `--n-gpu-layers` to see real tier dispatch
+3. **Phase 9 integration** — connect curriculum heatmap to JIT expert streaming on phone
+

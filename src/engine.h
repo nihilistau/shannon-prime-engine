@@ -77,6 +77,12 @@ struct Config {
     // for heterogeneous GPU pairs (e.g., RTX 2060 + Intel UHD).
     bool        crt_split = false;
 
+    // MoE expert curriculum — homeostatic expert balancer for Beast Canyon.
+    // When true and the model is MoE (n_expert >= 2), enables EWMA-based
+    // expert heatmap tracking + predictive prefetch for zero-bubble inference.
+    // Hot experts → RTX 2060 (Tier 1), cool experts → Intel UHD (Tier 2).
+    bool        moe_curriculum = false;
+
     // Positional-encoding mode.
     // Default is PrimePe (lattice-aligned RoPE frequencies) — proven −0.6%
     // to −0.8% PPL improvement across architectures at zero runtime cost.

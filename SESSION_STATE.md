@@ -1,5 +1,5 @@
 # SESSION_STATE.md — Shannon-Prime Engine Live State
-# Updated: 2026-05-05 | Phase: 8 NEON Oracle — Code Complete, Decode BLOCKED
+# Updated: 2026-05-07 | Phase: 8+ MoE Curriculum + Top-2 Prefetch SHIPPED
 
 ## Current Proven Metrics (Device-Validated)
 
@@ -71,6 +71,7 @@ Device                   = S22 Ultra (SM8450 / Waipio / Hexagon V69)
 - [x] System 1/2 entropy-gated dual-cache
 - [x] Runtime graph build (MatMul, KQ+Softmax) -- Phase 2.5
 - [x] Phase 8: SpOracle + speculative decode loop -- builds clean Android + Windows
+- [x] Phase 8+: MoE curriculum + Top-2 prefetch + confidence gate -- SHIPPED v0.7.0
 - [x] Prefill (single forward pass, 4 splits) -- works every time
 - [ ] **Decode (multi-token generation) -- BLOCKED by 5th-execute hang**
 
@@ -101,9 +102,18 @@ Options to explore:
 - CLI: `qnn_oracle_bench` and `qnn_bin_generate` verbs
 - Cannot validate on device until decode hang is fixed
 
+### Phase 8+: MoE Expert Curriculum + Top-2 Speculative Prefetch (SHIPPED -- 2026-05-07)
+- `sp_moe_curriculum.h` -- EWMA heatmap, curriculum pulse, tier assignment
+- `sp_prefetch_engine.h` -- dual-slot Top-2 speculative prefetch + confidence gate
+- Validated on Qwen3.6-35B-A3B (256 experts, top-8, 40 layers) -- desktop CPU
+- Validated graceful decline on dense models (Qwen3-0.6B)
+- CLI: `--moe-curriculum` flag enables full system
+- Tag: `v0.7.0-moe-curriculum` (engine d1421f7, submodule a9b8d10)
+
 ### Phase 9: MoE Scaling (Qwen 3.6 27B)
 - JIT expert streaming, HTP persistent context per active expert
 - Blocked on Phase 8 validation + decode fix
+- MoE curriculum now provides the expert heatmap for JIT prefetch decisions
 
 ## Blockers / Known Issues
 
