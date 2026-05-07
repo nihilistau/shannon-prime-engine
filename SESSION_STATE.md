@@ -80,6 +80,9 @@ Device                   = S22 Ultra (SM8450 / Waipio / Hexagon V69)
   - [x] Diagnostics pulse monitor (stride/PCIe/barrier latency tracking)
   - [x] `--beast <gguf>` CLI flag + `beast_test` verb
   - [x] Verified: Dolphin-1B Q4_K_M — 148 tensors, 2.88 ms boot, 1.56 µs stride
+  - [x] Dual-GPU auto-detection: RTX 2060 (12 GB CUDA) + Intel UHD (16 GB Vulkan)
+  - [x] CUDA stream/event + Vulkan instance auto-provisioned at boot
+  - [x] MinGW cudart linkage: gendef+dlltool import lib from DLL (no nvcc needed)
 - [x] CLI unified flag parser -- all verbs accept all engine Config flags (a379442)
 - [x] Prefill (single forward pass, 4 splits) -- works every time
 - [ ] **Decode (multi-token generation) -- BLOCKED by 5th-execute hang**
