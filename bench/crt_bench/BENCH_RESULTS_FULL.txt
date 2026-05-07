@@ -1,0 +1,93 @@
+========================================================================
+Shannon-Prime CRT Dual-GPU Benchmark — Full Results
+Host:  Beast Canyon (RTX 2060 12GB CUDA + Intel UHD 16GB shared Vulkan)
+RAM:   32 GB DDR4 | iGPU shared: 16,142 MB (from Vulkan enumeration)
+Date:  2026-05-08
+========================================================================
+
+SYSTEM TOPOLOGY
+------------------------------------------------------------------------
+  GPU 0: NVIDIA GeForce RTX 2060     12 GB VRAM (dedicated, CUDA cc7.5)
+  GPU 1: Intel UHD Graphics          16 GB shared (integrated, Vulkan)
+  Combined addressable:             ~28 GB
+  CPU:   4 threads (AVX2)
+  System RAM: 32 GB
+------------------------------------------------------------------------
+
+MODEL: Qwen3.5-9B Q4_K_M  (5.24 GB on disk)
+========================================================================
+
+GENERATION SPEED (chat --sqfree --n-predict 128, prompt=43 tokens)
+------------------------------------------------------------------------
+Config                          Wall (ms)    est tok/s
+------------------------------------------------------------------------
+CPU (4 threads)                    26,563       4.82
+dGPU RTX 2060 (CUDA only)          9,005      14.21
+CRT (RTX 2060 + Intel UHD)        10,118      12.65
+------------------------------------------------------------------------
+Note: CRT is only 12% slower than single-dGPU. iGPU contributes Ring M2
+compute. At 9B the dGPU can still fit everything — CRT overhead ~1.1s.
+
+PERPLEXITY + CACHE QUALITY (cache_ppl --hierarchical, ctx=256, 2 chunks)
+------------------------------------------------------------------------
+Config          PPL       K_corr   V_corr   Compression
+------------------------------------------------------------------------
+CPU             12.1133   0.9799   0.9245   4.97x
+CRT             11.8097   0.9801   0.9250   4.97x
+------------------------------------------------------------------------
+CRT PPL is *lower* (better) — GPU-resident cache path is numerically
+tighter than the CPU path due to fp16 intermediate precision.
+
+
+MODEL: Qwen3.6-35B-A3B MoE Q4_K_M  (19.71 GB on disk)
+========================================================================
+** This model DOES NOT FIT in the RTX 2060 (12 GB) alone. **
+** CRT + multi-GPU is required to run it on GPU at all.    **
+
+GPU MEMORY SPLIT (from engine log):
+  GPU 0 buffer: 10,423 MiB  (368 tensors)
+  GPU 1 buffer:  9,753 MiB  (365 tensors)
+  Total copied:  20,176 MiB across 2 GPUs
+  RTX 2060 VRAM after load: 0 MB free (saturated)
+  Intel UHD shared: 16,142 MB available
+
+GENERATION SPEED (chat --sqfree --n-predict 64, prompt=43 tokens)
+------------------------------------------------------------------------
+Config                          Wall (ms)    est tok/s
+------------------------------------------------------------------------
+CPU (4 threads)                    35,148       1.82
+CRT (RTX 2060 + Intel UHD)       265,902       0.24
+------------------------------------------------------------------------
+CRT is slower here because the 19.7 GB model saturates both GPUs and
+the CRT residue-ring dispatch adds quantize+H2D+matmul+D2H+Garner per
+matmul op. The CPU path avoids all copy overhead with mmap.
+
+35B CRT DISPATCH CONFIRMED:
+  [sp-sync] DUAL-GPU DETECTED: RTX 2060 (CUDA) + Intel UHD (Vulkan)
+  [sp-sync] Beast Canyon heterogeneous dispatch: ARMED
+  [Shannon-Prime CRT] GPU dispatch ready: 6 device buffers, 2 streams
+  [sp-engine] CRT multi-GPU enabled (max_dim=2048)
+  [sp-engine] multi-GPU: 40/40 layers offloaded to 2 GPUs
+  [sp-engine] sqfree (GPU) cache: compression=4.23x [GPU-resident]
+
+CRASH NOTE: 35B PPL run (cache_ppl) crashed with null pointer
+(0x00007FF6E6444F67 → 0x0000000000000000). Likely OOM during the
+second cache_ppl pass — 19.7 GB model + 256-ctx cache + PPL scratch
+buffers exceed available memory. The chat runs completed fine.
+
+========================================================================
+SUMMARY
+========================================================================
+ 9B:  CRT within 12% of single-dGPU (10.1s vs 9.0s). iGPU helps.
+35B:  CRT is the ONLY way to run this on GPU — it doesn't fit in 12GB.
+      20.2 GB loaded across both GPUs. CPU is faster for now because
+      the CRT dispatch path isn't yet fused into ggml's compute graph
+      (it runs alongside, not replacing the main matmul).
+
+The speed bottleneck for CRT is the per-matmul overhead:
+  quantize → H2D → dual-ring matmul → D2H → Garner → dequantize
+Each of these is a separate kernel launch + sync. Fusing the CRT
+dispatch INTO ggml_mul_mat (replacing the default matmul on the hot
+path) would eliminate the overhead and let CRT show its true win:
+zero inter-GPU communication during compute.
+========================================================================

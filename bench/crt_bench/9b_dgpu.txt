@@ -1,0 +1,46 @@
+﻿sp-engine.exe : ggml_cuda_init: found 1 CUDA devices (Total VRAM: 12287 MiB):
+At D:\F\shannon-prime-repos\shannon-prime-engine\bench\crt_bench\run_bench2.ps1:24 char:1
++ & $exe chat --model $model9b --sqfree --ctx 512 --n-predict 128 --n-g ...
++ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (ggml_cuda_init:...AM: 12287 MiB)::String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+  Device 0: NVIDIA GeForce RTX 2060, compute capability 7.5, VMM: yes, VRAM: 12287 MiB
+ggml_vulkan: Found 2 Vulkan devices:
+ggml_vulkan: 0 = NVIDIA GeForce RTX 2060 (NVIDIA) | uma: 0 | fp16: 1 | bf16: 1 | warp size: 32 | shared memory: 49152 
+| int dot: 1 | matrix cores: NV_coopmat2
+ggml_vulkan: 1 = Intel(R) UHD Graphics (Intel Corporation) | uma: 1 | fp16: 1 | bf16: 0 | warp size: 32 | shared 
+memory: 32768 | int dot: 1 | matrix cores: none
+[sp-engine] backend: CUDA0 (GPU)
+[sp-engine:diag] load_backend_offload_: enter             VRAM free=10.95 GiB used=1.05 GiB / total=12.00 GiB
+[sp-engine:diag] gguf named tensors: 427, sum(ggml_nbytes)=5355.91 MiB
+[sp-engine:diag]   type=14 count=22 bytes=1442.11 MiB
+[sp-engine:diag]   type=0 count=177 bytes=4.05 MiB
+[sp-engine:diag]   type=12 count=204 bytes=3381.75 MiB
+[sp-engine:diag]   type=13 count=24 bytes=528.00 MiB
+[sp-engine:diag] after mmap_ctx walk                      VRAM free=10.95 GiB used=1.05 GiB / total=12.00 GiB
+[sp-engine:diag] before ggml_backend_alloc_ctx_tensors    VRAM free=10.95 GiB used=1.05 GiB / total=12.00 GiB
+[sp-engine:diag] backend_buf_size=5355.91 MiB (what ggml allocated on backend)
+[sp-engine:diag] after ggml_backend_alloc_ctx_tensors     VRAM free=5.72 GiB used=6.28 GiB / total=12.00 GiB
+[sp-engine] LlamaWeights: offloaded 427 tensors (5355.91 MiB) to backend
+[sp-engine:diag] after all tensor_set copies              VRAM free=5.72 GiB used=6.28 GiB / total=12.00 GiB
+[sp-engine:diag] after mmap ctx + gguf free               VRAM free=5.72 GiB used=6.28 GiB / total=12.00 GiB
+[sp-engine] ForwardContext: multi-backend scheduler active (GPU + CPU fallback)
+[sp-cuda-sqfree] init: hd=256 pad_dim=330 sk_k=165 n_res=127 n_terms=173 res_bits=3 spinor=0 bytes_per_pos k=149 v=116 
+total=5.63 MB
+[Shannon-Prime SQFREE] K band bits (4 bands): 5,5,4,3
+[Shannon-Prime SQFREE] sk_k=165 pad_dim=330 n_res=127
+[sp-engine] KvCache::create_gpu: sqfree path, hd=256 pad_dim=330 sk_k=165 n_res=127 res_bits=3
+[sp-engine] sqfree (GPU) cache: n_layer=32 n_head_kv=4 head_dim=256 pad_dim=330 max_seq=174 compression=4.23x 
+[GPU-resident]
+[sp-engine] PE: PrimePE-RoPE (composite-tiered, alpha=0.17)
+[sp-engine:diag] bind_cache: is_gpu=1 n_layer=32 n_head_kv=4 head_dim=256 max_seq=174
+[sp-mertens] Initialized for ctx=174: 8 high-risk positions flagged, O(1) risk cache active (0 KB)
+[sp-engine] Cauchy system initialized: mode=2 fixed_n=512 ricci=no mertens=yes params_b=0.00
+[sp-engine] forward_full: graph built ΓÇö 3652 nodes, 0 leafs
+[sp-engine] forward_full: alloc OK, starting compute...
+[Shannon-Prime SQFREE] svd-entropy-ranked calibration (pad_dim=330, n_vectors=1344)
+[Shannon-Prime SQFREE] calibrated: sk_k=165 (L/2=165) pad_dim=330 n_res=127 n_vectors=1344
+You are a helpful coding assistant. Write a Python function that computes the first N prime numbers using a sieve of Eratosthenes. Include type hints and a docstring explaining the algorithm step by step.
+
+[sp-engine:diag] decode() first call: gpu_cache=1 past_n=42

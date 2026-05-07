@@ -1,0 +1,123 @@
+﻿sp-engine.exe : ggml_cuda_init: found 1 CUDA devices (Total VRAM: 12287 MiB):
+At D:\F\shannon-prime-repos\shannon-prime-engine\bench\run_bench.ps1:24 char:1
++ & $exe cache_ppl --model $model --hierarchical --ctx 256 --chunks 2 - ...
++ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (ggml_cuda_init:...AM: 12287 MiB)::String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+  Device 0: NVIDIA GeForce RTX 2060, compute capability 7.5, VMM: yes, VRAM: 12287 MiB
+ggml_vulkan: Found 2 Vulkan devices:
+ggml_vulkan: 0 = NVIDIA GeForce RTX 2060 (NVIDIA) | uma: 0 | fp16: 1 | bf16: 1 | warp size: 32 | shared memory: 49152 
+| int dot: 1 | matrix cores: NV_coopmat2
+ggml_vulkan: 1 = Intel(R) UHD Graphics (Intel Corporation) | uma: 1 | fp16: 1 | bf16: 0 | warp size: 32 | shared 
+memory: 32768 | int dot: 1 | matrix cores: none
+[sp-engine] backend: CUDA0 (GPU)
+[sp-engine:diag] load_backend_offload_: enter             VRAM free=10.95 GiB used=1.05 GiB / total=12.00 GiB
+[sp-engine:diag] gguf named tensors: 435, sum(ggml_nbytes)=2001.74 MiB
+[sp-engine:diag]   type=14 count=37 bytes=568.27 MiB
+[sp-engine:diag]   type=12 count=217 bytes=1432.55 MiB
+[sp-engine:diag]   type=0 count=181 bytes=0.92 MiB
+[sp-engine:diag] after mmap_ctx walk                      VRAM free=10.95 GiB used=1.05 GiB / total=12.00 GiB
+[sp-engine:diag] before ggml_backend_alloc_ctx_tensors    VRAM free=10.95 GiB used=1.05 GiB / total=12.00 GiB
+[sp-engine:diag] backend_buf_size=2001.75 MiB (what ggml allocated on backend)
+[sp-engine:diag] after ggml_backend_alloc_ctx_tensors     VRAM free=9.00 GiB used=3.00 GiB / total=12.00 GiB
+[sp-engine] LlamaWeights: offloaded 435 tensors (2001.74 MiB) to backend
+[sp-engine:diag] after all tensor_set copies              VRAM free=9.00 GiB used=3.00 GiB / total=12.00 GiB
+[sp-engine:diag] after mmap ctx + gguf free               VRAM free=9.00 GiB used=3.00 GiB / total=12.00 GiB
+[sp-engine] tokenised 198603 bytes -> 122666 tokens
+[sp-engine] ForwardContext: multi-backend scheduler active (GPU + CPU fallback)
+[Shannon-Prime HIER] pad_dim=154, skeleton=14 (9.1%), target=140, skel_bands=14 bytes, res_bits=K2/V2, ternary_mask=0x0
+[Shannon-Prime HIER] bytes/pos: K=53 V=53 (4.8├ù vs fp16)
+[sp-cuda-hier] init: pd=154 skel=14 target=140 res_bits=2 bytes_per_pos=53 n_slots=72 max_seq=256
+[sp-engine] KvCache::create_gpu: hier path, hd=128 pad_dim=154 n_skel=14 n_target=140 res_bits=2 bytes_per_pos=53
+[sp-engine] hierarchical (GPU) cache: n_layer=36 n_head_kv=2 head_dim=128 pad_dim=154 max_seq=256 compression=4.83x 
+skel=14/154 (9%) K=53B/pos V=53B/pos [GPU-resident]
+[sp-mertens] Initialized for ctx=256: 13 high-risk positions flagged, O(1) risk cache active (1 KB)
+[sp-engine] Cauchy system initialized: mode=2 fixed_n=512 ricci=no mertens=yes params_b=0.00
+[sp-engine] cache_ppl: n_ctx=256  chunks=2  mode=hierarchical
+[sp-engine] forward_full: graph built ΓÇö 1156 nodes, 0 leafs
+[sp-engine] forward_full: alloc OK, starting compute...
+[Shannon-Prime HIER] calibrated: 14 skeleton ΓåÆ 140 target, W = 14├ù140 (3.8 KB fp16), n_vectors=256
+[Shannon-Prime HIER] calibrated: 14 skeleton ΓåÆ 140 target, W = 14├ù140 (3.8 KB fp16), n_vectors=256
+[Shannon-Prime HIER] calibrated: 14 skeleton ΓåÆ 140 target, W = 14├ù140 (3.8 KB fp16), n_vectors=256
+[Shannon-Prime HIER] calibrated: 14 skeleton ΓåÆ 140 target, W = 14├ù140 (3.8 KB fp16), n_vectors=256
+[Shannon-Prime HIER] calibrated: 14 skeleton ΓåÆ 140 target, W = 14├ù140 (3.8 KB fp16), n_vectors=256
+[Shannon-Prime HIER] calibrated: 14 skeleton ΓåÆ 140 target, W = 14├ù140 (3.8 KB fp16), n_vectors=256
+[Shannon-Prime HIER] calibrated: 14 skeleton ΓåÆ 140 target, W = 14├ù140 (3.8 KB fp16), n_vectors=256
+[Shannon-Prime HIER] calibrated: 14 skeleton ΓåÆ 140 target, W = 14├ù140 (3.8 KB fp16), n_vectors=256
+[Shannon-Prime HIER] calibrated: 14 skeleton ΓåÆ 140 target, W = 14├ù140 (3.8 KB fp16), n_vectors=256
+[Shannon-Prime HIER] calibrated: 14 skeleton ΓåÆ 140 target, W = 14├ù140 (3.8 KB fp16), n_vectors=256
+[Shannon-Prime HIER] calibrated: 14 skeleton ΓåÆ 140 target, W = 14├ù140 (3.8 KB fp16), n_vectors=256
+[Shannon-Prime HIER] calibrated: 14 skeleton ΓåÆ 140 target, W = 14├ù140 (3.8 KB fp16), n_vectors=256
+[Shannon-Prime HIER] calibrated: 14 skeleton ΓåÆ 140 target, W = 14├ù140 (3.8 KB fp16), n_vectors=256
+[Shannon-Prime HIER] calibrated: 14 skeleton ΓåÆ 140 target, W = 14├ù140 (3.8 KB fp16), n_vectors=256
+[Shannon-Prime HIER] calibrated: 14 skeleton ΓåÆ 140 target, W = 14├ù140 (3.8 KB fp16), n_vectors=256
+[Shannon-Prime HIER] calibrated: 14 skeleton ΓåÆ 140 target, W = 14├ù140 (3.8 KB fp16), n_vectors=256
+[Shannon-Prime HIER] calibrated: 14 skeleton ΓåÆ 140 target, W = 14├ù140 (3.8 KB fp16), n_vectors=256
+[Shannon-Prime HIER] calibrated: 14 skeleton ΓåÆ 140 target, W = 14├ù140 (3.8 KB fp16), n_vectors=256
+[Shannon-Prime HIER] calibrated: 14 skeleton ΓåÆ 140 target, W = 14├ù140 (3.8 KB fp16), n_vectors=256
+[Shannon-Prime HIER] calibrated: 14 skeleton ΓåÆ 140 target, W = 14├ù140 (3.8 KB fp16), n_vectors=256
+[Shannon-Prime HIER] calibrated: 14 skeleton ΓåÆ 140 target, W = 14├ù140 (3.8 KB fp16), n_vectors=256
+[Shannon-Prime HIER] calibrated: 14 skeleton ΓåÆ 140 target, W = 14├ù140 (3.8 KB fp16), n_vectors=256
+[Shannon-Prime HIER] calibrated: 14 skeleton ΓåÆ 140 target, W = 14├ù140 (3.8 KB fp16), n_vectors=256
+[Shannon-Prime HIER] calibrated: 14 skeleton ΓåÆ 140 target, W = 14├ù140 (3.8 KB fp16), n_vectors=256
+[Shannon-Prime HIER] calibrated: 14 skeleton ΓåÆ 140 target, W = 14├ù140 (3.8 KB fp16), n_vectors=256
+[Shannon-Prime HIER] calibrated: 14 skeleton ΓåÆ 140 target, W = 14├ù140 (3.8 KB fp16), n_vectors=256
+[Shannon-Prime HIER] calibrated: 14 skeleton ΓåÆ 140 target, W = 14├ù140 (3.8 KB fp16), n_vectors=256
+[Shannon-Prime HIER] calibrated: 14 skeleton ΓåÆ 140 target, W = 14├ù140 (3.8 KB fp16), n_vectors=256
+[Shannon-Prime HIER] calibrated: 14 skeleton ΓåÆ 140 target, W = 14├ù140 (3.8 KB fp16), n_vectors=256
+[Shannon-Prime HIER] calibrated: 14 skeleton ΓåÆ 140 target, W = 14├ù140 (3.8 KB fp16), n_vectors=256
+[Shannon-Prime HIER] calibrated: 14 skeleton ΓåÆ 140 target, W = 14├ù140 (3.8 KB fp16), n_vectors=256
+[Shannon-Prime HIER] calibrated: 14 skeleton ΓåÆ 140 target, W = 14├ù140 (3.8 KB fp16), n_vectors=256
+[Shannon-Prime HIER] calibrated: 14 skeleton ΓåÆ 140 target, W = 14├ù140 (3.8 KB fp16), n_vectors=256
+[Shannon-Prime HIER] calibrated: 14 skeleton ΓåÆ 140 target, W = 14├ù140 (3.8 KB fp16), n_vectors=256
+[Shannon-Prime HIER] calibrated: 14 skeleton ΓåÆ 140 target, W = 14├ù140 (3.8 KB fp16), n_vectors=256
+[Shannon-Prime HIER] calibrated: 14 skeleton ΓåÆ 140 target, W = 14├ù140 (3.8 KB fp16), n_vectors=256
+[Shannon-Prime HIER] calibrated: 14 skeleton ΓåÆ 140 target, W = 14├ù140 (3.8 KB fp16), n_vectors=256
+[Shannon-Prime HIER] calibrated: 14 skeleton ΓåÆ 140 target, W = 14├ù140 (3.8 KB fp16), n_vectors=256
+[Shannon-Prime HIER] calibrated: 14 skeleton ΓåÆ 140 target, W = 14├ù140 (3.8 KB fp16), n_vectors=256
+[Shannon-Prime HIER] calibrated: 14 skeleton ΓåÆ 140 target, W = 14├ù140 (3.8 KB fp16), n_vectors=256
+[Shannon-Prime HIER] calibrated: 14 skeleton ΓåÆ 140 target, W = 14├ù140 (3.8 KB fp16), n_vectors=256
+[Shannon-Prime HIER] calibrated: 14 skeleton ΓåÆ 140 target, W = 14├ù140 (3.8 KB fp16), n_vectors=256
+[Shannon-Prime HIER] calibrated: 14 skeleton ΓåÆ 140 target, W = 14├ù140 (3.8 KB fp16), n_vectors=256
+[Shannon-Prime HIER] calibrated: 14 skeleton ΓåÆ 140 target, W = 14├ù140 (3.8 KB fp16), n_vectors=256
+[Shannon-Prime HIER] calibrated: 14 skeleton ΓåÆ 140 target, W = 14├ù140 (3.8 KB fp16), n_vectors=256
+[Shannon-Prime HIER] calibrated: 14 skeleton ΓåÆ 140 target, W = 14├ù140 (3.8 KB fp16), n_vectors=256
+[Shannon-Prime HIER] calibrated: 14 skeleton ΓåÆ 140 target, W = 14├ù140 (3.8 KB fp16), n_vectors=256
+[Shannon-Prime HIER] calibrated: 14 skeleton ΓåÆ 140 target, W = 14├ù140 (3.8 KB fp16), n_vectors=256
+[Shannon-Prime HIER] calibrated: 14 skeleton ΓåÆ 140 target, W = 14├ù140 (3.8 KB fp16), n_vectors=256
+[Shannon-Prime HIER] calibrated: 14 skeleton ΓåÆ 140 target, W = 14├ù140 (3.8 KB fp16), n_vectors=256
+[Shannon-Prime HIER] calibrated: 14 skeleton ΓåÆ 140 target, W = 14├ù140 (3.8 KB fp16), n_vectors=256
+[Shannon-Prime HIER] calibrated: 14 skeleton ΓåÆ 140 target, W = 14├ù140 (3.8 KB fp16), n_vectors=256
+[Shannon-Prime HIER] calibrated: 14 skeleton ΓåÆ 140 target, W = 14├ù140 (3.8 KB fp16), n_vectors=256
+[Shannon-Prime HIER] calibrated: 14 skeleton ΓåÆ 140 target, W = 14├ù140 (3.8 KB fp16), n_vectors=256
+[Shannon-Prime HIER] calibrated: 14 skeleton ΓåÆ 140 target, W = 14├ù140 (3.8 KB fp16), n_vectors=256
+[Shannon-Prime HIER] calibrated: 14 skeleton ΓåÆ 140 target, W = 14├ù140 (3.8 KB fp16), n_vectors=256
+[Shannon-Prime HIER] calibrated: 14 skeleton ΓåÆ 140 target, W = 14├ù140 (3.8 KB fp16), n_vectors=256
+[Shannon-Prime HIER] calibrated: 14 skeleton ΓåÆ 140 target, W = 14├ù140 (3.8 KB fp16), n_vectors=256
+[Shannon-Prime HIER] calibrated: 14 skeleton ΓåÆ 140 target, W = 14├ù140 (3.8 KB fp16), n_vectors=256
+[Shannon-Prime HIER] calibrated: 14 skeleton ΓåÆ 140 target, W = 14├ù140 (3.8 KB fp16), n_vectors=256
+[Shannon-Prime HIER] calibrated: 14 skeleton ΓåÆ 140 target, W = 14├ù140 (3.8 KB fp16), n_vectors=256
+[Shannon-Prime HIER] calibrated: 14 skeleton ΓåÆ 140 target, W = 14├ù140 (3.8 KB fp16), n_vectors=256
+[Shannon-Prime HIER] calibrated: 14 skeleton ΓåÆ 140 target, W = 14├ù140 (3.8 KB fp16), n_vectors=256
+[Shannon-Prime HIER] calibrated: 14 skeleton ΓåÆ 140 target, W = 14├ù140 (3.8 KB fp16), n_vectors=256
+[Shannon-Prime HIER] calibrated: 14 skeleton ΓåÆ 140 target, W = 14├ù140 (3.8 KB fp16), n_vectors=256
+[Shannon-Prime HIER] calibrated: 14 skeleton ΓåÆ 140 target, W = 14├ù140 (3.8 KB fp16), n_vectors=256
+[Shannon-Prime HIER] calibrated: 14 skeleton ΓåÆ 140 target, W = 14├ù140 (3.8 KB fp16), n_vectors=256
+[Shannon-Prime HIER] calibrated: 14 skeleton ΓåÆ 140 target, W = 14├ù140 (3.8 KB fp16), n_vectors=256
+[Shannon-Prime HIER] calibrated: 14 skeleton ΓåÆ 140 target, W = 14├ù140 (3.8 KB fp16), n_vectors=256
+[Shannon-Prime HIER] calibrated: 14 skeleton ΓåÆ 140 target, W = 14├ù140 (3.8 KB fp16), n_vectors=256
+[Shannon-Prime HIER] calibrated: 14 skeleton ΓåÆ 140 target, W = 14├ù140 (3.8 KB fp16), n_vectors=256
+[Shannon-Prime HIER] calibrated: 14 skeleton ΓåÆ 140 target, W = 14├ù140 (3.8 KB fp16), n_vectors=256
+[sp-engine:diag] calibrate_end: uploaded 72 hier W matrices to GPU (140├ù14 fp16 each)
+  chunk   1/2  PPL=11.0854  K_corr=0.9882  V_corr=0.9280
+[sp-engine] forward_full: graph built ΓÇö 1156 nodes, 0 leafs
+[sp-engine] forward_full: alloc OK, starting compute...
+  chunk   2/2  PPL=10.8604  K_corr=0.9858  V_corr=0.9281
+[sp-cauchy] mode=dynamic (Ricci+Mertens)  resets=0  last_reset_pos=-999999  mertens_schedule=0/13
+Baseline PPL = 10.8604  (over 254 tokens, 2 chunks at ctx=256)
+Cache K_corr = 0.985847  V_corr = 0.928116
+Ricci drift  = 0.000000
+Compression  = 4.83x
+Corr gap     = 0.014153  (1 - K_corr)
+Scaling term = 0.9415  (4700 ┬╖ gap┬▓)

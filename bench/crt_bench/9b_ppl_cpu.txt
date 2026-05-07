@@ -1,0 +1,68 @@
+﻿sp-engine.exe : [sp-engine] tokenised 198603 bytes -> 122677 tokens
+At D:\F\shannon-prime-repos\shannon-prime-engine\bench\crt_bench\run_bench2.ps1:41 char:1
++ & $exe cache_ppl --model $model9b --hierarchical --ctx 256 --chunks 2 ...
++ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: ([sp-engine] tok...> 122677 tokens:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+ggml_cuda_init: found 1 CUDA devices (Total VRAM: 12287 MiB):
+  Device 0: NVIDIA GeForce RTX 2060, compute capability 7.5, VMM: yes, VRAM: 12287 MiB
+ggml_vulkan: Found 2 Vulkan devices:
+ggml_vulkan: 0 = NVIDIA GeForce RTX 2060 (NVIDIA) | uma: 0 | fp16: 1 | bf16: 1 | warp size: 32 | shared memory: 49152 
+| int dot: 1 | matrix cores: NV_coopmat2
+ggml_vulkan: 1 = Intel(R) UHD Graphics (Intel Corporation) | uma: 1 | fp16: 1 | bf16: 0 | warp size: 32 | shared 
+memory: 32768 | int dot: 1 | matrix cores: none
+[sp-engine] CPU backend: 4 threads
+[sp-engine:diag] bind_gdn_state: n_layer=32 n_gdn=24 conv_kernel=4 conv_channels=8192 head_v_dim=128 num_v_heads=32
+[Shannon-Prime HIER] pad_dim=330, skeleton=30 (9.1%), target=300, skel_bands=24 bytes, res_bits=K2/V2, ternary_mask=0x0
+[Shannon-Prime HIER] bytes/pos: K=103 V=103 (5.0├ù vs fp16)
+[sp-engine] hierarchical cache: n_layer=32 n_head_kv=4 head_dim=256 pad_dim=330 max_seq=256 compression=4.97x 
+skel=30/330 (9%) K=103B/pos V=103B/pos
+[sp-mertens] Initialized for ctx=256: 13 high-risk positions flagged, O(1) risk cache active (1 KB)
+[sp-engine] Cauchy system initialized: mode=2 fixed_n=512 ricci=no mertens=yes params_b=0.00
+[sp-engine] cache_ppl: n_ctx=256  chunks=2  mode=hierarchical
+[sp-engine] forward_full: graph built ΓÇö 4732 nodes, 0 leafs
+[sp-engine] forward_full: alloc OK, starting compute...
+[Shannon-Prime HIER] calibrated: 30 skeleton ΓåÆ 300 target, W = 30├ù300 (17.6 KB fp16), n_vectors=256
+[Shannon-Prime HIER] calibrated: 30 skeleton ΓåÆ 300 target, W = 30├ù300 (17.6 KB fp16), n_vectors=256
+[Shannon-Prime HIER] calibrated: 30 skeleton ΓåÆ 300 target, W = 30├ù300 (17.6 KB fp16), n_vectors=256
+[Shannon-Prime HIER] calibrated: 30 skeleton ΓåÆ 300 target, W = 30├ù300 (17.6 KB fp16), n_vectors=256
+[Shannon-Prime HIER] calibrated: 30 skeleton ΓåÆ 300 target, W = 30├ù300 (17.6 KB fp16), n_vectors=256
+[Shannon-Prime HIER] calibrated: 30 skeleton ΓåÆ 300 target, W = 30├ù300 (17.6 KB fp16), n_vectors=256
+[Shannon-Prime HIER] calibrated: 30 skeleton ΓåÆ 300 target, W = 30├ù300 (17.6 KB fp16), n_vectors=256
+[Shannon-Prime HIER] calibrated: 30 skeleton ΓåÆ 300 target, W = 30├ù300 (17.6 KB fp16), n_vectors=256
+[Shannon-Prime HIER] calibrated: 30 skeleton ΓåÆ 300 target, W = 30├ù300 (17.6 KB fp16), n_vectors=256
+[Shannon-Prime HIER] calibrated: 30 skeleton ΓåÆ 300 target, W = 30├ù300 (17.6 KB fp16), n_vectors=256
+[Shannon-Prime HIER] calibrated: 30 skeleton ΓåÆ 300 target, W = 30├ù300 (17.6 KB fp16), n_vectors=256
+[Shannon-Prime HIER] calibrated: 30 skeleton ΓåÆ 300 target, W = 30├ù300 (17.6 KB fp16), n_vectors=256
+[Shannon-Prime HIER] calibrated: 30 skeleton ΓåÆ 300 target, W = 30├ù300 (17.6 KB fp16), n_vectors=256
+[Shannon-Prime HIER] calibrated: 30 skeleton ΓåÆ 300 target, W = 30├ù300 (17.6 KB fp16), n_vectors=256
+[Shannon-Prime HIER] calibrated: 30 skeleton ΓåÆ 300 target, W = 30├ù300 (17.6 KB fp16), n_vectors=256
+[Shannon-Prime HIER] calibrated: 30 skeleton ΓåÆ 300 target, W = 30├ù300 (17.6 KB fp16), n_vectors=256
+[Shannon-Prime HIER] calibrated: 30 skeleton ΓåÆ 300 target, W = 30├ù300 (17.6 KB fp16), n_vectors=256
+[Shannon-Prime HIER] calibrated: 30 skeleton ΓåÆ 300 target, W = 30├ù300 (17.6 KB fp16), n_vectors=256
+[Shannon-Prime HIER] calibrated: 30 skeleton ΓåÆ 300 target, W = 30├ù300 (17.6 KB fp16), n_vectors=256
+[Shannon-Prime HIER] calibrated: 30 skeleton ΓåÆ 300 target, W = 30├ù300 (17.6 KB fp16), n_vectors=256
+[Shannon-Prime HIER] calibrated: 30 skeleton ΓåÆ 300 target, W = 30├ù300 (17.6 KB fp16), n_vectors=256
+[Shannon-Prime HIER] calibrated: 30 skeleton ΓåÆ 300 target, W = 30├ù300 (17.6 KB fp16), n_vectors=256
+[Shannon-Prime HIER] calibrated: 30 skeleton ΓåÆ 300 target, W = 30├ù300 (17.6 KB fp16), n_vectors=256
+[Shannon-Prime HIER] calibrated: 30 skeleton ΓåÆ 300 target, W = 30├ù300 (17.6 KB fp16), n_vectors=256
+[Shannon-Prime HIER] calibrated: 30 skeleton ΓåÆ 300 target, W = 30├ù300 (17.6 KB fp16), n_vectors=256
+[Shannon-Prime HIER] calibrated: 30 skeleton ΓåÆ 300 target, W = 30├ù300 (17.6 KB fp16), n_vectors=256
+[Shannon-Prime HIER] calibrated: 30 skeleton ΓåÆ 300 target, W = 30├ù300 (17.6 KB fp16), n_vectors=256
+[Shannon-Prime HIER] calibrated: 30 skeleton ΓåÆ 300 target, W = 30├ù300 (17.6 KB fp16), n_vectors=256
+[Shannon-Prime HIER] calibrated: 30 skeleton ΓåÆ 300 target, W = 30├ù300 (17.6 KB fp16), n_vectors=256
+[Shannon-Prime HIER] calibrated: 30 skeleton ΓåÆ 300 target, W = 30├ù300 (17.6 KB fp16), n_vectors=256
+[Shannon-Prime HIER] calibrated: 30 skeleton ΓåÆ 300 target, W = 30├ù300 (17.6 KB fp16), n_vectors=256
+[Shannon-Prime HIER] calibrated: 30 skeleton ΓåÆ 300 target, W = 30├ù300 (17.6 KB fp16), n_vectors=256
+  chunk   1/2  PPL=12.5164  K_corr=0.9897  V_corr=0.9241
+[sp-engine] forward_full: graph built ΓÇö 4732 nodes, 0 leafs
+[sp-engine] forward_full: alloc OK, starting compute...
+  chunk   2/2  PPL=12.1133  K_corr=0.9799  V_corr=0.9245
+[sp-cauchy] mode=dynamic (Ricci+Mertens)  resets=0  last_reset_pos=-999999  mertens_schedule=0/13
+Baseline PPL = 12.1133  (over 254 tokens, 2 chunks at ctx=256)
+Cache K_corr = 0.979903  V_corr = 0.924453
+Ricci drift  = 0.000000
+Compression  = 4.97x
+Corr gap     = 0.020097  (1 - K_corr)
+Scaling term = 1.8982  (4700 ┬╖ gap┬▓)
