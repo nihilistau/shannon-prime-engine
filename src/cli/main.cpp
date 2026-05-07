@@ -2014,7 +2014,8 @@ int main(int argc, char** argv) {
             sp_beast_config_t bcfg;
             sp_beast_config_init(&bcfg);
             bcfg.gguf_path = gguf_path;
-            bcfg.force_cpu_only = true; // CPU-only for test harness
+            // Auto-detect GPUs (CUDA + Vulkan) unless --cpu-only passed
+            bcfg.force_cpu_only = false;
 
             sp_beast_engine_t engine;
             rc = sp_beast_init(&engine, &bcfg);

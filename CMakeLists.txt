@@ -61,6 +61,8 @@ option(SP_ENGINE_WITH_QNN        "Enable Qualcomm QNN HTP backend (V69+ NPU disp
 option(SP_ENGINE_FP8             "Enable FP8 (E4M3) KV cache quantization kernels" OFF)
 option(SP_ENGINE_FP4             "Enable FP4 (Blackwell sm_120+) KV cache quantization" OFF)
 option(SP_ENGINE_WITH_BEAST      "Enable Beast Canyon heterogeneous MoE backend (Optane + AVX-512 + dual-GPU)" OFF)
+option(SP_ENGINE_BEAST_CUDA      "Beast Canyon: link CUDA runtime for GPU detect (no nvcc needed)" OFF)
+option(SP_ENGINE_BEAST_VULKAN    "Beast Canyon: link Vulkan for iGPU detect" OFF)
 option(SP_ENGINE_AUTO_PATCH      "Auto-apply vendor patches before build" ON)
 
 # --------------------------------------------------------------------
@@ -314,12 +316,14 @@ endif()
 # CUDA/Vulkan options).
 # --------------------------------------------------------------------
 if(SP_ENGINE_WITH_BEAST)
-    set(SP_WITH_CUDA   ${SP_ENGINE_WITH_CUDA}   CACHE BOOL "" FORCE)
-    set(SP_WITH_VULKAN ${SP_ENGINE_WITH_VULKAN}  CACHE BOOL "" FORCE)
+    # Beast Canyon GPU detect uses cudart/Vulkan C API only — no nvcc needed.
+    # These are independent of SP_ENGINE_WITH_CUDA (which needs nvcc for .cu).
+    set(SP_WITH_CUDA   ${SP_ENGINE_BEAST_CUDA}   CACHE BOOL "" FORCE)
+    set(SP_WITH_VULKAN ${SP_ENGINE_BEAST_VULKAN}  CACHE BOOL "" FORCE)
     add_subdirectory(${SP_CORE_DIR}/backends/beast_canyon
                      ${CMAKE_BINARY_DIR}/beast_canyon)
     target_link_libraries(sp_beast_canyon PUBLIC shannon_prime_core)
-    message(STATUS "Shannon-Prime Beast Canyon: enabled")
+    message(STATUS "Shannon-Prime Beast Canyon: enabled (CUDA=${SP_ENGINE_BEAST_CUDA}, Vulkan=${SP_ENGINE_BEAST_VULKAN})")
 endif()
 
 # --------------------------------------------------------------------
@@ -483,7 +487,7 @@ message(STATUS "  Hexagon    : ${SP_ENGINE_WITH_HEXAGON} (FastRPC=${SP_ENGINE_HE
 message(STATUS "  QNN HTP    : ${SP_ENGINE_WITH_QNN}")
 message(STATUS "  FP8 (E4M3) : ${SP_ENGINE_FP8}")
 message(STATUS "  FP4 (BW)   : ${SP_ENGINE_FP4}")
-message(STATUS "  Beast Canyon: ${SP_ENGINE_WITH_BEAST}")
+message(STATUS "  Beast Canyon: ${SP_ENGINE_WITH_BEAST} (CUDA=${SP_ENGINE_BEAST_CUDA}, Vulkan=${SP_ENGINE_BEAST_VULKAN})")
 message(STATUS "  auto-patch : ${SP_ENGINE_AUTO_PATCH}")
 message(STATUS "  CLI        : ${SP_ENGINE_BUILD_CLI}")
 message(STATUS "  tests      : ${SP_ENGINE_BUILD_TESTS}")
