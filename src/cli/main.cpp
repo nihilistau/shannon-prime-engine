@@ -252,7 +252,8 @@ static void usage(const char* prog) {
         "                        (env: SP_ENGINE_SAVE_CACHE, SP_ENGINE_LOAD_CACHE)\n"
         "\n"
         "Hierarchical Vilenkin predictor (maximum compression):\n"
-        "  --hierarchical       enable hierarchical predictor (~9%% skeleton)\n"
+        "  --hierarchical       enable hierarchical predictor (~9%% skeleton) [default]\n"
+        "  --no-compression     disable ALL compression (raw fp16 KV, for baseline PPL)\n"
         "  --hier-level <n>     0 = auto, 1..n_primes-1 = explicit\n"
         "  --hier-res-bits <n>  K target residual bits, 1-4 (default: 2)\n"
         "  --hier-res-bits-v <n>  V target residual bits; 0 = same as K\n"
@@ -310,6 +311,7 @@ static int parse_config_flag(sp::engine::Config& cfg, const char* a, const char*
     if (a_eq("--sqfree"))       { cfg.sqfree = true; cfg.hierarchical = false; return 1; }
     if (a_eq("--spinor"))       { cfg.spinor = true; cfg.sqfree = true; cfg.hierarchical = false; return 1; }
     if (a_eq("--hierarchical")) { cfg.hierarchical = true; cfg.sqfree = false; return 1; }
+    if (a_eq("--no-compression")) { cfg.hierarchical = false; cfg.sqfree = false; cfg.spinor = false; cfg.mobius = false; return 1; }
     if (a_eq("--no-mobius"))    { cfg.mobius = false; return 1; }
     if (a_eq("--k-bits")        && has_next) { cfg.k_bits_csv = next; return 2; }
     if (a_eq("--v-bits")        && has_next) { cfg.v_bits_csv = next; return 2; }
@@ -1452,6 +1454,7 @@ int main(int argc, char** argv) {
             if      (a == "--sqfree")    { kvc.sqfree = true; kvc.hierarchical = false; }
             else if (a == "--spinor")    { kvc.spinor = true; kvc.sqfree = true; kvc.hierarchical = false; }
             else if (a == "--no-mobius") kvc.mobius = false;
+            else if (a == "--no-compression") { kvc.hierarchical = false; kvc.sqfree = false; kvc.spinor = false; kvc.mobius = false; }
             else if (a == "--hierarchical") kvc.hierarchical = true;
             else if (a == "--head-dim"  && i + 1 < argc) hd        = std::atoi(argv[++i]);
             else if (a == "--n-tokens"  && i + 1 < argc) n_tokens  = std::atoi(argv[++i]);

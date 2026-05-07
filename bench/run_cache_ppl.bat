@@ -43,7 +43,7 @@ echo.
 echo ============================================================
 echo  5. VANILLA (no compression, reference PPL)
 echo ============================================================
-%ENGINE% cache_ppl --model %MODEL% --ctx %CTX% --chunks %CHUNKS% %TEXT%
+%ENGINE% cache_ppl --model %MODEL% --no-compression --ctx %CTX% --chunks %CHUNKS% %TEXT%
 
 echo.
 echo Done.
