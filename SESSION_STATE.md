@@ -72,6 +72,7 @@ Device                   = S22 Ultra (SM8450 / Waipio / Hexagon V69)
 - [x] Runtime graph build (MatMul, KQ+Softmax) -- Phase 2.5
 - [x] Phase 8: SpOracle + speculative decode loop -- builds clean Android + Windows
 - [x] Phase 8+: MoE curriculum + Top-2 prefetch + confidence gate -- SHIPPED v0.7.0
+- [x] CLI unified flag parser -- all verbs accept all engine Config flags (a379442)
 - [x] Prefill (single forward pass, 4 splits) -- works every time
 - [ ] **Decode (multi-token generation) -- BLOCKED by 5th-execute hang**
 

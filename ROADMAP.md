@@ -127,7 +127,8 @@ larger models (27B MoE) where we can't fit everything in memory at once.
 
 ## Phase 8: NEON Oracle + MoE Expert Curriculum
 **Status:** IMPLEMENTED (2026-05-07) — NEON oracle pending device validation;
-MoE curriculum + Top-2 prefetch validated on desktop (Qwen3.6-35B-A3B, 256 experts)
+MoE curriculum + Top-2 prefetch validated on desktop (Qwen3.6-35B-A3B, 256 experts).
+CLI unified: all verbs accept all engine flags via shared `parse_config_flag()` (a379442).
 **Goal:** Use ARM NEON cores for speculative token prediction, MoE expert
 routing, and high-speed tokenization. The CPU becomes the "brain" while
 the DSP is the "muscle."

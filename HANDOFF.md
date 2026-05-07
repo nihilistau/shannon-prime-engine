@@ -611,3 +611,48 @@ multi-GPU dispatch (Beast Canyon: RTX 2060 + Intel UHD).
 2. **GPU offload MoE decode** — Qwen3.6-35B-A3B with `--n-gpu-layers` to see real tier dispatch
 3. **Phase 9 integration** — connect curriculum heatmap to JIT expert streaming on phone
 
+---
+
+## Session: 2026-05-07 — CLI Unified Flag Parser Refactor
+
+### What Was Done
+
+Replaced 5 separate inline flag parsers with a single `parse_config_flag()` function.
+Every CLI verb now accepts every engine Config flag through one canonical code path.
+
+**`parse_config_flag()` (static, before `main()`):**
+- Accepts `(Config& cfg, const char* a, const char* next)`, returns argv slots consumed
+- Handles all 35+ engine flags: compression mode, hierarchical options, PrimePE/RoPE,
+  Cauchy reset, GPU offload, cache persistence, cold storage, System 1/2, CRT, MoE
+- Added `--residual-bits` which was missing from prior parsers
+
+**Verbs refactored:**
+1. `cache_ppl` — was 42-line inline parser → shared parser + verb-specific `--chunks`
+2. `perplexity` — was 30-line inline parser → shared parser + verb-specific `--chunks`, `--cache`
+3. `chat` — was 50+ lines → shared parser + verb-specific `--naive`, `--debug-decode`, `--n-predict`
+4. `run` — was 12-line inline parser → shared parser + verb-specific `--n-predict`
+5. `serve` — was 8-line inline parser → shared parser + verb-specific `--host`, `--port`, `--name`, `--www`
+6. Global tail (info/logits/prefill) — was 30-line partial parser → shared parser
+
+**ngl handling:** `cache_ppl`, `perplexity`, and `chat` have a local `ngl` variable
+initialised from `sp_default_n_gpu_layers()`. These verbs track `ngl_explicit` to detect
+whether the user passed `-ngl` explicitly vs. relying on the auto-detect default.
+
+### What Was Proven
+- Clean build: 10/10 targets, zero errors, zero warnings
+- `run --sqfree` engages sqfree mode (no hier calibration messages)
+- `run --moe-curriculum` correctly declines on dense model
+- `serve` accepts `--moe-curriculum --system12 --hier-res-bits 3 --hier-res-bits-v 2`
+  (previously rejected as unknown flags)
+- Hier default with calibration warning suppression working
+
+### Files Modified
+| File | Change |
+|------|--------|
+| `src/cli/main.cpp` | NEW: `parse_config_flag()` shared function; refactored all 5 verb parsers + global tail to use it; added `--residual-bits`; net -21 lines |
+
+### What's Next
+1. **Beast Canyon dual-GPU validation** — CUDA build, CRT end-to-end
+2. **27B+ model validation** — hier cache on larger models
+3. **fp8/fp4 integration** — PyTorch-only gap
+

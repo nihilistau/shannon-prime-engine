@@ -277,6 +277,80 @@ static void usage(const char* prog) {
         "\n", prog);
 }
 
+// ---------------------------------------------------------------------------
+// Shared Config flag parser — one canonical parser for ALL engine flags.
+// Returns the number of argv slots consumed (0 = not recognized, 1 = flag
+// only, 2 = flag + value). Verbs call this in a loop; any leftover args
+// are verb-specific (positional prompt, etc.).
+// ---------------------------------------------------------------------------
+static int parse_config_flag(sp::engine::Config& cfg, const char* a, const char* next) {
+    auto a_eq = [&](const char* flag) { return std::strcmp(a, flag) == 0; };
+    auto has_next = (next != nullptr);
+
+    // -- Model / context --
+    if (a_eq("--model")     && has_next) { cfg.model_path = next; return 2; }
+    if (a_eq("--ctx")       && has_next) { cfg.n_ctx = std::atoi(next); return 2; }
+    if (a_eq("--model-preset") && has_next) { cfg.model_preset = next; return 2; }
+
+    // -- Compression mode --
+    if (a_eq("--sqfree"))       { cfg.sqfree = true; cfg.hierarchical = false; return 1; }
+    if (a_eq("--spinor"))       { cfg.spinor = true; cfg.sqfree = true; cfg.hierarchical = false; return 1; }
+    if (a_eq("--hierarchical")) { cfg.hierarchical = true; cfg.sqfree = false; return 1; }
+    if (a_eq("--no-mobius"))    { cfg.mobius = false; return 1; }
+    if (a_eq("--k-bits")        && has_next) { cfg.k_bits_csv = next; return 2; }
+    if (a_eq("--v-bits")        && has_next) { cfg.v_bits_csv = next; return 2; }
+    if (a_eq("--residual-bits") && has_next) { cfg.residual_bits = std::atoi(next); return 2; }
+
+    // -- Hierarchical options --
+    if (a_eq("--hier-level")     && has_next) { cfg.hier_level = std::atoi(next); return 2; }
+    if (a_eq("--hier-res-bits")  && has_next) { cfg.hier_res_bits = std::atoi(next); return 2; }
+    if (a_eq("--hier-res-bits-v") && has_next) { cfg.hier_res_bits_v = std::atoi(next); return 2; }
+    if (a_eq("--hier-skel-bits") && has_next) { cfg.hier_skel_bits = next; return 2; }
+    if (a_eq("--hier-ternary-mask") && has_next) { cfg.hier_skel_ternary = (uint32_t)std::strtoul(next, nullptr, 0); return 2; }
+
+    // -- PrimePE / RoPE --
+    if (a_eq("--pe-mode") && has_next) {
+        std::string m = next;
+        if      (m == "standard")      cfg.pe_mode = sp::engine::Config::PeMode::Standard;
+        else if (m == "primepe")       cfg.pe_mode = sp::engine::Config::PeMode::PrimePe;
+        else if (m == "primepe_alibi") cfg.pe_mode = sp::engine::Config::PeMode::PrimePeAlibi;
+        else if (m == "alibi")         cfg.pe_mode = sp::engine::Config::PeMode::AlibiOnly;
+        return 2;
+    }
+    if (a_eq("--pe-alpha") && has_next) { cfg.pe_alpha = (float)std::atof(next); return 2; }
+    if (a_eq("--pe-tier")  && has_next) { cfg.pe_tier = std::atoi(next); return 2; }
+
+    // -- Cauchy reset --
+    if (a_eq("--cauchy-mode")     && has_next) { cfg.cauchy_mode = std::atoi(next); return 2; }
+    if (a_eq("--cauchy-fixed-n")  && has_next) { cfg.cauchy_fixed_n = std::atoi(next); return 2; }
+    if (a_eq("--cauchy-cooldown") && has_next) { cfg.cauchy_cooldown = std::atoi(next); return 2; }
+    if (a_eq("--cauchy-warmup")   && has_next) { cfg.cauchy_warmup = std::atoi(next); return 2; }
+    if (a_eq("--cauchy-use-ricci"))    { cfg.cauchy_use_ricci = true; return 1; }
+    if (a_eq("--cauchy-ricci-only"))   { cfg.cauchy_ricci_only = true; return 1; }
+    if (a_eq("--cauchy-mertens-only")) { cfg.cauchy_mertens_only = true; return 1; }
+    if (a_eq("--params-b") && has_next) { cfg.params_b = (float)std::atof(next); return 2; }
+
+    // -- GPU / offload --
+    if ((a_eq("--n-gpu-layers") || a_eq("-ngl")) && has_next) { cfg.n_gpu_layers = std::atoi(next); return 2; }
+    if (a_eq("--n-gpus") && has_next) { cfg.n_gpus = std::atoi(next); return 2; }
+
+    // -- Cache persistence --
+    if (a_eq("--save-cache") && has_next) { cfg.save_cache_path = next; return 2; }
+    if (a_eq("--load-cache") && has_next) { cfg.load_cache_path = next; return 2; }
+    if (a_eq("--cold-mb")    && has_next) { cfg.cold_mb = std::atoi(next); cfg.enable_cold = true; return 2; }
+    if (a_eq("--cold"))                   { cfg.enable_cold = true; return 1; }
+    if (a_eq("--evict-keep") && has_next) { cfg.evict_keep = std::atoi(next); return 2; }
+
+    // -- System 1/2 + CRT + MoE --
+    if (a_eq("--system12"))                       { cfg.system12 = true; return 1; }
+    if (a_eq("--crt-split"))                      { cfg.crt_split = true; return 1; }
+    if (a_eq("--moe-curriculum"))                  { cfg.moe_curriculum = true; return 1; }
+    if (a_eq("--s12-threshold") && has_next) { cfg.s12_threshold = (float)std::atof(next); return 2; }
+    if (a_eq("--s12-sys2")      && has_next) { cfg.s12_sys2 = next; return 2; }
+
+    return 0;  // not recognized
+}
+
 int main(int argc, char** argv) {
     if (argc < 2) { usage(argv[0]); return 1; }
     std::string cmd = argv[1];
@@ -297,56 +371,33 @@ int main(int argc, char** argv) {
     if (cmd == "cache_ppl") {
         sp::engine::Config cc;
         sp::engine::seed_config_from_env(cc);
-        int  n_ctx    = 512;
+        cc.n_ctx = 512;  // cache_ppl default (smaller than engine default)
         int  n_chunks = 0;
         int  ngl      = sp_default_n_gpu_layers();
+        bool ngl_explicit = false;
         std::string textfile;
         for (int i = 2; i < argc; ++i) {
-            std::string a = argv[i];
-            if      (a == "--model"          && i + 1 < argc) cc.model_path     = argv[++i];
-            else if (a == "--ctx"            && i + 1 < argc) n_ctx             = std::atoi(argv[++i]);
-            else if (a == "--chunks"         && i + 1 < argc) n_chunks          = std::atoi(argv[++i]);
-            else if ((a == "--n-gpu-layers" || a == "-ngl") && i + 1 < argc) ngl = std::atoi(argv[++i]);
-            else if (a == "--n-gpus"        && i + 1 < argc) cc.n_gpus         = std::atoi(argv[++i]);
-            else if (a == "--sqfree")        cc.sqfree = true;
-            else if (a == "--spinor")        { cc.spinor = true; cc.sqfree = true; }
-            else if (a == "--no-mobius")     cc.mobius = false;
-            else if (a == "--hierarchical") cc.hierarchical = true;
-            else if (a == "--k-bits"         && i + 1 < argc) cc.k_bits_csv     = argv[++i];
-            else if (a == "--v-bits"         && i + 1 < argc) cc.v_bits_csv     = argv[++i];
-            else if (a == "--residual-bits"  && i + 1 < argc) cc.residual_bits  = std::atoi(argv[++i]);
-            else if (a == "--model-preset"   && i + 1 < argc) cc.model_preset   = argv[++i];
-            else if (a == "--hier-level"     && i + 1 < argc) cc.hier_level     = std::atoi(argv[++i]);
-            else if (a == "--hier-res-bits"  && i + 1 < argc) cc.hier_res_bits  = std::atoi(argv[++i]);
-            else if (a == "--hier-res-bits-v" && i + 1 < argc) cc.hier_res_bits_v = std::atoi(argv[++i]);
-            else if (a == "--hier-skel-bits" && i + 1 < argc) cc.hier_skel_bits = argv[++i];
-            else if (a == "--hier-ternary-mask" && i + 1 < argc) cc.hier_skel_ternary = (uint32_t)std::strtoul(argv[++i], nullptr, 0);
-            else if (a == "--pe-mode"        && i + 1 < argc) {
-                std::string m = argv[++i];
-                if      (m == "standard")      cc.pe_mode = sp::engine::Config::PeMode::Standard;
-                else if (m == "primepe")       cc.pe_mode = sp::engine::Config::PeMode::PrimePe;
-                else if (m == "primepe_alibi") cc.pe_mode = sp::engine::Config::PeMode::PrimePeAlibi;
-                else if (m == "alibi")         cc.pe_mode = sp::engine::Config::PeMode::AlibiOnly;
+            const char* a    = argv[i];
+            const char* next = (i + 1 < argc) ? argv[i + 1] : nullptr;
+
+            // Verb-specific flags.
+            if (std::strcmp(a, "--chunks") == 0 && next) { n_chunks = std::atoi(next); ++i; continue; }
+
+            // Track explicit -ngl (local ngl overrides sp_default).
+            if ((std::strcmp(a, "--n-gpu-layers") == 0 || std::strcmp(a, "-ngl") == 0) && next)
+                ngl_explicit = true;
+
+            int ate = parse_config_flag(cc, a, next);
+            if (ate > 0) { i += ate - 1; continue; }
+
+            // Unknown flag or positional.
+            if (a[0] == '-' && a[1] == '-') {
+                std::fprintf(stderr, "cache_ppl: unknown flag %s\n", a); return 2;
             }
-            else if (a == "--pe-alpha"       && i + 1 < argc) cc.pe_alpha = (float)std::atof(argv[++i]);
-            else if (a == "--pe-tier"        && i + 1 < argc) cc.pe_tier  = std::atoi(argv[++i]);
-            else if (a == "--cauchy-mode"     && i + 1 < argc) cc.cauchy_mode     = std::atoi(argv[++i]);
-            else if (a == "--cauchy-fixed-n"  && i + 1 < argc) cc.cauchy_fixed_n  = std::atoi(argv[++i]);
-            else if (a == "--cauchy-cooldown" && i + 1 < argc) cc.cauchy_cooldown = std::atoi(argv[++i]);
-            else if (a == "--cauchy-use-ricci")                cc.cauchy_use_ricci = true;
-            else if (a == "--params-b"        && i + 1 < argc) cc.params_b        = (float)std::atof(argv[++i]);
-            else if (a == "--save-cache"      && i + 1 < argc) cc.save_cache_path = argv[++i];
-            else if (a == "--load-cache"      && i + 1 < argc) cc.load_cache_path = argv[++i];
-            else if (a == "--system12")                         cc.system12       = true;
-            else if (a == "--crt-split")                        cc.crt_split      = true;
-            else if (a == "--moe-curriculum")                   cc.moe_curriculum = true;
-            else if (a == "--s12-threshold"   && i + 1 < argc) cc.s12_threshold  = (float)std::atof(argv[++i]);
-            else if (a == "--s12-sys2"        && i + 1 < argc) cc.s12_sys2       = argv[++i];
-            else if (a.size() >= 2 && a[0] == '-' && a[1] == '-') {
-                std::fprintf(stderr, "cache_ppl: unknown flag %s\n", a.c_str()); return 2;
-            }
-            else { textfile = a; }
+            textfile = a;
         }
+        if (ngl_explicit) ngl = cc.n_gpu_layers;
+        int n_ctx = cc.n_ctx;
         if (cc.model_path.empty()) {
             std::fprintf(stderr, "cache_ppl requires --model <path.gguf>\n"); return 1;
         }
@@ -697,45 +748,35 @@ int main(int argc, char** argv) {
     if (cmd == "perplexity") {
         sp::engine::Config pc;
         sp::engine::seed_config_from_env(pc);
-        int  n_ctx    = 512;
+        pc.n_ctx = 512;  // perplexity default (smaller than engine default)
         int  n_chunks = 0;     // 0 = all
         int  ngl      = sp_default_n_gpu_layers();
+        bool ngl_explicit = false;
         bool use_cache = false;
         std::string textfile;
         for (int i = 2; i < argc; ++i) {
-            std::string a = argv[i];
-            if      (a == "--model"    && i + 1 < argc) pc.model_path    = argv[++i];
-            else if (a == "--ctx"      && i + 1 < argc) n_ctx            = std::atoi(argv[++i]);
-            else if (a == "--chunks"   && i + 1 < argc) n_chunks         = std::atoi(argv[++i]);
-            else if ((a == "--n-gpu-layers" || a == "-ngl") && i + 1 < argc) ngl = std::atoi(argv[++i]);
-            else if (a == "--n-gpus"        && i + 1 < argc) pc.n_gpus        = std::atoi(argv[++i]);
-            else if (a == "--cache")        use_cache       = true;
-            else if (a == "--sqfree")       pc.sqfree       = true;
-            else if (a == "--spinor")       { pc.spinor = true; pc.sqfree = true; }
-            else if (a == "--hierarchical") pc.hierarchical = true;
-            else if (a == "--no-mobius")    pc.mobius       = false;
-            else if (a == "--k-bits"        && i + 1 < argc) pc.k_bits_csv    = argv[++i];
-            else if (a == "--v-bits"        && i + 1 < argc) pc.v_bits_csv    = argv[++i];
-            else if (a == "--residual-bits" && i + 1 < argc) pc.residual_bits = std::atoi(argv[++i]);
-            else if (a == "--model-preset"  && i + 1 < argc) pc.model_preset  = argv[++i];
-            else if (a == "--hier-level"    && i + 1 < argc) pc.hier_level    = std::atoi(argv[++i]);
-            else if (a == "--hier-res-bits" && i + 1 < argc) pc.hier_res_bits = std::atoi(argv[++i]);
-            else if (a == "--hier-res-bits-v" && i + 1 < argc) pc.hier_res_bits_v = std::atoi(argv[++i]);
-            else if (a == "--hier-skel-bits"&& i + 1 < argc) pc.hier_skel_bits= argv[++i];
-            else if (a == "--hier-ternary-mask" && i + 1 < argc) pc.hier_skel_ternary = (uint32_t)std::strtoul(argv[++i], nullptr, 0);
-            else if (a == "--cauchy-mode"     && i + 1 < argc) pc.cauchy_mode     = std::atoi(argv[++i]);
-            else if (a == "--cauchy-fixed-n"  && i + 1 < argc) pc.cauchy_fixed_n  = std::atoi(argv[++i]);
-            else if (a == "--cauchy-cooldown" && i + 1 < argc) pc.cauchy_cooldown = std::atoi(argv[++i]);
-            else if (a == "--cauchy-warmup"     && i + 1 < argc) pc.cauchy_warmup   = std::atoi(argv[++i]);
-            else if (a == "--cauchy-use-ricci")                  pc.cauchy_use_ricci    = true;
-            else if (a == "--cauchy-ricci-only")                 pc.cauchy_ricci_only   = true;
-            else if (a == "--cauchy-mertens-only")               pc.cauchy_mertens_only = true;
-            else if (a == "--params-b"          && i + 1 < argc) pc.params_b        = (float)std::atof(argv[++i]);
-            else if (a.size() >= 2 && a[0] == '-' && a[1] == '-') {
-                std::fprintf(stderr, "perplexity: unknown flag %s\n", a.c_str()); return 2;
+            const char* a    = argv[i];
+            const char* next = (i + 1 < argc) ? argv[i + 1] : nullptr;
+
+            // Verb-specific flags.
+            if (std::strcmp(a, "--chunks") == 0 && next) { n_chunks = std::atoi(next); ++i; continue; }
+            if (std::strcmp(a, "--cache") == 0)           { use_cache = true; continue; }
+
+            // Track explicit -ngl.
+            if ((std::strcmp(a, "--n-gpu-layers") == 0 || std::strcmp(a, "-ngl") == 0) && next)
+                ngl_explicit = true;
+
+            int ate = parse_config_flag(pc, a, next);
+            if (ate > 0) { i += ate - 1; continue; }
+
+            // Unknown flag or positional.
+            if (a[0] == '-' && a[1] == '-') {
+                std::fprintf(stderr, "perplexity: unknown flag %s\n", a); return 2;
             }
-            else { textfile = a; }
+            textfile = a;
         }
+        if (ngl_explicit) ngl = pc.n_gpu_layers;
+        int n_ctx = pc.n_ctx;
         if (pc.model_path.empty()) {
             std::fprintf(stderr, "perplexity requires --model <path.gguf>\n"); return 1;
         }
@@ -1031,59 +1072,25 @@ int main(int argc, char** argv) {
         sp::engine::Config cc;
         sp::engine::seed_config_from_env(cc);
         int  n_predict = 32;
+        bool ngl_explicit = false;
         int  ngl       = sp_default_n_gpu_layers();
         bool naive     = false;
         bool debug_decode = false;
         std::string text;
         for (int i = 2; i < argc; ++i) {
-            std::string a = argv[i];
-            if      (a == "--sqfree")       cc.sqfree = true;
-            else if (a == "--spinor")       { cc.spinor = true; cc.sqfree = true; }
-            else if (a == "--no-mobius")    cc.mobius  = false;
-            else if (a == "--hierarchical") cc.hierarchical = true;
-            else if (a == "--naive")        naive      = true;
-            else if (a == "--debug-decode") debug_decode = true;
-            else if ((a == "--n-gpu-layers" || a == "-ngl") && i + 1 < argc) ngl = std::atoi(argv[++i]);
-            else if (a == "--n-gpus"    && i + 1 < argc) cc.n_gpus     = std::atoi(argv[++i]);
-            else if (a == "--model"     && i + 1 < argc) cc.model_path = argv[++i];
-            else if (a == "--k-bits"    && i + 1 < argc) cc.k_bits_csv = argv[++i];
-            else if (a == "--v-bits"    && i + 1 < argc) cc.v_bits_csv = argv[++i];
-            else if (a == "--model-preset" && i + 1 < argc) cc.model_preset = argv[++i];
-            else if (a == "--n-predict" && i + 1 < argc) n_predict     = std::atoi(argv[++i]);
-            else if (a == "--ctx"       && i + 1 < argc) cc.n_ctx      = std::atoi(argv[++i]);
-            else if (a == "--hier-level"     && i + 1 < argc) cc.hier_level     = std::atoi(argv[++i]);
-            else if (a == "--hier-res-bits"  && i + 1 < argc) cc.hier_res_bits  = std::atoi(argv[++i]);
-            else if (a == "--hier-res-bits-v" && i + 1 < argc) cc.hier_res_bits_v = std::atoi(argv[++i]);
-            else if (a == "--hier-skel-bits" && i + 1 < argc) cc.hier_skel_bits = argv[++i];
-            else if (a == "--hier-ternary-mask" && i + 1 < argc) cc.hier_skel_ternary = (uint32_t)std::strtoul(argv[++i], nullptr, 0);
-            else if (a == "--pe-mode"   && i + 1 < argc) {
-                std::string m = argv[++i];
-                if      (m == "standard")      cc.pe_mode = sp::engine::Config::PeMode::Standard;
-                else if (m == "primepe")       cc.pe_mode = sp::engine::Config::PeMode::PrimePe;
-                else if (m == "primepe_alibi") cc.pe_mode = sp::engine::Config::PeMode::PrimePeAlibi;
-                else if (m == "alibi")         cc.pe_mode = sp::engine::Config::PeMode::AlibiOnly;
+            const char* next = (i + 1 < argc) ? argv[i + 1] : nullptr;
+            int consumed = parse_config_flag(cc, argv[i], next);
+            if (consumed > 0) {
+                // Track if -ngl was explicitly set via shared parser
+                std::string a = argv[i];
+                if (a == "--n-gpu-layers" || a == "-ngl") { ngl = cc.n_gpu_layers; ngl_explicit = true; }
+                i += consumed - 1;
+                continue;
             }
-            else if (a == "--pe-alpha"  && i + 1 < argc) cc.pe_alpha = (float)std::atof(argv[++i]);
-            else if (a == "--pe-tier"   && i + 1 < argc) cc.pe_tier  = std::atoi(argv[++i]);
-            // Cauchy reset system — decode-chain causal stability during
-            // generation. Same semantics as perplexity --cache: on reset,
-            // re-prefill the token sequence so far.
-            else if (a == "--cauchy-mode"     && i + 1 < argc) cc.cauchy_mode     = std::atoi(argv[++i]);
-            else if (a == "--cauchy-fixed-n"  && i + 1 < argc) cc.cauchy_fixed_n  = std::atoi(argv[++i]);
-            else if (a == "--cauchy-cooldown" && i + 1 < argc) cc.cauchy_cooldown = std::atoi(argv[++i]);
-            else if (a == "--cauchy-warmup"   && i + 1 < argc) cc.cauchy_warmup   = std::atoi(argv[++i]);
-            else if (a == "--cauchy-use-ricci")                cc.cauchy_use_ricci    = true;
-            else if (a == "--params-b"        && i + 1 < argc) cc.params_b        = (float)std::atof(argv[++i]);
-            else if (a == "--save-cache"      && i + 1 < argc) cc.save_cache_path = argv[++i];
-            else if (a == "--load-cache"      && i + 1 < argc) cc.load_cache_path = argv[++i];
-            else if (a == "--cold-mb"         && i + 1 < argc) { cc.cold_mb = std::atoi(argv[++i]); cc.enable_cold = true; }
-            else if (a == "--cold")                             cc.enable_cold = true;
-            else if (a == "--evict-keep"      && i + 1 < argc) cc.evict_keep = std::atoi(argv[++i]);
-            else if (a == "--system12")                         cc.system12       = true;
-            else if (a == "--crt-split")                        cc.crt_split      = true;
-            else if (a == "--moe-curriculum")                   cc.moe_curriculum = true;
-            else if (a == "--s12-threshold"   && i + 1 < argc) cc.s12_threshold  = (float)std::atof(argv[++i]);
-            else if (a == "--s12-sys2"        && i + 1 < argc) cc.s12_sys2       = argv[++i];
+            std::string a = argv[i];
+            if      (a == "--naive")        naive      = true;
+            else if (a == "--debug-decode") debug_decode = true;
+            else if (a == "--n-predict" && i + 1 < argc) n_predict = std::atoi(argv[++i]);
             else if (a.size() >= 2 && a[0] == '-' && a[1] == '-') {
                 std::fprintf(stderr, "chat: unknown flag %s\n", a.c_str()); return 2;
             }
@@ -1422,8 +1429,8 @@ int main(int argc, char** argv) {
         int hd = 128, n_tokens = 32, n_head_kv = 4, n_layer = 2;
         for (int i = 2; i < argc; ++i) {
             std::string a = argv[i];
-            if      (a == "--sqfree")    kvc.sqfree = true;
-            else if (a == "--spinor")    { kvc.spinor = true; kvc.sqfree = true; }
+            if      (a == "--sqfree")    { kvc.sqfree = true; kvc.hierarchical = false; }
+            else if (a == "--spinor")    { kvc.spinor = true; kvc.sqfree = true; kvc.hierarchical = false; }
             else if (a == "--no-mobius") kvc.mobius = false;
             else if (a == "--hierarchical") kvc.hierarchical = true;
             else if (a == "--head-dim"  && i + 1 < argc) hd        = std::atoi(argv[++i]);
@@ -2285,17 +2292,10 @@ int main(int argc, char** argv) {
     // unknown by the strict global parser below. Same pattern as cache_ppl,
     // perplexity, and chat.
     if (cmd == "run") {
-        // Library-level demo: load a model via the public Engine API and
-        // run a greedy generate. Honours --model <path>, --n-predict, and
-        // a positional prompt; everything else uses defaults. For rich
-        // options use the dedicated `chat` verb.
+        // Library-level API: load via Engine class, greedy generate.
+        // Accepts ALL engine Config flags via the shared parser.
         sp::engine::Config rcfg;
         sp::engine::seed_config_from_env(rcfg);
-        // Forward SP_ENGINE_BACKEND into cfg.backend so Engine::load picks
-        // the GPU path (the CLI shim — library callers set cfg.backend
-        // explicitly). Bare-minimum: treat {gpu, cuda, vulkan} as CUDA
-        // since the Engine's backend enum collapses to "not CPU" at the
-        // ForwardContext layer.
         if (const char* env = std::getenv("SP_ENGINE_BACKEND")) {
             if (std::strcmp(env, "gpu") == 0 || std::strcmp(env, "cuda") == 0) {
                 rcfg.backend = sp::engine::Config::Backend::CUDA;
@@ -2306,10 +2306,11 @@ int main(int argc, char** argv) {
         int n_predict = 32;
         std::string prompt;
         for (int i = 2; i < argc; ++i) {
+            const char* next = (i + 1 < argc) ? argv[i + 1] : nullptr;
+            int consumed = parse_config_flag(rcfg, argv[i], next);
+            if (consumed > 0) { i += consumed - 1; continue; }
             std::string a = argv[i];
-            if      (a == "--model"     && i + 1 < argc) rcfg.model_path = argv[++i];
-            else if (a == "--n-predict" && i + 1 < argc) n_predict       = std::atoi(argv[++i]);
-            else if (a == "--ctx"       && i + 1 < argc) rcfg.n_ctx      = std::atoi(argv[++i]);
+            if      (a == "--n-predict" && i + 1 < argc) n_predict = std::atoi(argv[++i]);
             else if (a.size() >= 2 && a[0] == '-' && a[1] == '-') {
                 std::fprintf(stderr, "run: unknown flag %s\n", a.c_str()); return 2;
             }
@@ -2345,6 +2346,7 @@ int main(int argc, char** argv) {
     //   POST /v1/chat/completions     chat (non-streaming, ChatML template)
     //   POST /v1/completions          raw prompt (non-streaming)
     if (cmd == "serve") {
+        // OpenAI-compatible HTTP server — accepts ALL engine Config flags.
         sp::engine::Config rcfg;
         sp::engine::seed_config_from_env(rcfg);
         if (const char* env = std::getenv("SP_ENGINE_BACKEND")) {
@@ -2359,13 +2361,14 @@ int main(int argc, char** argv) {
         std::string model_id;
         std::string www_root;
         for (int i = 2; i < argc; ++i) {
+            const char* next = (i + 1 < argc) ? argv[i + 1] : nullptr;
+            int consumed = parse_config_flag(rcfg, argv[i], next);
+            if (consumed > 0) { i += consumed - 1; continue; }
             std::string a = argv[i];
-            if      (a == "--model" && i + 1 < argc) rcfg.model_path = argv[++i];
-            else if (a == "--ctx"   && i + 1 < argc) rcfg.n_ctx      = std::atoi(argv[++i]);
-            else if (a == "--host"  && i + 1 < argc) host             = argv[++i];
-            else if (a == "--port"  && i + 1 < argc) port             = std::atoi(argv[++i]);
-            else if (a == "--name"  && i + 1 < argc) model_id         = argv[++i];
-            else if (a == "--www"   && i + 1 < argc) www_root         = argv[++i];
+            if      (a == "--host"  && i + 1 < argc) host     = argv[++i];
+            else if (a == "--port"  && i + 1 < argc) port     = std::atoi(argv[++i]);
+            else if (a == "--name"  && i + 1 < argc) model_id = argv[++i];
+            else if (a == "--www"   && i + 1 < argc) www_root = argv[++i];
             else if (a.size() >= 2 && a[0] == '-' && a[1] == '-') {
                 std::fprintf(stderr, "serve: unknown flag %s\n", a.c_str()); return 2;
             }
@@ -2484,47 +2487,23 @@ int main(int argc, char** argv) {
 
     // Flag parser — extracts known flags and stashes positional args in `rest`.
     // Per-command handlers below can consume those positionals however they like.
+    // Uses the shared parse_config_flag() so info/logits/prefill/etc. get the
+    // full engine flag set for free.
     sp::engine::Config cfg;
     sp::engine::seed_config_from_env(cfg);
     std::vector<std::string> rest;
     for (int i = 2; i < argc; ++i) {
-        std::string a = argv[i];
-        auto next = [&](const char* key, std::string& dst) {
-            if (a == key && i + 1 < argc) { dst = argv[++i]; return true; }
-            return false;
-        };
-        if      (a == "--sqfree")       cfg.sqfree = true;
-        else if (a == "--spinor")       cfg.spinor = true;
-        else if (a == "--no-mobius")    cfg.mobius = false;
-        else if (a == "--hierarchical") cfg.hierarchical = true;
-        else if (next("--model",   cfg.model_path)) {}
-        else if (next("--k-bits",  cfg.k_bits_csv)) {}
-        else if (next("--v-bits",  cfg.v_bits_csv)) {}
-        else if (next("--model-preset", cfg.model_preset)) {}
-        else if (next("--hier-skel-bits", cfg.hier_skel_bits)) {}
-        else if (a == "--ctx" && i + 1 < argc)               cfg.n_ctx          = std::atoi(argv[++i]);
-        else if (a == "--residual-bits" && i + 1 < argc)     cfg.residual_bits  = std::atoi(argv[++i]);
-        else if (a == "--hier-level" && i + 1 < argc)        cfg.hier_level     = std::atoi(argv[++i]);
-        else if (a == "--hier-res-bits" && i + 1 < argc)     cfg.hier_res_bits  = std::atoi(argv[++i]);
-        else if (a == "--hier-res-bits-v" && i + 1 < argc)   cfg.hier_res_bits_v = std::atoi(argv[++i]);
-        else if (a == "--hier-ternary-mask" && i + 1 < argc) cfg.hier_skel_ternary = (uint32_t)std::strtoul(argv[++i], nullptr, 0);
-        else if (a == "--pe-mode" && i + 1 < argc) {
-            std::string m = argv[++i];
-            if      (m == "standard")      cfg.pe_mode = sp::engine::Config::PeMode::Standard;
-            else if (m == "primepe")       cfg.pe_mode = sp::engine::Config::PeMode::PrimePe;
-            else if (m == "primepe_alibi") cfg.pe_mode = sp::engine::Config::PeMode::PrimePeAlibi;
-            else if (m == "alibi")         cfg.pe_mode = sp::engine::Config::PeMode::AlibiOnly;
-            else { std::fprintf(stderr, "bad --pe-mode: %s\n", m.c_str()); return 2; }
-        }
-        else if (a == "--pe-alpha" && i + 1 < argc) cfg.pe_alpha = (float)std::atof(argv[++i]);
-        else if (a == "--pe-tier"  && i + 1 < argc) cfg.pe_tier  = std::atoi(argv[++i]);
-        else if (a == "--crt-split")                 cfg.crt_split = true;
-        else if (a == "--moe-curriculum")             cfg.moe_curriculum = true;
-        else if (a.size() >= 2 && a[0] == '-' && a[1] == '-') {
-            std::fprintf(stderr, "unknown flag: %s\n", a.c_str());
+        const char* a    = argv[i];
+        const char* next = (i + 1 < argc) ? argv[i + 1] : nullptr;
+
+        int ate = parse_config_flag(cfg, a, next);
+        if (ate > 0) { i += ate - 1; continue; }
+
+        if (a[0] == '-' && a[1] == '-') {
+            std::fprintf(stderr, "unknown flag: %s\n", a);
             return 2;
         }
-        else rest.push_back(std::move(a));
+        rest.emplace_back(a);
     }
 
     if (cmd == "info") {

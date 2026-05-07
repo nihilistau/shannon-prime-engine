@@ -92,36 +92,32 @@ cmake --build build
   --sp-k-bits 5,5,4,3 \
   --prompt "Hello, world"
 
-# Aggressive compression
-./build/sp-engine run \
+# Sqfree compression
+./build/bin/sp-engine run \
   --model /path/to/model.gguf \
-  --sp-compression sqfree \
-  --sp-spinor \
-  --prompt "Hello, world"
+  --sqfree --spinor \
+  --n-predict 128 "Hello, world"
 
-# Hierarchical (maximum compression, requires calibration)
-./build/sp-engine run \
+# Hierarchical (maximum compression, default mode)
+./build/bin/sp-engine run \
   --model /path/to/model.gguf \
-  --sp-compression hier \
-  --sp-hier-level 0 \
-  --sp-hier-res-bits 2 \
-  --prompt "Hello, world"
+  --hier-res-bits 2 --hier-res-bits-v 1 \
+  --n-predict 128 "Hello, world"
 
 # Perplexity evaluation
-./build/sp-engine ppl \
+./build/bin/sp-engine cache_ppl \
   --model /path/to/model.gguf \
-  --dataset wikitext-2 \
-  --chunks 3
+  --chunks 3 wiki.test.raw
 
-# HTTP server
-./build/sp-engine serve \
+# HTTP server (all engine flags accepted)
+./build/bin/sp-engine serve \
   --model /path/to/model.gguf \
-  --port 8082
+  --port 8082 --moe-curriculum --system12
 
 # MoE model with expert curriculum (heterogeneous dispatch)
-./build/sp-engine chat \
+./build/bin/sp-engine chat \
   --model /path/to/Qwen3.6-35B-A3B.gguf \
-  --moe-curriculum \
+  --moe-curriculum -ngl 99 \
   "Explain mixture of experts"
 
 # QNN .bin benchmark (phone, via adb)
