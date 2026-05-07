@@ -10,7 +10,7 @@ set CudaToolkitDir=%CUDA_PATH%
 set PATH=%CUDA_PATH%\bin;%PATH%
 set SHANNON_PRIME_VERBOSE=1
 
-set ENGINE=..\build\bin\sp-engine.exe
+set ENGINE=..\build\bin\Release\sp-engine.exe
 set MODEL=Qwen3-0.6B-Q4_K_M.gguf
 set TEXT=test_corpus.txt
 set CTX=256
