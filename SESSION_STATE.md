@@ -1,5 +1,5 @@
 # SESSION_STATE.md — Shannon-Prime Engine Live State
-# Updated: 2026-05-07 | Phase: 8+ MoE Curriculum + Top-2 Prefetch SHIPPED
+# Updated: 2026-05-07 | Phase: 9 Beast Canyon Desktop Engine SHIPPED
 
 ## Current Proven Metrics (Device-Validated)
 
@@ -72,6 +72,14 @@ Device                   = S22 Ultra (SM8450 / Waipio / Hexagon V69)
 - [x] Runtime graph build (MatMul, KQ+Softmax) -- Phase 2.5
 - [x] Phase 8: SpOracle + speculative decode loop -- builds clean Android + Windows
 - [x] Phase 8+: MoE curriculum + Top-2 prefetch + confidence gate -- SHIPPED v0.7.0
+- [x] Phase 9: Beast Canyon desktop engine -- SHIPPED v0.8.0
+  - [x] Optane reservoir (mmap GGUF, expert pointer table, stride audit)
+  - [x] AVX-512 Shredder (Q4_0/Q4_1/Q8_0/Q4_K/Q6_K/F16 → fp16 staging)
+  - [x] Heterogeneous orchestrator (dual-GPU, ping-pong buffers, sidecar)
+  - [x] Cross-GPU sync barriers (CUDA event + Vulkan fence + pre-shred callback)
+  - [x] Diagnostics pulse monitor (stride/PCIe/barrier latency tracking)
+  - [x] `--beast <gguf>` CLI flag + `beast_test` verb
+  - [x] Verified: Dolphin-1B Q4_K_M — 148 tensors, 2.88 ms boot, 1.56 µs stride
 - [x] CLI unified flag parser -- all verbs accept all engine Config flags (a379442)
 - [x] Prefill (single forward pass, 4 splits) -- works every time
 - [ ] **Decode (multi-token generation) -- BLOCKED by 5th-execute hang**

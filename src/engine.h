@@ -83,6 +83,15 @@ struct Config {
     // Hot experts → RTX 2060 (Tier 1), cool experts → Intel UHD (Tier 2).
     bool        moe_curriculum = false;
 
+    // Beast Canyon heterogeneous MoE orchestrator.
+    // When set to a GGUF path, the Beast Canyon engine boots:
+    //   1. Optane reservoir (mmap of the GGUF file)
+    //   2. AVX-512 Shredder (dequant → fp16 staging)
+    //   3. Dual-GPU dispatch (CUDA + Vulkan)
+    //   4. S22U sidecar (optional)
+    // This replaces the normal forward path for MoE layers.
+    std::string beast_gguf_path;
+
     // Positional-encoding mode.
     // Default is PrimePe (lattice-aligned RoPE frequencies) — proven −0.6%
     // to −0.8% PPL improvement across architectures at zero runtime cost.
