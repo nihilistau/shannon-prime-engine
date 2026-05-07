@@ -13,6 +13,12 @@
 #include "ggml-cpu.h"
 #include "ggml.h"
 
+// CRT multi-GPU dispatch
+#include "sp_crt_dispatch.h"
+// MoE expert curriculum + predictive prefetch
+#include "sp_moe_curriculum.h"
+#include "sp_prefetch_engine.h"
+
 #ifdef SP_ENGINE_WITH_CUDA
 #include <cuda_runtime.h>
 #endif
@@ -107,6 +113,17 @@ struct ForwardContext::Impl {
     size_t ctx_size = 0;
     std::vector<uint8_t> ctx_mem;              // backing for graph ggml_context
 
+    // CRT multi-GPU dispatch (non-null when enable_crt() has been called).
+    sp_crt_dispatch_t* crt_dispatch = nullptr;   // heap-allocated, owned
+
+    // MoE expert curriculum — homeostatic expert balancer.
+    // Non-null when enable_moe_curriculum() has been called on a MoE model.
+    sp_moe_curriculum_t* moe_curriculum = nullptr;   // heap-allocated, owned
+
+    // Predictive expert prefetch — zero-bubble inference.
+    // Non-null when curriculum is active and prefetch is enabled.
+    sp_prefetch_engine_t* prefetch = nullptr;         // heap-allocated, owned
+
     // Stage 5b: stateful session over a bound (non-owning) KvCache.
     KvCache* cache  = nullptr;
     int      kv_pos = 0;
@@ -152,6 +169,21 @@ struct ForwardContext::Impl {
     int gdn_d_inner       = 0;
 
     ~Impl() {
+        if (prefetch) {
+            sp_prefetch_free(prefetch);
+            free(prefetch);
+            prefetch = nullptr;
+        }
+        if (moe_curriculum) {
+            sp_moe_curriculum_free(moe_curriculum);
+            free(moe_curriculum);
+            moe_curriculum = nullptr;
+        }
+        if (crt_dispatch) {
+            sp_crt_dispatch_free(crt_dispatch);
+            free(crt_dispatch);
+            crt_dispatch = nullptr;
+        }
         if (backend_sched) ggml_backend_sched_free(backend_sched);
         if (compute_buf) ggml_backend_buffer_free(compute_buf);
         if (allocr)      ggml_gallocr_free(allocr);
@@ -206,6 +238,98 @@ void ForwardContext::bind_cache(KvCache* cache) {
             "head_dim=%d max_seq=%d\n",
             (int)cache->is_gpu(), cache->n_layer(),
             cache->n_head_kv(), cache->head_dim(), cache->max_seq());
+    }
+}
+
+bool ForwardContext::enable_crt(int max_dim) {
+    if (impl_->crt_dispatch) return true;  // already enabled
+    auto* d = (sp_crt_dispatch_t*)calloc(1, sizeof(sp_crt_dispatch_t));
+    if (!d) return false;
+    int rc = sp_crt_dispatch_init(d, max_dim);
+    if (rc != 0) {
+        free(d);
+        std::fprintf(stderr, "[sp-engine] CRT dispatch init failed (rc=%d)\n", rc);
+        return false;
+    }
+    impl_->crt_dispatch = d;
+    std::fprintf(stderr, "[sp-engine] CRT dispatch enabled (max_dim=%d, GPU=%s)\n",
+                 max_dim, d->crt.gpu_ready ? "yes" : "cpu-only");
+    return true;
+}
+
+void ForwardContext::print_crt_stats() const {
+    if (impl_->crt_dispatch) {
+        sp_crt_dispatch_stats(impl_->crt_dispatch);
+    }
+}
+
+bool ForwardContext::enable_moe_curriculum() {
+    if (impl_->moe_curriculum) return true;  // already enabled
+
+    if (impl_->n_expert < 2) {
+        std::fprintf(stderr, "[sp-engine] MoE curriculum requires n_expert >= 2 (got %d)\n",
+                     impl_->n_expert);
+        return false;
+    }
+
+    auto* c = (sp_moe_curriculum_t*)calloc(1, sizeof(sp_moe_curriculum_t));
+    if (!c) return false;
+
+    int rc = sp_moe_curriculum_init(c, impl_->n_layer, impl_->n_expert,
+                                     impl_->n_expert_used);
+    if (rc != 0) {
+        free(c);
+        std::fprintf(stderr, "[sp-engine] MoE curriculum init failed (rc=%d)\n", rc);
+        return false;
+    }
+    impl_->moe_curriculum = c;
+
+    // Also initialise the prefetch engine (requires CRT dispatch for max_dim)
+    int max_dim = impl_->n_embd;
+    auto* pe = (sp_prefetch_engine_t*)calloc(1, sizeof(sp_prefetch_engine_t));
+    if (pe && sp_prefetch_init(pe, c, max_dim, max_dim) == 0) {
+        impl_->prefetch = pe;
+        std::fprintf(stderr, "[sp-engine] Predictive prefetch enabled "
+                     "(shadow_bufs=2, max_dim=%d)\n", max_dim);
+    } else {
+        free(pe);
+        std::fprintf(stderr, "[sp-engine] Prefetch init failed — curriculum active without prefetch\n");
+    }
+
+    std::fprintf(stderr, "[sp-engine] MoE curriculum enabled "
+                 "(n_layer=%d, n_expert=%d, n_used=%d, pulse=%d, alpha=%.2f)\n",
+                 impl_->n_layer, impl_->n_expert, impl_->n_expert_used,
+                 c->pulse_interval, c->alpha);
+    return true;
+}
+
+void ForwardContext::print_moe_curriculum_stats() const {
+    if (impl_->moe_curriculum) {
+        sp_moe_curriculum_stats_t cs = sp_moe_get_stats(impl_->moe_curriculum);
+        std::fprintf(stderr, "[sp-engine] MoE curriculum: tokens=%llu rebalances=%llu "
+                     "tier1_dispatches=%llu tier2_dispatches=%llu "
+                     "avg_t1_score=%.4f avg_t2_score=%.4f\n",
+                     (unsigned long long)cs.total_tokens,
+                     (unsigned long long)cs.total_rebalances,
+                     (unsigned long long)cs.tier1_dispatches,
+                     (unsigned long long)cs.tier2_dispatches,
+                     cs.avg_tier1_score, cs.avg_tier2_score);
+    }
+    if (impl_->prefetch) {
+        sp_prefetch_stats_t ps = sp_prefetch_get_stats(impl_->prefetch);
+        std::fprintf(stderr, "[sp-engine] Prefetch: primary=%llu secondary=%llu "
+                     "miss=%llu gated=%llu hit=%.1f%% (pri=%.1f%% sec=%.1f%%) "
+                     "gate_skip=%.1f%% tau=%.2f alpha=%.3f\n",
+                     (unsigned long long)ps.primary_hits,
+                     (unsigned long long)ps.secondary_hits,
+                     (unsigned long long)ps.misses,
+                     (unsigned long long)ps.gated_skips,
+                     ps.hit_rate * 100.0f,
+                     ps.primary_rate * 100.0f,
+                     ps.secondary_rate * 100.0f,
+                     ps.gate_skip_rate * 100.0f,
+                     ps.confidence_threshold,
+                     ps.current_alpha);
     }
 }
 
@@ -727,7 +851,8 @@ static ggml_tensor* build_moe_ffn(ggml_context* gctx,
                                    int   n_expert,
                                    int   n_expert_used,
                                    bool  norm_topk_prob,
-                                   float expert_weights_scale) {
+                                   float expert_weights_scale,
+                                   ggml_tensor** selected_capture = nullptr) {
     const int n_tokens = (int)cur->ne[1];
     const int n_embd   = (int)cur->ne[0];
 
@@ -737,6 +862,9 @@ static ggml_tensor* build_moe_ffn(ggml_context* gctx,
 
     // 3. Top-k expert indices per token.
     ggml_tensor* selected = ggml_top_k(gctx, probs, n_expert_used);  // [k, n]   I32
+
+    // Curriculum capture: expose selected expert IDs for post-compute readback.
+    if (selected_capture) *selected_capture = selected;
 
     // 4. Gather probs at the selected slots. ggml_get_rows treats dim 0
     //    as the data width and indexes along dim 1, carrying the higher
@@ -804,6 +932,53 @@ static ggml_tensor* build_moe_ffn(ggml_context* gctx,
 }
 
 // ------------------------------------------------------------------
+// CRT custom-op callback for ggml_custom_4d.
+//
+// dst->src[0] = W (weight tensor, [K, M] in ggml)
+// dst->src[1] = x (activation tensor, [K, N])
+// dst shape   = [M, N] (set by ggml_custom_4d at build time)
+// userdata    = sp_crt_dispatch_t*
+//
+// The callback runs on the CPU backend. Internally, it dispatches to
+// the CRT dual-ring GPU matmul (if available) or the CPU reference.
+// ------------------------------------------------------------------
+static void sp_crt_custom_op(ggml_tensor* dst, int ith, int nth, void* userdata) {
+    if (ith != 0) return;  // single-threaded dispatch
+
+    sp_crt_dispatch_t* d = (sp_crt_dispatch_t*)userdata;
+    ggml_tensor* W = dst->src[0];  // [K, M]
+    ggml_tensor* x = dst->src[1];  // [K, N]
+
+    // Forward to the ggml callback which handles transpose + calibrate + dispatch
+    sp_crt_ggml_matmul(dst, W, x, 0, 1, d);
+}
+
+// ------------------------------------------------------------------
+// CRT-aware matmul: routes through ggml_custom_4d when CRT is
+// enabled, falls back to ggml_mul_mat otherwise. This is the single
+// switch point for all weight projection matmuls in build_block.
+//
+// Uses ggml_custom_4d to specify the correct output shape [M, N]
+// explicitly, avoiding the shape-inheritance issue with map_custom2.
+// ------------------------------------------------------------------
+static ggml_tensor* sp_crt_mul_mat(ggml_context* gctx,
+                                    ggml_tensor* W,
+                                    ggml_tensor* x,
+                                    sp_crt_dispatch_t* crt) {
+    if (crt && W->type == GGML_TYPE_F32) {
+        // Only intercept fp32 weights for now. Quantized weights (Q4_K,
+        // Q8_0, etc.) need dequant before CRT can process them — that's
+        // a Phase 2 extension. Most prefill test paths use fp32 weights.
+        int64_t M = W->ne[1];   // output features
+        int64_t N = x->ne[1];   // n_tokens
+        ggml_tensor* args[2] = { W, x };
+        return ggml_custom_4d(gctx, GGML_TYPE_F32, M, N, 1, 1,
+                              args, 2, sp_crt_custom_op, 1, crt);
+    }
+    return ggml_mul_mat(gctx, W, x);
+}
+
+// ------------------------------------------------------------------
 // Shared per-block graph builder. Given an already-embedded hidden
 // state `x` and the current RoPE position tensor `pos`, builds the
 // attention + FFN block from `L` and returns the updated hidden state.
@@ -834,7 +1009,15 @@ static ggml_tensor* build_block(ggml_context* gctx,
                                  // gallocr keeps them addressable) and
                                  // reads them after compute.
                                  ggml_tensor** k_capture = nullptr,
-                                 ggml_tensor** v_capture = nullptr) {
+                                 ggml_tensor** v_capture = nullptr,
+                                 // CRT multi-GPU dispatch. When non-null,
+                                 // weight projection matmuls (Wq/Wk/Wv/Wo
+                                 // and FFN gate/up/down) are routed through
+                                 // CRT dual-ring modular matmul instead of
+                                 // ggml_mul_mat. The callback handles
+                                 // quantize → dual-stream GPU matmul →
+                                 // Garner reconstruction transparently.
+                                 sp_crt_dispatch_t* crt = nullptr) {
     const int n_embd_q = n_head * head_dim;
 
     // Attention pre-norm + projections.
@@ -853,7 +1036,7 @@ static ggml_tensor* build_block(ggml_context* gctx,
     ggml_tensor* K;
     ggml_tensor* V;
     if (L.attn_qkv) {
-        ggml_tensor* qkv = ggml_mul_mat(gctx, L.attn_qkv, xa);   // [q+kv+kv, n]
+        ggml_tensor* qkv = sp_crt_mul_mat(gctx, L.attn_qkv, xa, crt);   // [q+kv+kv, n]
         const size_t row_stride = qkv->nb[1];
         const size_t elem_size  = ggml_element_size(qkv);
         const int64_t n_embd_kv = (int64_t)n_head_kv * head_dim;
@@ -863,11 +1046,11 @@ static ggml_tensor* build_block(ggml_context* gctx,
         K = ggml_cont(gctx, ggml_view_2d(gctx, qkv, n_embd_kv, n, row_stride, q_bytes));
         V = ggml_cont(gctx, ggml_view_2d(gctx, qkv, n_embd_kv, n, row_stride, q_bytes + kv_bytes));
     } else {
-        Q = ggml_mul_mat(gctx, L.wq, xa);
+        Q = sp_crt_mul_mat(gctx, L.wq, xa, crt);
         if (L.bq) Q = ggml_add(gctx, Q, L.bq);
-        K = ggml_mul_mat(gctx, L.wk, xa);
+        K = sp_crt_mul_mat(gctx, L.wk, xa, crt);
         if (L.bk) K = ggml_add(gctx, K, L.bk);
-        V = ggml_mul_mat(gctx, L.wv, xa);
+        V = sp_crt_mul_mat(gctx, L.wv, xa, crt);
         if (L.bv) V = ggml_add(gctx, V, L.bv);
     }
 
@@ -920,7 +1103,7 @@ static ggml_tensor* build_block(ggml_context* gctx,
     ggml_flash_attn_ext_set_prec(attn, GGML_PREC_F32);
     attn = ggml_reshape_2d(gctx, attn, n_embd_q, n);
 
-    ggml_tensor* y1 = ggml_mul_mat(gctx, L.wo, attn);
+    ggml_tensor* y1 = sp_crt_mul_mat(gctx, L.wo, attn, crt);
     if (L.bo) y1 = ggml_add(gctx, y1, L.bo);
 
     // Gemma3 sandwich norm: an extra RMSNorm on the attention output
@@ -947,10 +1130,10 @@ static ggml_tensor* build_block(ggml_context* gctx,
     ggml_tensor* gate;
     ggml_tensor* up;
     if (L.ffn_gate) {
-        gate = ggml_mul_mat(gctx, L.ffn_gate, xb);
-        up   = ggml_mul_mat(gctx, L.ffn_up,   xb);
+        gate = sp_crt_mul_mat(gctx, L.ffn_gate, xb, crt);
+        up   = sp_crt_mul_mat(gctx, L.ffn_up,   xb, crt);
     } else {
-        ggml_tensor* gu = ggml_mul_mat(gctx, L.ffn_up, xb);   // [2*n_ff, n]
+        ggml_tensor* gu = sp_crt_mul_mat(gctx, L.ffn_up, xb, crt);   // [2*n_ff, n]
         const int64_t n_ff       = gu->ne[0] / 2;
         const size_t  row_stride = gu->nb[1];
         const size_t  gate_bytes = (size_t)n_ff * ggml_element_size(gu);
@@ -959,7 +1142,7 @@ static ggml_tensor* build_block(ggml_context* gctx,
     }
     gate = ffn_gelu ? ggml_gelu(gctx, gate) : ggml_silu(gctx, gate);
     ggml_tensor* ffn  = ggml_mul(gctx, gate, up);
-    ffn  = ggml_mul_mat(gctx, L.ffn_down, ffn);
+    ffn  = sp_crt_mul_mat(gctx, L.ffn_down, ffn, crt);
 
     // Gemma3 sandwich norm on the FFN output (mirrors attn_post_norm above).
     if (L.ffn_post_norm) {
@@ -1008,7 +1191,8 @@ static ggml_tensor* build_block_moe_attn(ggml_context* gctx,
                                           float expert_weights_scale, float attn_logit_softcap,
                                           bool  is_moe = true,
                                           ggml_tensor** k_capture = nullptr,
-                                          ggml_tensor** v_capture = nullptr) {
+                                          ggml_tensor** v_capture = nullptr,
+                                          ggml_tensor** selected_capture = nullptr) {
     // Qwen3-Next gated attention.
     //
     // The wq projection is 2× wider than a standard attention head
@@ -1139,7 +1323,8 @@ static ggml_tensor* build_block_moe_attn(ggml_context* gctx,
     if (is_moe) {
         ffn_out = build_moe_ffn(gctx, xb, L,
                                 n_expert, n_expert_used,
-                                norm_topk_prob, expert_weights_scale);
+                                norm_topk_prob, expert_weights_scale,
+                                selected_capture);
     } else {
         // Dense SwiGLU FFN (qwen35 non-MoE hybrid).
         ggml_tensor* gate = ggml_mul_mat(gctx, L.ffn_gate, xb);
@@ -1203,7 +1388,8 @@ static ggml_tensor* build_block_gdn(ggml_context* gctx,
                                      int   n_expert_used,
                                      bool  norm_topk_prob,
                                      float expert_weights_scale,
-                                     bool  is_moe = true) {
+                                     bool  is_moe = true,
+                                     ggml_tensor** selected_capture = nullptr) {
     const int qk_dim = num_qk_heads * head_qk_dim;  // 2048
     const int v_dim  = num_v_heads  * head_v_dim;   // 4096
     const size_t ele = ggml_type_size(GGML_TYPE_F32);
@@ -1588,7 +1774,8 @@ static ggml_tensor* build_block_gdn(ggml_context* gctx,
     if (is_moe) {
         ffn_out = build_moe_ffn(gctx, xb, L,
                                 n_expert, n_expert_used,
-                                norm_topk_prob, expert_weights_scale);
+                                norm_topk_prob, expert_weights_scale,
+                                selected_capture);
     } else {
         // Dense SwiGLU FFN (qwen35 non-MoE hybrid).
         // For GDN layers the pre-norm is attn_post_norm (already applied
@@ -1661,7 +1848,8 @@ bool ForwardContext::forward_one_block(const std::vector<int32_t>& token_ids,
                      W->layers()[0], n,
                      impl_->head_dim, impl_->n_head, impl_->n_head_kv,
                      impl_->n_rot, block0_freq_base, impl_->rope_freq_scale,
-                     impl_->rms_norm_eps, impl_->rope_mode, impl_->ffn_gelu, impl_->attn_logit_softcapping);
+                     impl_->rms_norm_eps, impl_->rope_mode, impl_->ffn_gelu, impl_->attn_logit_softcapping,
+                     nullptr, nullptr, impl_->crt_dispatch);
     ggml_set_output(x);
 
     ggml_cgraph* graph = ggml_new_graph(gctx);
@@ -1826,10 +2014,19 @@ bool ForwardContext::forward_full(const std::vector<int32_t>& token_ids,
         cap_V.assign((size_t)impl_->n_layer, nullptr);
     }
 
+    // MoE curriculum: per-layer expert-selection capture tensors.
+    // When curriculum is active, the `selected` I32 tensor from ggml_top_k
+    // is marked as a graph output so we can read back expert IDs post-compute
+    // and feed them to the heatmap.
+    const bool curriculum_active = (impl_->moe_curriculum != nullptr);
+    std::vector<ggml_tensor*> cap_selected(
+        curriculum_active ? (size_t)impl_->n_layer : 0, nullptr);
+
     ggml_tensor* x_layer0 = nullptr;
     for (int i = 0; i < impl_->n_layer; ++i) {
         ggml_tensor* k_cap = nullptr;
         ggml_tensor* v_cap = nullptr;
+        ggml_tensor* sel_cap = nullptr;
 
         const LlamaLayer& L = W->layers()[(size_t)i];
 
@@ -1849,7 +2046,8 @@ bool ForwardContext::forward_full(const std::vector<int32_t>& token_ids,
                              impl_->n_rot, layer_freq_base, impl_->rope_freq_scale,
                              impl_->rms_norm_eps, impl_->rope_mode, impl_->ffn_gelu, impl_->attn_logit_softcapping,
                              capture ? &k_cap : nullptr,
-                             capture ? &v_cap : nullptr);
+                             capture ? &v_cap : nullptr,
+                             impl_->crt_dispatch);
             break;
         }
         case LlamaLayerKind::MOE_ATTN: {
@@ -1864,7 +2062,8 @@ bool ForwardContext::forward_full(const std::vector<int32_t>& token_ids,
                                       impl_->norm_topk_prob, impl_->expert_weights_scale, impl_->attn_logit_softcapping,
                                       impl_->is_moe,
                                       capture ? &k_cap : nullptr,
-                                      capture ? &v_cap : nullptr);
+                                      capture ? &v_cap : nullptr,
+                                      curriculum_active ? &sel_cap : nullptr);
             break;
         }
         case LlamaLayerKind::MOE_GDN: {
@@ -1889,7 +2088,8 @@ bool ForwardContext::forward_full(const std::vector<int32_t>& token_ids,
                                  impl_->rms_norm_eps,
                                  impl_->n_expert, impl_->n_expert_used,
                                  impl_->norm_topk_prob, impl_->expert_weights_scale,
-                                 impl_->is_moe);
+                                 impl_->is_moe,
+                                 curriculum_active ? &sel_cap : nullptr);
             if (conv_out) { ggml_set_output(conv_out); gdn_conv_state_out[(size_t)i] = conv_out; }
             if (ssm_out)  { ggml_set_output(ssm_out);  gdn_ssm_state_out[(size_t)i]  = ssm_out;  }
             break;
@@ -1904,6 +2104,11 @@ bool ForwardContext::forward_full(const std::vector<int32_t>& token_ids,
             ggml_set_output(v_cap);
             cap_K[(size_t)i] = k_cap;
             cap_V[(size_t)i] = v_cap;
+        }
+        // Curriculum: mark the selected-expert tensor as output for readback.
+        if (curriculum_active && sel_cap) {
+            ggml_set_output(sel_cap);
+            cap_selected[(size_t)i] = sel_cap;
         }
         if (i == 0 && dbg_X_layer0) {
             x_layer0 = x;
@@ -1950,6 +2155,15 @@ bool ForwardContext::forward_full(const std::vector<int32_t>& token_ids,
             }
             if (gdn_ssm_state_out[(size_t)il]) {
                 ggml_build_forward_expand(graph, gdn_ssm_state_out[(size_t)il]);
+            }
+        }
+    }
+    // Curriculum: expand the expert-selection tensors into the graph so
+    // gallocr allocates their backing buffers for post-compute readback.
+    if (curriculum_active) {
+        for (int il = 0; il < impl_->n_layer; ++il) {
+            if (cap_selected[(size_t)il]) {
+                ggml_build_forward_expand(graph, cap_selected[(size_t)il]);
             }
         }
     }
@@ -2134,6 +2348,46 @@ bool ForwardContext::forward_full(const std::vector<int32_t>& token_ids,
         }
     }
 
+    // ── MoE Curriculum: read back expert selections and update heatmap ──
+    if (curriculum_active) {
+        // `selected` shape is [k, n_tokens] I32 — each column is the k
+        // expert indices chosen for that token. We read all n_tokens at
+        // once per MoE layer, then feed them into the curriculum.
+        const int k = impl_->n_expert_used;
+        std::vector<int32_t> sel_buf((size_t)k * (size_t)n);
+
+        for (int il = 0; il < impl_->n_layer; ++il) {
+            ggml_tensor* sel = cap_selected[(size_t)il];
+            if (!sel) continue;  // non-MoE layer
+
+            ggml_backend_tensor_get(sel, sel_buf.data(), 0,
+                                    (size_t)k * (size_t)n * sizeof(int32_t));
+
+            // Record per-token expert usage into the curriculum heatmap.
+            for (int t = 0; t < n; ++t) {
+                // Each token's selected experts are at sel_buf[e * n + t]
+                // (ggml stores [k, n] column-major → dim0=k stride-1).
+                int experts_for_token[16];  // k <= 16 always
+                for (int e = 0; e < k && e < 16; ++e) {
+                    experts_for_token[e] = sel_buf[(size_t)e * (size_t)n + (size_t)t];
+                }
+                sp_moe_record_usage(impl_->moe_curriculum, il,
+                                    experts_for_token, k);
+            }
+        }
+
+        // Tick the curriculum — fires a Curriculum Pulse every
+        // `pulse_interval` tokens, updating EWMA scores and re-ranking.
+        for (int t = 0; t < n; ++t) {
+            sp_moe_tick(impl_->moe_curriculum);
+        }
+
+        // Adaptive prefetch: periodically adjust alpha based on hit rate.
+        if (impl_->prefetch) {
+            sp_prefetch_adapt(impl_->prefetch);
+        }
+    }
+
     ggml_free(gctx);
     return true;
 }
@@ -2185,7 +2439,8 @@ static ggml_tensor* build_block_decode(ggml_context* gctx,
                                         int   rope_mode,
                                         float attn_logit_softcap,
                                         ggml_tensor** k_capture,
-                                        ggml_tensor** v_capture) {
+                                        ggml_tensor** v_capture,
+                                        sp_crt_dispatch_t* crt = nullptr) {
     const int n_embd_q = n_head * head_dim;
     const int n        = 1;
 
@@ -2199,7 +2454,7 @@ static ggml_tensor* build_block_decode(ggml_context* gctx,
     ggml_tensor* K;
     ggml_tensor* V;
     if (L.attn_qkv) {
-        ggml_tensor* qkv = ggml_mul_mat(gctx, L.attn_qkv, xa);
+        ggml_tensor* qkv = sp_crt_mul_mat(gctx, L.attn_qkv, xa, crt);
         const size_t row_stride = qkv->nb[1];
         const size_t elem_size  = ggml_element_size(qkv);
         const int64_t n_embd_kv = (int64_t)n_head_kv * head_dim;
@@ -2209,11 +2464,11 @@ static ggml_tensor* build_block_decode(ggml_context* gctx,
         K = ggml_cont(gctx, ggml_view_2d(gctx, qkv, n_embd_kv, n, row_stride, q_bytes));
         V = ggml_cont(gctx, ggml_view_2d(gctx, qkv, n_embd_kv, n, row_stride, q_bytes + kv_bytes));
     } else {
-        Q = ggml_mul_mat(gctx, L.wq, xa);
+        Q = sp_crt_mul_mat(gctx, L.wq, xa, crt);
         if (L.bq) Q = ggml_add(gctx, Q, L.bq);
-        K = ggml_mul_mat(gctx, L.wk, xa);
+        K = sp_crt_mul_mat(gctx, L.wk, xa, crt);
         if (L.bk) K = ggml_add(gctx, K, L.bk);
-        V = ggml_mul_mat(gctx, L.wv, xa);
+        V = sp_crt_mul_mat(gctx, L.wv, xa, crt);
         if (L.bv) V = ggml_add(gctx, V, L.bv);
     }
 
@@ -2284,7 +2539,7 @@ static ggml_tensor* build_block_decode(ggml_context* gctx,
     attn = ggml_cont(gctx, ggml_permute(gctx, attn, 0, 2, 1, 3));
     attn = ggml_reshape_2d(gctx, attn, n_embd_q, n);
 
-    ggml_tensor* y1 = ggml_mul_mat(gctx, L.wo, attn);
+    ggml_tensor* y1 = sp_crt_mul_mat(gctx, L.wo, attn, crt);
     if (L.bo) y1 = ggml_add(gctx, y1, L.bo);
 
     if (L.attn_post_norm) {
@@ -2303,10 +2558,10 @@ static ggml_tensor* build_block_decode(ggml_context* gctx,
     ggml_tensor* gate;
     ggml_tensor* up;
     if (L.ffn_gate) {
-        gate = ggml_mul_mat(gctx, L.ffn_gate, xb);
-        up   = ggml_mul_mat(gctx, L.ffn_up,   xb);
+        gate = sp_crt_mul_mat(gctx, L.ffn_gate, xb, crt);
+        up   = sp_crt_mul_mat(gctx, L.ffn_up,   xb, crt);
     } else {
-        ggml_tensor* gu = ggml_mul_mat(gctx, L.ffn_up, xb);  // [2*n_ff, n]
+        ggml_tensor* gu = sp_crt_mul_mat(gctx, L.ffn_up, xb, crt);  // [2*n_ff, n]
         const int64_t n_ff       = gu->ne[0] / 2;
         const int64_t n_tok      = gu->ne[1];
         const size_t  row_stride = gu->nb[1];
@@ -2316,7 +2571,7 @@ static ggml_tensor* build_block_decode(ggml_context* gctx,
     }
     gate = ggml_silu(gctx, gate);
     ggml_tensor* ffn  = ggml_mul(gctx, gate, up);
-    ffn  = ggml_mul_mat(gctx, L.ffn_down, ffn);
+    ffn  = sp_crt_mul_mat(gctx, L.ffn_down, ffn, crt);
 
     return ggml_add(gctx, x, ffn);
 }
@@ -2549,7 +2804,8 @@ bool ForwardContext::decode(int32_t token_id,
                                impl_->n_rot,
                                layer_freq_base, impl_->rope_freq_scale,
                                impl_->rms_norm_eps, impl_->rope_mode, impl_->attn_logit_softcapping,
-                               &k_cap, &v_cap);
+                               &k_cap, &v_cap,
+                               impl_->crt_dispatch);
         // Copy this layer's capture into its slice of the batched
         // output tensors. ggml_cpy returns the destination view.
         ggml_tensor* dst_k = ggml_view_3d(gctx, new_K_big, hd, n_kv, 1,

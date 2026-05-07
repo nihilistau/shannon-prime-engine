@@ -339,6 +339,7 @@ int main(int argc, char** argv) {
             else if (a == "--load-cache"      && i + 1 < argc) cc.load_cache_path = argv[++i];
             else if (a == "--system12")                         cc.system12       = true;
             else if (a == "--crt-split")                        cc.crt_split      = true;
+            else if (a == "--moe-curriculum")                   cc.moe_curriculum = true;
             else if (a == "--s12-threshold"   && i + 1 < argc) cc.s12_threshold  = (float)std::atof(argv[++i]);
             else if (a == "--s12-sys2"        && i + 1 < argc) cc.s12_sys2       = argv[++i];
             else if (a.size() >= 2 && a[0] == '-' && a[1] == '-') {
@@ -396,6 +397,23 @@ int main(int argc, char** argv) {
             fc = sp::engine::ForwardContext::create(*m, *W, 1024 * 1024 * 1024, pe, bk);
         }
         if (!fc) return 5;
+
+        // CRT multi-GPU tensor splitting (Beast Canyon)
+        if (cc.crt_split) {
+            const int max_dim = m->n_embd();
+            if (fc->enable_crt(max_dim))
+                std::fprintf(stderr, "[sp-engine] CRT multi-GPU enabled (max_dim=%d)\n", max_dim);
+            else
+                std::fprintf(stderr, "[sp-engine] CRT init failed — falling back to standard matmul\n");
+        }
+
+        // MoE expert curriculum (Beast Canyon homeostatic balancer)
+        if (cc.moe_curriculum) {
+            if (fc->enable_moe_curriculum())
+                std::fprintf(stderr, "[sp-engine] MoE curriculum active\n");
+            else
+                std::fprintf(stderr, "[sp-engine] MoE curriculum not available (non-MoE model?)\n");
+        }
 
         // Hybrid-arch (qwen35moe / qwen35): allocate and bind a GdnStateCache
         // so the per-layer delta-rule recurrent state persists across chunks.
@@ -1063,6 +1081,7 @@ int main(int argc, char** argv) {
             else if (a == "--evict-keep"      && i + 1 < argc) cc.evict_keep = std::atoi(argv[++i]);
             else if (a == "--system12")                         cc.system12       = true;
             else if (a == "--crt-split")                        cc.crt_split      = true;
+            else if (a == "--moe-curriculum")                   cc.moe_curriculum = true;
             else if (a == "--s12-threshold"   && i + 1 < argc) cc.s12_threshold  = (float)std::atof(argv[++i]);
             else if (a == "--s12-sys2"        && i + 1 < argc) cc.s12_sys2       = argv[++i];
             else if (a.size() >= 2 && a[0] == '-' && a[1] == '-') {
@@ -1112,6 +1131,24 @@ int main(int argc, char** argv) {
             fc = sp::engine::ForwardContext::create(*m, *W, 1024 * 1024 * 1024, pe, bk);
         }
         if (!fc) return 4;
+
+        // CRT multi-GPU tensor splitting (Beast Canyon)
+        if (cc.crt_split) {
+            const int max_dim = m->n_embd();
+            if (fc->enable_crt(max_dim)) {
+                std::fprintf(stderr, "[sp-engine] CRT multi-GPU enabled (max_dim=%d)\n", max_dim);
+            } else {
+                std::fprintf(stderr, "[sp-engine] CRT init failed — falling back to standard matmul\n");
+            }
+        }
+
+        // MoE expert curriculum (Beast Canyon homeostatic balancer)
+        if (cc.moe_curriculum) {
+            if (fc->enable_moe_curriculum())
+                std::fprintf(stderr, "[sp-engine] MoE curriculum active\n");
+            else
+                std::fprintf(stderr, "[sp-engine] MoE curriculum not available (non-MoE model?)\n");
+        }
 
         // Prefer GPU-resident cache when backend is GPU + ship path.
         std::unique_ptr<sp::engine::KvCache> kv;
@@ -2481,6 +2518,8 @@ int main(int argc, char** argv) {
         }
         else if (a == "--pe-alpha" && i + 1 < argc) cfg.pe_alpha = (float)std::atof(argv[++i]);
         else if (a == "--pe-tier"  && i + 1 < argc) cfg.pe_tier  = std::atoi(argv[++i]);
+        else if (a == "--crt-split")                 cfg.crt_split = true;
+        else if (a == "--moe-curriculum")             cfg.moe_curriculum = true;
         else if (a.size() >= 2 && a[0] == '-' && a[1] == '-') {
             std::fprintf(stderr, "unknown flag: %s\n", a.c_str());
             return 2;

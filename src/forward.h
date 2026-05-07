@@ -154,6 +154,26 @@ public:
     // from disk so decode continues at the right offset.
     void set_kv_pos(int pos);
 
+    // CRT multi-GPU parallelism — enables Chinese Remainder Theorem
+    // tensor splitting for weight projection matmuls. Call after create()
+    // and before any forward/prefill/decode. max_dim is the largest
+    // expected matrix dimension (typically n_embd).
+    // Returns true on success. GPU acceleration is attempted but non-fatal.
+    bool enable_crt(int max_dim);
+
+    // Print CRT dispatch statistics (no-op if CRT not enabled).
+    void print_crt_stats() const;
+
+    // MoE Expert Curriculum — homeostatic expert balancer for Beast Canyon.
+    // Tracks expert usage via EWMA heatmap and assigns hot experts to RTX
+    // 2060, cool experts to Intel UHD. Also initialises the predictive
+    // prefetch engine (zero-bubble inference). Requires a MoE model
+    // (n_expert >= 2). Call after create() and before forward/prefill.
+    bool enable_moe_curriculum();
+
+    // Print curriculum + prefetch statistics (no-op if not enabled).
+    void print_moe_curriculum_stats() const;
+
     // Hparams the caller set at create(); exposed for diagnostics.
     int n_embd()  const;
     int n_vocab() const;
