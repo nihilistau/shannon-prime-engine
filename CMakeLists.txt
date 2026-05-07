@@ -465,6 +465,12 @@ endif()
 if(SP_ENGINE_BUILD_CLI)
     add_executable(sp-engine src/cli/main.cpp)
     target_link_libraries(sp-engine PRIVATE sp_engine)
+
+    # MSVC with CUDA: ggml-cuda.dll uses deep template recursion that
+    # blows the default 1 MB stack on DLL load.  8 MB is enough.
+    if(MSVC AND SP_ENGINE_WITH_CUDA)
+        target_link_options(sp-engine PRIVATE "/STACK:8388608")
+    endif()
 endif()
 
 # --------------------------------------------------------------------
