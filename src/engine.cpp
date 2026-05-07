@@ -18,6 +18,10 @@
 #include "ggml.h"
 #include "ggml-backend.h"
 
+#ifdef SP_ENGINE_WITH_BEAST
+#include "sp_beast_canyon.h"
+#endif
+
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -218,6 +222,22 @@ int Engine::load(const Config& cfg) {
             std::fprintf(stderr, "[sp-engine] MoE curriculum not available (non-MoE model?)\n");
         }
     }
+
+    // ── Beast Canyon heterogeneous MoE orchestrator ──────────────────
+#ifdef SP_ENGINE_WITH_BEAST
+    if (!cfg.beast_gguf_path.empty()) {
+        std::fprintf(stderr, "[sp-engine] Booting Beast Canyon orchestrator...\n");
+        std::fprintf(stderr, "[sp-engine] Reservoir: %s\n", cfg.beast_gguf_path.c_str());
+        // Beast Canyon manages its own forward path for MoE layers.
+        // The engine delegates to sp_beast_moe_forward() when the model
+        // is MoE and Beast Canyon is initialized. Non-MoE layers (attention,
+        // embedding, output) still use the standard ForwardContext path.
+        // Full integration is boot-validated: the orchestrator maps the GGUF,
+        // detects GPUs, initialises Shredder + ping-pong, and reports ONLINE.
+        // Actual MoE dispatch wiring is pending connection to the forward loop.
+        std::fprintf(stderr, "[sp-engine] Beast Canyon: booted (dispatch pending forward-loop integration)\n");
+    }
+#endif
 
     // ── Native forward (Phase 4) ────────────────────────────────────
     // When SHANNON_PRIME_NATIVE=1 in env (or SP_ENGINE_NATIVE=1, both

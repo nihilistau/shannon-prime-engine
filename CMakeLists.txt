@@ -60,6 +60,9 @@ option(SP_ENGINE_HEXAGON_FASTRPC "Link real Qualcomm FastRPC libs (Android+SDK o
 option(SP_ENGINE_WITH_QNN        "Enable Qualcomm QNN HTP backend (V69+ NPU dispatch)" OFF)
 option(SP_ENGINE_FP8             "Enable FP8 (E4M3) KV cache quantization kernels" OFF)
 option(SP_ENGINE_FP4             "Enable FP4 (Blackwell sm_120+) KV cache quantization" OFF)
+option(SP_ENGINE_WITH_BEAST      "Enable Beast Canyon heterogeneous MoE backend (Optane + AVX-512 + dual-GPU)" OFF)
+option(SP_ENGINE_BEAST_CUDA      "Beast Canyon: link CUDA runtime for GPU detect (no nvcc needed)" OFF)
+option(SP_ENGINE_BEAST_VULKAN    "Beast Canyon: link Vulkan for iGPU detect" OFF)
 option(SP_ENGINE_AUTO_PATCH      "Auto-apply vendor patches before build" ON)
 
 # --------------------------------------------------------------------
@@ -329,6 +332,27 @@ if(SP_ENGINE_WITH_QNN)
 endif()
 
 # --------------------------------------------------------------------
+# Beast Canyon: heterogeneous MoE orchestrator
+# (Optane reservoir + AVX-512 Shredder + dual-GPU dispatch + sidecar)
+#
+# Builds as a standalone static library with its own CMakeLists.
+# Linked into sp_engine when SP_ENGINE_WITH_BEAST=ON.
+# Pass -DSP_WITH_CUDA=ON and/or -DSP_WITH_VULKAN=ON to enable GPU
+# dispatch inside the Beast Canyon backend (mirrors the top-level
+# CUDA/Vulkan options).
+# --------------------------------------------------------------------
+if(SP_ENGINE_WITH_BEAST)
+    # Beast Canyon GPU detect uses cudart/Vulkan C API only — no nvcc needed.
+    # These are independent of SP_ENGINE_WITH_CUDA (which needs nvcc for .cu).
+    set(SP_WITH_CUDA   ${SP_ENGINE_BEAST_CUDA}   CACHE BOOL "" FORCE)
+    set(SP_WITH_VULKAN ${SP_ENGINE_BEAST_VULKAN}  CACHE BOOL "" FORCE)
+    add_subdirectory(${SP_CORE_DIR}/backends/beast_canyon
+                     ${CMAKE_BINARY_DIR}/beast_canyon)
+    target_link_libraries(sp_beast_canyon PUBLIC shannon_prime_core)
+    message(STATUS "Shannon-Prime Beast Canyon: enabled (CUDA=${SP_ENGINE_BEAST_CUDA}, Vulkan=${SP_ENGINE_BEAST_VULKAN})")
+endif()
+
+# --------------------------------------------------------------------
 # ggml (submodule) — MIT-licensed compute graph + GGUF loader + matmul
 # Disable the bits we don't need so the engine binary stays lean.
 # --------------------------------------------------------------------
@@ -432,6 +456,12 @@ if(SP_ENGINE_WITH_QNN)
     # Phase 5: V69 QNN context-binary driver (load AI Hub-compiled .bins).
     target_sources(sp_engine PRIVATE src/qnn_bin_driver.cpp)
 endif()
+if(SP_ENGINE_WITH_BEAST)
+    target_link_libraries(sp_engine PUBLIC sp_beast_canyon)
+    target_compile_definitions(sp_engine PUBLIC SP_ENGINE_WITH_BEAST=1)
+    target_include_directories(sp_engine PUBLIC
+        ${SP_CORE_DIR}/backends/beast_canyon)
+endif()
 if(SP_ENGINE_WITH_CUDA)
     target_link_libraries(sp_engine PUBLIC shannon_prime_cuda_backend)
     target_compile_definitions(sp_engine PUBLIC SP_ENGINE_WITH_CUDA=1)
@@ -483,6 +513,7 @@ message(STATUS "  Hexagon    : ${SP_ENGINE_WITH_HEXAGON} (FastRPC=${SP_ENGINE_HE
 message(STATUS "  QNN HTP    : ${SP_ENGINE_WITH_QNN}")
 message(STATUS "  FP8 (E4M3) : ${SP_ENGINE_FP8}")
 message(STATUS "  FP4 (BW)   : ${SP_ENGINE_FP4}")
+message(STATUS "  Beast Canyon: ${SP_ENGINE_WITH_BEAST} (CUDA=${SP_ENGINE_BEAST_CUDA}, Vulkan=${SP_ENGINE_BEAST_VULKAN})")
 message(STATUS "  auto-patch : ${SP_ENGINE_AUTO_PATCH}")
 message(STATUS "  CLI        : ${SP_ENGINE_BUILD_CLI}")
 message(STATUS "  tests      : ${SP_ENGINE_BUILD_TESTS}")

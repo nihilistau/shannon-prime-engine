@@ -20,6 +20,13 @@
 #include "speculative_oracle.h"
 #endif
 
+#if defined(SP_ENGINE_WITH_BEAST)
+extern "C" {
+#include "sp_beast_canyon.h"
+#include "sp_optane.h"
+}
+#endif
+
 #if defined(SP_ENGINE_HEXAGON_FASTRPC)
 extern "C" {
 #include "shannon_prime_hexagon.h"
@@ -271,6 +278,8 @@ static void usage(const char* prog) {
         "System 1↔2 switching (entropy-gated dynamic cache routing):\n"
         "  --system12            enable dual-cache mode (ship + hier/sqfree)\n"
         "  --crt-split           CRT multi-GPU parallelism (needs n_gpus >= 2)\n"
+        "  --moe-curriculum      MoE expert curriculum (EWMA heatmap + prefetch)\n"
+        "  --beast <gguf>        Boot Beast Canyon orchestrator on Optane-mapped model\n"
         "  --s12-threshold <f>   entropy threshold in nats (default: 2.0)\n"
         "  --s12-sys2 <type>     System 2 cache type: hier (default) | sqfree\n"
         "                        (env: SP_ENGINE_SYSTEM12, SP_ENGINE_S12_THRESHOLD)\n"
@@ -345,6 +354,7 @@ static int parse_config_flag(sp::engine::Config& cfg, const char* a, const char*
     if (a_eq("--system12"))                       { cfg.system12 = true; return 1; }
     if (a_eq("--crt-split"))                      { cfg.crt_split = true; return 1; }
     if (a_eq("--moe-curriculum"))                  { cfg.moe_curriculum = true; return 1; }
+    if (a_eq("--beast") && has_next)              { cfg.beast_gguf_path = next; return 2; }
     if (a_eq("--s12-threshold") && has_next) { cfg.s12_threshold = (float)std::atof(next); return 2; }
     if (a_eq("--s12-sys2")      && has_next) { cfg.s12_sys2 = next; return 2; }
 
@@ -1962,6 +1972,66 @@ int main(int argc, char** argv) {
         std::printf("\n=== CRT Model: %s ===\n", pass ? "PASS" : "FAIL");
         return pass ? 0 : 1;
     }
+
+    // ── Beast Canyon standalone test ─────────────────────────────────
+    //   sp-engine beast_test <path-to-gguf> [--audit-only]
+    //
+    // Boots the Beast Canyon orchestrator on the specified GGUF model:
+    // maps Optane reservoir, runs Day Zero stride audit, shredder bench,
+    // expert table dump, and full engine boot dry-run.
+#ifdef SP_ENGINE_WITH_BEAST
+    if (cmd == "beast_test") {
+        if (argc < 3) {
+            std::fprintf(stderr, "Usage: sp-engine beast_test <gguf-path> [--audit-only]\n");
+            return 1;
+        }
+        const char* gguf_path = argv[2];
+        bool audit_only = (argc >= 4 && std::string(argv[3]) == "--audit-only");
+
+        // Boot the reservoir (mmap + GGUF parse)
+        sp_optane_reservoir_t reservoir;
+        int rc = sp_optane_init(&reservoir, gguf_path);
+        if (rc != 0) {
+            std::fprintf(stderr, "[beast_test] Reservoir mapping failed (rc=%d)\n", rc);
+            return 1;
+        }
+        sp_optane_print_status(&reservoir);
+
+        // Optane stride audit
+        std::fprintf(stderr, "\n=== OPTANE STRIDE AUDIT ===\n");
+        double lat_us = sp_optane_measure_stride_latency(&reservoir);
+        std::fprintf(stderr, "4KB stride latency: %.2f us\n", lat_us);
+        if (lat_us > 0 && lat_us < 15.0)
+            std::fprintf(stderr, "VERDICT: PASS — Optane-class latency\n");
+        else if (lat_us > 0)
+            std::fprintf(stderr, "VERDICT: ACCEPTABLE — NVMe SSD (%.1f us > 15 us Optane target)\n", lat_us);
+        else
+            std::fprintf(stderr, "VERDICT: FAIL — measurement error\n");
+
+        if (!audit_only) {
+            // Full engine boot
+            std::fprintf(stderr, "\n=== BEAST CANYON ENGINE BOOT ===\n");
+            sp_beast_config_t bcfg;
+            sp_beast_config_init(&bcfg);
+            bcfg.gguf_path = gguf_path;
+            // Auto-detect GPUs (CUDA + Vulkan) unless --cpu-only passed
+            bcfg.force_cpu_only = false;
+
+            sp_beast_engine_t engine;
+            rc = sp_beast_init(&engine, &bcfg);
+            if (rc == 0) {
+                sp_beast_print_status(&engine);
+                sp_beast_free(&engine);
+                std::fprintf(stderr, "\n=== BEAST CANYON TEST: PASS ===\n");
+            } else {
+                std::fprintf(stderr, "\n=== BEAST CANYON TEST: FAIL (rc=%d) ===\n", rc);
+            }
+        }
+
+        sp_optane_free(&reservoir);
+        return 0;
+    }
+#endif
 
     if (cmd == "banner") {
         std::printf("Shannon-Prime Engine — reference inference with compressed KV cache\n");

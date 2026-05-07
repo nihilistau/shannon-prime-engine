@@ -11,16 +11,17 @@ namespace sp::engine {
 // Platform-portable aligned alloc/free. std::aligned_alloc is C++17
 // but MSVC didn't ship it until very late; use _aligned_malloc there.
 static void* sp_aligned_alloc_impl(size_t alignment, size_t bytes) {
-#if defined(_MSC_VER)
+#if defined(_WIN32)
+    // Both MSVC and MinGW provide _aligned_malloc.
     return _aligned_malloc(bytes, alignment);
 #else
     // POSIX aligned_alloc requires bytes to be a multiple of alignment.
     size_t round = (bytes + alignment - 1) & ~(alignment - 1);
-    return std::aligned_alloc(alignment, round);
+    return aligned_alloc(alignment, round);
 #endif
 }
 static void sp_aligned_free_impl(void* p) {
-#if defined(_MSC_VER)
+#if defined(_WIN32)
     _aligned_free(p);
 #else
     std::free(p);
