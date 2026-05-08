@@ -47,6 +47,11 @@ public:
     uint32_t n_head()           const { return n_head_; }
     uint32_t n_head_kv()        const { return n_head_kv_; }
     uint32_t head_dim()         const;   // derived: n_embd / n_head if not stored
+    uint32_t kv_head_dim()      const { return kv_head_dim_ ? kv_head_dim_ : head_dim(); }
+    // Maximum per-head dim across all layer types. For models with
+    // local/global layers (gemma4), global layers may have 2× head_dim.
+    // Use this for KV cache allocation to accommodate all layers.
+    uint32_t cache_head_dim()   const { return max_head_dim_ ? max_head_dim_ : head_dim(); }
     uint32_t rope_dim_count()   const { return rope_dim_count_; }
     float    rope_freq_base()   const { return rope_freq_base_; }
     uint32_t context_length()   const { return context_length_; }
@@ -103,6 +108,8 @@ private:
     uint32_t    n_embd_          = 0;
     uint32_t    n_head_          = 0;
     uint32_t    n_head_kv_       = 0;
+    uint32_t    kv_head_dim_     = 0;   // per-head K dim (may differ from head_dim for fold archs)
+    uint32_t    max_head_dim_    = 0;   // max head_dim across local/global layers (gemma4)
     uint32_t    rope_dim_count_  = 0;
     float       rope_freq_base_  = 10000.0f;
     uint32_t    context_length_  = 0;

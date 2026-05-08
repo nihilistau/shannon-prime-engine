@@ -367,7 +367,7 @@ int Engine::generate(const std::string& prompt, int n_predict,
     }
 
     const int n_layer   = impl_->fc->n_layer();
-    const int head_dim  = (int)impl_->model->head_dim();
+    const int head_dim  = (int)impl_->model->cache_head_dim();
     const int n_head_kv = (int)impl_->model->n_head_kv();
     const int max_seq   = ids.size() + (size_t)n_predict;
 

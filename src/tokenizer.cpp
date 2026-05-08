@@ -538,7 +538,7 @@ std::unique_ptr<Tokenizer> Tokenizer::create(const Vocab& vocab) {
     // finetunes like functiongemma. In GGUF, SPM vocabs never ship a
     // real merges array (the merge priorities are inherent in the
     // token scores); if one somehow appears it's ignored here.
-    if (model == "llama") {
+    if (model == "llama" || model == "gemma4") {
         return std::make_unique<SpmTokenizer>(vocab, pre);
     }
 
