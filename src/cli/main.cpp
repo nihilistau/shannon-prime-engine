@@ -518,7 +518,7 @@ int main(int argc, char** argv) {
         }
 
         const int n_layer   = fc->n_layer();
-        const int head_dim  = (int)m->cache_head_dim();
+        const int head_dim  = (int)m->head_dim();
         const int n_head_kv = (int)m->n_head_kv();
         const int n_vocab_local = fc->n_vocab();
 
@@ -914,7 +914,7 @@ int main(int argc, char** argv) {
             if (prefer_gpu_cache && backend_is_gpu && gpu_ok) {
                 kv = sp::engine::KvCache::create_gpu(fc->n_layer(),
                                                       (int)m->n_head_kv(),
-                                                      (int)m->cache_head_dim(),
+                                                      (int)m->head_dim(),
                                                       n_ctx + 8, pc,
                                                       /*stream=*/nullptr);
                 if (!kv) {
@@ -924,7 +924,7 @@ int main(int argc, char** argv) {
             if (!kv) {
                 kv = sp::engine::KvCache::create(fc->n_layer(),
                                                   (int)m->n_head_kv(),
-                                                  (int)m->cache_head_dim(),
+                                                  (int)m->head_dim(),
                                                   n_ctx + 8, pc);
             }
             if (!kv) { std::fprintf(stderr, "KvCache::create failed\n"); return 5; }
@@ -1196,14 +1196,14 @@ int main(int argc, char** argv) {
                 if (backend_is_gpu) {
                     dual = sp::engine::DualKvCache::create_gpu(
                         fc->n_layer(), (int)m->n_head_kv(),
-                        (int)m->cache_head_dim(), max_seq, cc,
+                        (int)m->head_dim(), max_seq, cc,
                         cc.s12_sys2, cc.s12_threshold,
                         /*stream=*/nullptr);
                 }
                 if (!dual) {
                     dual = sp::engine::DualKvCache::create(
                         fc->n_layer(), (int)m->n_head_kv(),
-                        (int)m->cache_head_dim(), max_seq, cc,
+                        (int)m->head_dim(), max_seq, cc,
                         cc.s12_sys2, cc.s12_threshold);
                 }
                 if (!dual) {
@@ -1217,7 +1217,7 @@ int main(int argc, char** argv) {
                 if (prefer_gpu_cache && backend_is_gpu && gpu_ok) {
                     kv = sp::engine::KvCache::create_gpu(fc->n_layer(),
                                                           (int)m->n_head_kv(),
-                                                          (int)m->cache_head_dim(),
+                                                          (int)m->head_dim(),
                                                           max_seq, cc,
                                                           /*stream=*/nullptr);
                     if (!kv) {
@@ -1227,7 +1227,7 @@ int main(int argc, char** argv) {
                 if (!kv) {
                     kv = sp::engine::KvCache::create(fc->n_layer(),
                                                       (int)m->n_head_kv(),
-                                                      (int)m->cache_head_dim(),
+                                                      (int)m->head_dim(),
                                                       max_seq, cc);
                 }
                 if (!kv) { std::fprintf(stderr, "KvCache::create failed\n"); return 5; }
@@ -1378,7 +1378,7 @@ int main(int argc, char** argv) {
                         std::fprintf(stderr, "\nref forward failed at step %d\n", step); return 8;
                     }
                     const int n_kv     = (int)m->n_head_kv();
-                    const int hd       = (int)m->cache_head_dim();
+                    const int hd       = (int)m->head_dim();
                     const int n_embd   = fc->n_embd();
                     const int last_pos = (int)running.size() - 1;
                     const float* ref_K_last = ref_K[0].data() + (size_t)last_pos * n_kv * hd;
@@ -1817,7 +1817,7 @@ int main(int argc, char** argv) {
         if (!tk) { std::fprintf(stderr, "failed to create tokenizer\n"); return 3; }
 
         const int n_layer   = (int)m->n_layer();
-        const int head_dim  = (int)m->cache_head_dim();
+        const int head_dim  = (int)m->head_dim();
         const int n_head_kv = (int)m->n_head_kv();
 
         if (layer >= n_layer) {
@@ -2601,30 +2601,6 @@ int main(int argc, char** argv) {
         if (!m) return 2;
         m->print_summary(stdout);
 
-        // Gemma4 diagnostic: dump relevant attention hparams.
-        if (m->architecture() == "gemma4") {
-            std::printf("\n  gemma4 attention hparams:\n");
-            const std::string p = "gemma4.";
-            auto dump_i = [&](const char* k) {
-                int64_t v = m->get_i64(std::string(p) + k, -1);
-                std::printf("    %s%s = %lld\n", p.c_str(), k, (long long)v);
-            };
-            dump_i("attention.head_count");
-            dump_i("attention.head_count_kv");
-            dump_i("attention.key_length");
-            dump_i("attention.value_length");
-            dump_i("attention.sliding_window");
-            dump_i("attention.sliding_window_pattern");
-            dump_i("attention.layer_indices.sliding_window");
-            dump_i("block_count");
-            dump_i("kv_shared_layer_frequency");
-            dump_i("attention.logit_softcapping");
-            dump_i("final_logit_softcapping");
-            dump_i("attention.query_pre_attn_scalar");
-            auto ff = m->get_f64(p + "attention.logit_softcapping", -1.0);
-            std::printf("    %sattention.logit_softcapping (f64) = %.2f\n", p.c_str(), ff);
-        }
-
         // Also show the first few tensors so the user can spot-check the
         // layout without loading a full inspection tool.
         std::printf("\n  first %d tensors:\n",
@@ -2977,7 +2953,7 @@ int main(int argc, char** argv) {
         }
 
         const int n_layer   = fc->n_layer();
-        const int head_dim  = (int)m->cache_head_dim();
+        const int head_dim  = (int)m->head_dim();
         const int n_head_kv = (int)m->n_head_kv();
 
         // prefill is a CPU-only diagnostic verb — forward runs on CPU-mmap
@@ -2988,13 +2964,11 @@ int main(int argc, char** argv) {
         if (!kv) { std::fprintf(stderr, "KvCache::create failed\n"); return 7; }
         std::fprintf(stderr, "[sp-engine] %s\n", kv->describe().c_str());
 
-        // Calibrate before writing. Skip layers with no K/V capture
-        // (GDN layers in hybrid archs produce no K/V).
+        // Calibrate before writing.
         if (!kv->is_calibrated()) {
             if (kv->calibrate_begin()) {
                 const bool hier = kv->is_hierarchical();
                 for (int L = 0; L < n_layer; ++L) {
-                    if (Ks[(size_t)L].empty()) continue;  // GDN layer — no K/V
                     const float* K_data = Ks[(size_t)L].data();
                     for (int q = 0; q < n; ++q) {
                         for (int h = 0; h < n_head_kv; ++h) {
@@ -3012,12 +2986,7 @@ int main(int argc, char** argv) {
         }
 
         // Push every layer's captured K/V through the compressed cache.
-        // Skip layers with no K/V capture (GDN layers in hybrid archs).
         for (int L = 0; L < n_layer; ++L) {
-            if (Ks[(size_t)L].empty() || Vs[(size_t)L].empty()) {
-                std::fprintf(stderr, "  layer %d: no K/V (GDN), skipped\n", L);
-                continue;
-            }
             if (!kv->write(L, /*pos_offset=*/0, n, Ks[(size_t)L].data(), Vs[(size_t)L].data())) {
                 std::fprintf(stderr, "kv->write layer %d failed\n", L); return 8;
             }
@@ -3037,12 +3006,9 @@ int main(int argc, char** argv) {
         };
 
         // Read every layer back, compute mean K corr / V corr per layer.
-        // Skip layers with no K/V capture (GDN layers in hybrid archs).
         std::printf("layer  K_corr   V_corr  K_min   V_min\n");
         double overall_k = 0, overall_v = 0;
-        int    n_attn_layers = 0;
         for (int L = 0; L < n_layer; ++L) {
-            if (Ks[(size_t)L].empty() || Vs[(size_t)L].empty()) continue;
             std::vector<float> Krec, Vrec;
             if (!kv->read(L, n, Krec, Vrec)) {
                 std::fprintf(stderr, "kv->read layer %d failed\n", L); return 9;
@@ -3065,15 +3031,13 @@ int main(int argc, char** argv) {
             }
             float km = (float)(k_sum / per), vm = (float)(v_sum / per);
             overall_k += km; overall_v += vm;
-            ++n_attn_layers;
             // Show a sample of layers to keep the table small.
-            if (n_attn_layers <= 4 || L == n_layer - 1 || L == n_layer / 2) {
+            if (L < 4 || L == n_layer - 1 || L == n_layer / 2) {
                 std::printf("%3d   %6.4f  %6.4f  %6.4f  %6.4f\n", L, km, vm, k_min, v_min);
             }
         }
-        if (n_attn_layers == 0) n_attn_layers = 1;
-        std::printf("---\nmean over %d attn layers (of %d total): K_corr=%.4f  V_corr=%.4f  compression=%.2fx\n",
-                    n_attn_layers, n_layer, overall_k / n_attn_layers, overall_v / n_attn_layers,
+        std::printf("---\nmean over %d layers: K_corr=%.4f  V_corr=%.4f  compression=%.2fx\n",
+                    n_layer, overall_k / n_layer, overall_v / n_layer,
                     kv->compression_ratio());
         return 0;
     }

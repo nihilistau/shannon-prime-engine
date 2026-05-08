@@ -66,7 +66,7 @@ ggml_context* LlamaWeights::ctx() const { return impl_->ctx; }
 static bool supported_arch(const std::string& a) {
     static const std::unordered_set<std::string> ok = {
         "llama", "qwen2", "qwen3", "mistral3", "phi3", "granite", "gemma3",
-        "gemma4", "qwen35moe", "qwen35"
+        "qwen35moe", "qwen35"
     };
     return ok.count(a) != 0;
 }
@@ -247,11 +247,7 @@ bool LlamaWeights::bind_tensors_(LlamaWeights& w, ggml_context* tctx,
         L.kind = LlamaLayerKind::STANDARD;
         L.wq        = bind_req(layer_name(i, "attn_q.weight"));
         L.wk        = bind_req(layer_name(i, "attn_k.weight"));
-        // Gemma4 has layers with shared KV (no own V projection).
-        // Those layers reuse V from the nearest global-attention layer.
-        const bool is_gemma4 = (arch == "gemma4");
-        L.wv        = is_gemma4 ? bind_opt(layer_name(i, "attn_v.weight"))
-                                : bind_req(layer_name(i, "attn_v.weight"));
+        L.wv        = bind_req(layer_name(i, "attn_v.weight"));
         L.wo        = bind_req(layer_name(i, "attn_output.weight"));
 
         L.attn_q_norm = bind_opt(layer_name(i, "attn_q_norm.weight"));
@@ -262,67 +258,22 @@ bool LlamaWeights::bind_tensors_(LlamaWeights& w, ggml_context* tctx,
         L.bv        = bind_opt(layer_name(i, "attn_v.bias"));
         L.bo        = bind_opt(layer_name(i, "attn_output.bias"));
 
-        L.ffn_norm  = bind_opt(layer_name(i, "ffn_norm.weight"));
-        L.ffn_gate  = bind_opt(layer_name(i, "ffn_gate.weight"));
-        L.ffn_up    = bind_opt(layer_name(i, "ffn_up.weight"));
-        L.ffn_down  = bind_opt(layer_name(i, "ffn_down.weight"));
+        L.ffn_norm  = bind_req(layer_name(i, "ffn_norm.weight"));
+        L.ffn_gate  = bind_req(layer_name(i, "ffn_gate.weight"));
+        L.ffn_up    = bind_req(layer_name(i, "ffn_up.weight"));
+        L.ffn_down  = bind_req(layer_name(i, "ffn_down.weight"));
 
-        // Gemma3/4 sandwich norms. Optional — stay nullptr for llama/qwen/etc.
+        // Gemma3 sandwich norms. Optional — stay nullptr for llama/qwen/etc.
         L.attn_post_norm = bind_opt(layer_name(i, "post_attention_norm.weight"));
         L.ffn_post_norm  = bind_opt(layer_name(i, "post_ffw_norm.weight"));
 
-        // For non-gemma4 archs, enforce the required tensors.
-        if (!is_gemma4) {
-            if (!L.attn_norm || !L.wq || !L.wk || !L.wv || !L.wo
-                || !L.ffn_norm || !L.ffn_gate || !L.ffn_up || !L.ffn_down) {
-                std::fprintf(stderr,
-                    "[sp-engine] LlamaWeights: layer %d missing required tensor(s)\n", i);
-                return false;
-            }
-        } else {
-            // Gemma4 minimum: Q, K, output. V and FFN may be absent on some layers.
-            if (!L.attn_norm || !L.wq || !L.wk || !L.wo) {
-                std::fprintf(stderr,
-                    "[sp-engine] LlamaWeights: gemma4 layer %d missing Q/K/O\n", i);
-                return false;
-            }
+        if (!L.attn_norm || !L.wq || !L.wk || !L.wv || !L.wo
+            || !L.ffn_norm || !L.ffn_gate || !L.ffn_up || !L.ffn_down) {
+            std::fprintf(stderr,
+                "[sp-engine] LlamaWeights: layer %d missing required tensor(s)\n", i);
+            return false;
         }
     }
-
-    // ── Gemma4 V-sharing fixup ──────────────────────────────────────
-    // Gemma4 has a mixed global/local attention pattern where "local"
-    // layers omit attn_v.weight in the GGUF. Those layers reuse the
-    // V projection from the nearest preceding "global" layer (weight
-    // sharing — the same Wv is applied to the local layer's normalised
-    // input). Backfill the wv pointer now so the forward pass sees a
-    // valid tensor on every layer; mark the backfilled layers so the
-    // SWA / cache dispatch can distinguish them.
-    if (arch == "gemma4") {
-        ggml_tensor* last_v   = nullptr;
-        ggml_tensor* last_bv  = nullptr;
-        int n_shared = 0;
-        for (int i = 0; i < n_layer; ++i) {
-            LlamaLayer& L = w.layers_[(size_t)i];
-            if (L.wv) {
-                last_v  = L.wv;
-                last_bv = L.bv;
-            } else if (last_v) {
-                L.wv              = last_v;
-                L.bv              = last_bv;   // may be nullptr — fine
-                L.gemma4_v_shared = true;
-                ++n_shared;
-            } else {
-                std::fprintf(stderr,
-                    "[sp-engine] LlamaWeights: gemma4 layer %d has no V and no "
-                    "preceding global layer to share from\n", i);
-                return false;
-            }
-        }
-        std::fprintf(stderr,
-            "[sp-engine] gemma4 V-sharing: %d/%d layers share V from global neighbors\n",
-            n_shared, n_layer);
-    }
-
     return true;
 }
 

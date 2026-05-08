@@ -5,7 +5,7 @@
 // Commercial license available — contact raydaniels@gmail.com
 //
 // Materialises the tensors of a llama-family GGUF (arch ∈ {llama, qwen2,
-// qwen3, mistral3, phi3, granite, gemma3, gemma4, qwen35moe}) into a ggml_context
+// qwen3, mistral3, phi3, granite, gemma3, qwen35moe}) into a ggml_context
 // and exposes typed per-layer handles. The layout is nearly identical
 // across these archs modulo a handful of optional bias / norm tensors —
 // a single struct covers them all:
@@ -61,12 +61,6 @@ enum class LlamaLayerKind : int {
 
 struct LlamaLayer {
     LlamaLayerKind kind = LlamaLayerKind::STANDARD;
-
-    // Gemma4 V-sharing: true if this layer's wv was backfilled from a
-    // preceding global-attention layer (the layer itself has no attn_v
-    // tensor in the GGUF). The forward pass uses this to select
-    // sliding-window masking for the shared layers.
-    bool gemma4_v_shared = false;
 
     // --- Attention (STANDARD / MOE_ATTN layers) -------------------------
     ggml_tensor* attn_norm   = nullptr;  // "blk.N.attn_norm.weight"

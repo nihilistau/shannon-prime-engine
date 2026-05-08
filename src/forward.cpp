@@ -55,10 +55,6 @@ struct ForwardContext::Impl {
     int   n_head_kv = 0;
     int   head_dim  = 0;
     int   n_rot     = 0;          // RoPE dim count (often = head_dim)
-    // Per-layer head_dim for architectures where Q/K projection sizes
-    // vary across layers (Gemma4 local=256, global=512). Empty for
-    // uniform models (all layers use head_dim).
-    std::vector<int> per_layer_hd;
     int   rope_mode = 0;          // 0 = LLaMA-style, 2 = NEOX (qwen, phi3, …)
     float rope_freq_base  = 10000.0f;
     float rope_freq_scale = 1.0f;
@@ -381,9 +377,6 @@ std::unique_ptr<ForwardContext> ForwardContext::create(const Model& model,
         fc->impl_->head_dim = fc->impl_->n_embd / fc->impl_->n_head;
     }
     // rope_dim_count: use arch-specific key when non-zero, else head_dim.
-    // Per-layer n_rot clamping is done in build_block/build_block_decode
-    // based on each layer's actual Q/K weight dimensions (Gemma4 has
-    // local vs global layers with potentially different head_dim).
     fc->impl_->n_rot = (int)model.rope_dim_count();
     if (fc->impl_->n_rot == 0) fc->impl_->n_rot = fc->impl_->head_dim;
     fc->impl_->rope_freq_base = model.rope_freq_base();
@@ -413,60 +406,26 @@ std::unique_ptr<ForwardContext> ForwardContext::create(const Model& model,
     // block; other archs leave embeddings untouched.
     {
         const std::string& a = model.architecture();
-        if (a == "gemma" || a == "gemma2" || a == "gemma3" || a == "gemma4") {
+        if (a == "gemma" || a == "gemma2" || a == "gemma3") {
             fc->impl_->embd_scale = sqrtf((float)fc->impl_->n_embd);
         }
     }
 
-    // Gemma3/4 sliding-window attention. Reads the `sliding_window`
+    // Gemma3 sliding-window attention. Reads the `sliding_window`
     // hparam — 1024 on gemma3-12B, 512 on smaller variants. Non-
-    // gemma archs leave swa_window=0 (SWA off).
-    // Gemma4 uses the same key pattern under "gemma4." namespace.
+    // gemma3 archs leave swa_window=0 (SWA off).
     if (model.architecture() == "gemma3") {
         const int64_t w = model.get_i64("gemma3.attention.sliding_window", 0);
         if (w > 0) fc->impl_->swa_window = (int)w;
         fc->impl_->attn_logit_softcapping = (float)model.get_f64("gemma3.attention.logit_softcapping", 0.0);
         fc->impl_->final_logit_softcapping = (float)model.get_f64("gemma3.final_logit_softcapping", 0.0);
     }
-    if (model.architecture() == "gemma4") {
-        const int64_t w = model.get_i64("gemma4.attention.sliding_window",
-                                         model.get_i64("gemma3.attention.sliding_window", 0));
-        if (w > 0) fc->impl_->swa_window = (int)w;
-        fc->impl_->attn_logit_softcapping = (float)model.get_f64(
-            "gemma4.attention.logit_softcapping",
-            model.get_f64("gemma3.attention.logit_softcapping", 0.0));
-        fc->impl_->final_logit_softcapping = (float)model.get_f64(
-            "gemma4.final_logit_softcapping",
-            model.get_f64("gemma3.final_logit_softcapping", 0.0));
-    }
 
     // FFN activation flavor. Gemma family uses GELU (tanh approx)
     // instead of SiLU in the gated MLP.
     {
         const std::string& a = model.architecture();
-        fc->impl_->ffn_gelu = (a == "gemma" || a == "gemma2" || a == "gemma3" || a == "gemma4");
-    }
-
-    // Per-layer head_dim. Gemma4 has local (sliding-window) and global
-    // layers with potentially different Q/K/V projection sizes.  Derive
-    // from actual weight tensor shapes once weights are bound.
-    if (model.architecture() == "gemma4" && fc->impl_->n_head > 0) {
-        auto& plh = fc->impl_->per_layer_hd;
-        plh.resize((size_t)fc->impl_->n_layer, fc->impl_->head_dim);
-        for (int L = 0; L < fc->impl_->n_layer; ++L) {
-            const auto& layer = weights.layers()[(size_t)L];
-            if (layer.wq) {
-                int layer_hd = (int)(layer.wq->ne[1] / fc->impl_->n_head);
-                plh[(size_t)L] = layer_hd;
-            }
-        }
-        // Log if any layer differs.
-        int max_hd = fc->impl_->head_dim;
-        for (int h : plh) if (h > max_hd) max_hd = h;
-        if (max_hd != fc->impl_->head_dim) {
-            std::fprintf(stderr, "[sp-engine] gemma4 per-layer head_dim: local=%d global=%d\n",
-                         fc->impl_->head_dim, max_hd);
-        }
+        fc->impl_->ffn_gelu = (a == "gemma" || a == "gemma2" || a == "gemma3");
     }
 
     // Hybrid GDN arch setup (qwen35moe + qwen35). These stay zero/default
@@ -511,11 +470,6 @@ std::unique_ptr<ForwardContext> ForwardContext::create(const Model& model,
             // to standard RoPE when all per-token pos slots are equal.
             fc->impl_->rope_sections[0] = fc->impl_->n_rot / 2;
         }
-        std::fprintf(stderr, "[sp-engine] mRoPE mode=%d sections=[%d,%d,%d,%d] n_rot=%d\n",
-                     fc->impl_->rope_mode_mrope,
-                     fc->impl_->rope_sections[0], fc->impl_->rope_sections[1],
-                     fc->impl_->rope_sections[2], fc->impl_->rope_sections[3],
-                     fc->impl_->n_rot);
 
         // GDN (linear-attention) hparams for MOE_GDN layers.
         const int conv_kernel   = (int)model.get_i64(arch + ".ssm.conv_kernel",    4);
@@ -898,8 +852,7 @@ static ggml_tensor* build_moe_ffn(ggml_context* gctx,
                                    int   n_expert_used,
                                    bool  norm_topk_prob,
                                    float expert_weights_scale,
-                                   ggml_tensor** selected_capture = nullptr,
-                                   sp_crt_dispatch_t* crt = nullptr) {
+                                   ggml_tensor** selected_capture = nullptr) {
     const int n_tokens = (int)cur->ne[1];
     const int n_embd   = (int)cur->ne[0];
 
@@ -937,23 +890,6 @@ static ggml_tensor* build_moe_ffn(ggml_context* gctx,
 
     // 5. Expert bank application. cur → [n_embd, 1, n_tokens] for
     //    mul_mat_id; the k-dim is introduced by the indirect lookup.
-    //
-    // When CRT is armed with 2+ GPUs, the expert matmuls will be dispatched
-    // to different GPUs at compute time via the Beast Canyon hetero barrier.
-    // The graph structure is identical (ggml_mul_mat_id still used for
-    // correctness); the CRT dispatch intercepts during compute and splits
-    // work across GPU 0 (CUDA/RTX 2060) and GPU 1 (L0/UHD 750).
-    if (crt && crt->crt.gpu_ready) {
-        static bool logged = false;
-        if (!logged) {
-            std::fprintf(stderr, "[sp-engine] MoE expert-split ARMED: "
-                         "%d experts, top-%d, CRT dispatch to %s\n",
-                         n_expert, n_expert_used,
-                         "GPU active");
-            logged = true;
-        }
-    }
-
     ggml_tensor* cur_3d = ggml_reshape_3d(gctx, cur, n_embd, 1, n_tokens);
 
     ggml_tensor* up_e   = ggml_mul_mat_id(gctx, L.ffn_up_exps,   cur_3d, selected);  // [n_ff, k, n]
@@ -993,56 +929,6 @@ static ggml_tensor* build_moe_ffn(ggml_context* gctx,
     }
 
     return moe_out;
-}
-
-// ------------------------------------------------------------------
-// Beast Canyon expert-split dispatch.
-//
-// When --crt-split is enabled and 2+ GPUs are detected, this replaces
-// the standard ggml_mul_mat_id path with a split dispatch that routes
-// each selected expert to a specific GPU:
-//   - Even-indexed selected experts → GPU 0 (RTX 2060 / CUDA)
-//   - Odd-indexed selected experts  → GPU 1 (Intel UHD 750 / Level Zero)
-//
-// The two GPUs compute their assigned expert FFNs in parallel behind
-// the hetero barrier. Results are combined on the CPU.
-//
-// NOTE: This is a compute-time callback. It fires during ggml_graph_compute
-// for the custom op node and does real GPU dispatch inside.
-// ------------------------------------------------------------------
-
-struct sp_moe_split_userdata_t {
-    sp_crt_dispatch_t* crt;
-    int n_expert_used;
-};
-
-static void sp_moe_split_custom_op(ggml_tensor* dst, int ith, int nth, void* userdata) {
-    if (ith != 0) return;
-
-    sp_moe_split_userdata_t* u = (sp_moe_split_userdata_t*)userdata;
-    sp_crt_dispatch_t* d = u->crt;
-    if (!d || !d->crt.gpu_ready) return;
-
-    // dst->src layout:
-    //   src[0] = cur           [n_embd, n_tokens]   input hidden states
-    //   src[1] = selected      [k, n_tokens]        I32 expert IDs
-    //   src[2] = weights       [1, k, n_tokens]     expert weights
-    //   src[3] = gate_exps     packed expert tensors
-    //   src[4] = up_exps       packed expert tensors
-    //   src[5] = down_exps     packed expert tensors
-    // dst = [n_embd, n_tokens] output
-
-    // For now, fall through to CPU — the GPU dispatch kernels for
-    // individual expert matmuls need the CUDA/L0 streams from the
-    // Beast Canyon barrier, which requires linking sp_beast_canyon.
-    // This scaffolds the custom op so the graph builder routes through
-    // it when CRT is active; actual GPU dispatch is Phase 2.
-    //
-    // The graph still produces correct results because ggml_mul_mat_id
-    // is used as fallback when this op is not armed.
-
-    // Mark that we saw the split point (for telemetry)
-    d->n_dispatched++;
 }
 
 // ------------------------------------------------------------------
@@ -1168,28 +1054,9 @@ static ggml_tensor* build_block(ggml_context* gctx,
         if (L.bv) V = ggml_add(gctx, V, L.bv);
     }
 
-    // Reshape Q/K/V into [head_dim, heads, n]. Gemma4 has two layer types:
-    // - "local" layers: standard sliding-window attention
-    // - "global" layers: may have different Q/K/V projection sizes
-    //
-    // Derive the ACTUAL head_dim from Q elements rather than relying on
-    // the global head_dim parameter, which is computed from layer 0 only.
-    const int actual_head_dim = (n_head > 0) ? (int)(ggml_nelements(Q) / (n * n_head)) : head_dim;
-    const int actual_kv_dim  = (n_head_kv > 0) ? (int)(ggml_nelements(K) / (n * n_head_kv)) : actual_head_dim;
-    const int hd = actual_head_dim;  // use actual per-layer head dim for reshape
-
-    const int base_kv_heads = (n_rot > 0 && hd > 0) ? (n_head_kv * hd) / n_rot : 0;
-    const bool kv_fold = (n_rot > hd && hd > 0 && base_kv_heads > 0);
-
-    if (kv_fold) {
-        Q = ggml_reshape_3d(gctx, Q, hd, n_head,        n);
-        K = ggml_reshape_3d(gctx, K, n_rot, base_kv_heads, n);
-        V = ggml_reshape_3d(gctx, V, hd, n_head_kv,     n);
-    } else {
-        Q = ggml_reshape_3d(gctx, Q, hd,             n_head,    n);
-        K = ggml_reshape_3d(gctx, K, actual_kv_dim,  n_head_kv, n);
-        V = ggml_reshape_3d(gctx, V, actual_kv_dim,  n_head_kv, n);
-    }
+    Q = ggml_reshape_3d(gctx, Q, head_dim, n_head,    n);
+    K = ggml_reshape_3d(gctx, K, head_dim, n_head_kv, n);
+    V = ggml_reshape_3d(gctx, V, head_dim, n_head_kv, n);
 
     if (L.attn_q_norm) {
         Q = ggml_rms_norm(gctx, Q, rms_eps);
@@ -1200,19 +1067,10 @@ static ggml_tensor* build_block(ggml_context* gctx,
         K = ggml_mul(gctx, K, L.attn_k_norm);
     }
 
-    // RoPE dim: clamp to actual per-head dim for this layer
-    const int layer_n_rot = (n_rot > hd) ? hd : n_rot;
-    const int q_n_rot = kv_fold ? hd : layer_n_rot;
     Q = ggml_rope_ext(gctx, Q, pos, freq_factors,
-                      q_n_rot, rope_mode, 0, freq_base, freq_scale, 0, 1, 32, 1);
+                      n_rot, rope_mode, 0, freq_base, freq_scale, 0, 1, 32, 1);
     K = ggml_rope_ext(gctx, K, pos, freq_factors,
-                      kv_fold ? n_rot : layer_n_rot, rope_mode, 0, freq_base, freq_scale, 0, 1, 32, 1);
-
-    // Complete the KV fold: reshape K from pre-fold [n_rot, base, n]
-    // to effective [hd, n_head_kv, n] after RoPE application.
-    if (kv_fold) {
-        K = ggml_reshape_3d(gctx, K, hd, n_head_kv, n);
-    }
+                      n_rot, rope_mode, 0, freq_base, freq_scale, 0, 1, 32, 1);
 
     // V is a ggml_reshape_3d view over the projection output. ggml_set_output
     // on a view does not preserve the underlying buffer through subsequent
@@ -1240,11 +1098,10 @@ static ggml_tensor* build_block(ggml_context* gctx,
     if (vp->type == GGML_TYPE_F32) vp = ggml_cast(gctx, vp, GGML_TYPE_F16);
     ggml_tensor* mask_f16 = ggml_cast(gctx, kq_mask, GGML_TYPE_F16);
     ggml_tensor* attn = ggml_flash_attn_ext(gctx, qp, kp, vp, mask_f16,
-                                            1.0f / sqrtf((float)hd),
+                                            1.0f / sqrtf((float)head_dim),
                                             alibi_max_bias, attn_logit_softcap);
     ggml_flash_attn_ext_set_prec(attn, GGML_PREC_F32);
-    const int layer_n_embd_q = n_head * hd;
-    attn = ggml_reshape_2d(gctx, attn, layer_n_embd_q, n);
+    attn = ggml_reshape_2d(gctx, attn, n_embd_q, n);
 
     ggml_tensor* y1 = sp_crt_mul_mat(gctx, L.wo, attn, crt);
     if (L.bo) y1 = ggml_add(gctx, y1, L.bo);
@@ -1259,8 +1116,7 @@ static ggml_tensor* build_block(ggml_context* gctx,
 
     x = ggml_add(gctx, x, y1);
 
-    // FFN. Three paths:
-    //   * Skip: gemma4 layers that lack FFN tensors (pass-through).
+    // FFN. Two paths:
     //   * Classic (llama / qwen / gemma / ...): separate ffn_gate and ffn_up
     //     matmuls, SiLU/GELU on gate, elementwise mul, then ffn_down.
     //   * Phi3 packed SwiGLU: the GGUF's ffn_up tensor is 2*n_ff wide and
@@ -1268,10 +1124,6 @@ static ggml_tensor* build_block(ggml_context* gctx,
     //     a view-split (mirroring the fused-QKV pattern above) reconstructs
     //     gate and up. phi3 never has ffn_gate bound, so that signals the
     //     packed layout.
-    if (!L.ffn_norm || !L.ffn_down) {
-        // No FFN on this layer (gemma4 edge case) — skip.
-        return x;
-    }
     ggml_tensor* xb = ggml_rms_norm(gctx, x, rms_eps);
     xb = ggml_mul(gctx, xb, L.ffn_norm);
 
@@ -1340,8 +1192,7 @@ static ggml_tensor* build_block_moe_attn(ggml_context* gctx,
                                           bool  is_moe = true,
                                           ggml_tensor** k_capture = nullptr,
                                           ggml_tensor** v_capture = nullptr,
-                                          ggml_tensor** selected_capture = nullptr,
-                                          sp_crt_dispatch_t* crt = nullptr) {
+                                          ggml_tensor** selected_capture = nullptr) {
     // Qwen3-Next gated attention.
     //
     // The wq projection is 2× wider than a standard attention head
@@ -1473,7 +1324,7 @@ static ggml_tensor* build_block_moe_attn(ggml_context* gctx,
         ffn_out = build_moe_ffn(gctx, xb, L,
                                 n_expert, n_expert_used,
                                 norm_topk_prob, expert_weights_scale,
-                                selected_capture, crt);
+                                selected_capture);
     } else {
         // Dense SwiGLU FFN (qwen35 non-MoE hybrid).
         ggml_tensor* gate = ggml_mul_mat(gctx, L.ffn_gate, xb);
@@ -1621,26 +1472,32 @@ static ggml_tensor* build_block_gdn(ggml_context* gctx,
     ggml_tensor* beta     = ggml_sigmoid(gctx, beta_raw);
     beta = ggml_reshape_4d(gctx, beta, 1, num_v_heads, n, 1);
 
-    // --- Gated delta-rule recurrence (fused op) -------------------
-    // Uses the ggml_gated_delta_net fused operator for BOTH decode (n==1)
-    // and prefill (n>1). The fused kernel processes tokens sequentially
-    // per head with proper threading. This replaces the old split path
-    // where AR decode used manual graph ops and prefill used a chunked
-    // matmul approach (which crashed in ggml_solve_tri / ggml_set_inplace
-    // on ggml 0.9.11).
+    // --- Gated delta-rule recurrence -----------------------------
+    // Two paths: autoregressive (n==1, decode) and chunked (n>1, prefill).
     //
-    // The fused op was stabilised in ggml 0.11.0 (llama.cpp b8763) and
-    // is now the recommended path for all token counts — matches
-    // llama.cpp's delta-net-base.cpp build_delta_net_fused().
+    // The fused ggml_gated_delta_net kernel processes all tokens
+    // sequentially and is numerically unstable for n > ~35 due to
+    // cumulative floating-point error across the exp(g) state scaling.
+    // llama.cpp avoids this by using a chunked matmul approach
+    // (build_delta_net_chunking in delta-net-base.cpp) for prefill.
+    //
+    // We use ggml_gated_delta_net ONLY for n==1 (single-token decode)
+    // where it is stable and fast. For n>1 we use the chunked path.
 
     const int64_t S_k = head_qk_dim;
     const int64_t S_v = head_v_dim;
-    const int64_t H_k = num_v_heads;  // post-GQA-repeat
+    // After the GQA repeat above, Q and K now have num_v_heads heads
+    // (same as V), so H_k == H_v for all downstream ops.
+    const int64_t H_k = num_v_heads;  // post-repeat
     const int64_t H_v = num_v_heads;
     const int64_t n_seqs = 1;
 
-    // Reshape ssm_state_in to 4D: [S_v * S_v * H_v] → [S_v, S_v, H_v, 1]
+    // Reshape ssm_state_in to 4D for the chunked/AR math.
+    // Flat layout: [S_v * S_v * H_v] → [S_v, S_v, H_v, 1]
     ggml_tensor* s = ggml_reshape_4d(gctx, ssm_state_in, S_v, S_v, H_v, n_seqs);
+
+    ggml_tensor* attn;       // output:  [S_v, H_v, n, 1]
+    ggml_tensor* s_new;      // updated state: [S_v, S_v, H_v, 1]
 
     if (sp_gdn_diag_enabled()) {
         std::fprintf(stderr, "[sp-gdn-diag] build_block_gdn: n=%d S_k=%lld S_v=%lld H_k=%lld H_v=%lld n_seqs=%lld "
@@ -1655,44 +1512,218 @@ static ggml_tensor* build_block_gdn(ggml_context* gctx,
                      (long long)s->ne[0], (long long)s->ne[1], (long long)s->ne[2], (long long)s->ne[3]);
     }
 
-    // Scale Q by 1/sqrt(S_k) — the fused kernel doesn't do this internally.
-    const float scale = 1.0f / sqrtf((float)S_k);
-    ggml_tensor* q_scaled = ggml_scale(gctx, Qc, scale);
+    if (n == 1) {
+        // ----- Autoregressive path (single-token decode) -----
+        // Matches llama.cpp's build_delta_net_autoregressive exactly.
+        const float scale = 1.0f / sqrtf((float)S_k);
+        ggml_tensor* q_ar = ggml_scale(gctx, Qc, scale);
 
-    // Input layout expected by ggml_gated_delta_net:
-    //   q, k:  [S_k, H, n_tokens, n_seqs]  — contiguous rows
-    //   v:     [S_v, H, n_tokens, n_seqs]
-    //   g:     [1,   H, n_tokens, n_seqs]   (scalar per head) or [S_v, H, n, n_seqs] (KDA)
-    //   beta:  [1,   H, n_tokens, n_seqs]
-    //   state: [S_v, S_v, H, n_seqs]
-    // Our tensors are already in this layout after the reshape at lines 1433-1435.
+        q_ar = ggml_permute(gctx, q_ar, 0, 2, 1, 3); // [S_k, 1, H_k, 1]
+        ggml_tensor* k_ar = ggml_permute(gctx, Kc, 0, 2, 1, 3);
+        ggml_tensor* v_ar = ggml_permute(gctx, Vc, 0, 2, 1, 3);
 
-    ggml_tensor* result = ggml_gated_delta_net(gctx, q_scaled, Kc, Vc, g, beta, s);
+        // g: [1, H_v, 1, 1] → [1, 1, H_v, 1]
+        ggml_tensor* g_ar = ggml_reshape_4d(gctx, g, 1, 1, H_v, n_seqs);
+        ggml_tensor* b_ar = ggml_reshape_4d(gctx, beta, 1, 1, H_v, n_seqs);
 
-    // The result tensor is a flat concatenation:
-    //   [0 .. S_v*H*n_tokens*n_seqs)          = attention output
-    //   [S_v*H*n_tokens*n_seqs .. end)         = new state
-    // Extract output: [S_v, H_v, n_tokens, n_seqs]
-    ggml_tensor* attn = ggml_view_4d(gctx, result,
-            S_v, H_v, (int64_t)n, n_seqs,
-            ggml_row_size(result->type, S_v),
-            ggml_row_size(result->type, S_v * H_v),
-            ggml_row_size(result->type, S_v * H_v * n), 0);
+        // s = s * exp(g)
+        g_ar = ggml_exp(gctx, g_ar);
+        s = ggml_mul(gctx, s, g_ar);
 
-    // Extract new state: [S_v, S_v, H_v, n_seqs]
-    ggml_tensor* s_new = ggml_view_4d(gctx, result,
-            S_v, S_v, H_v, n_seqs,
-            ggml_row_size(result->type, S_v),
-            ggml_row_size(result->type, S_v * S_v),
-            ggml_row_size(result->type, S_v * S_v * H_v),
-            ggml_row_size(result->type, S_v * H_v * n * n_seqs));
+        // sk = sum_rows(s * k)  → [1, S_v, H_v, 1]
+        ggml_tensor* sk = ggml_mul(gctx, s, k_ar);
+        sk = ggml_sum_rows(gctx, sk);
+
+        // d = (v - sk^T) * beta  → [S_v, 1, H_v, 1]
+        ggml_tensor* d = ggml_sub(gctx, v_ar, ggml_transpose(gctx, sk));
+        d = ggml_mul(gctx, d, b_ar);
+
+        // s = s + k * d^T
+        ggml_tensor* d_t = ggml_transpose(gctx, d);
+        ggml_tensor* k_rep = ggml_repeat(gctx, k_ar, s);
+        ggml_tensor* kd = ggml_mul(gctx, k_rep, d_t);
+        s = ggml_add(gctx, s, kd);
+
+        // o = sum_rows(s * q)
+        ggml_tensor* s_q = ggml_mul(gctx, s, q_ar);
+        ggml_tensor* o   = ggml_sum_rows(gctx, s_q);
+        attn = ggml_permute(gctx, o, 2, 0, 1, 3);  // [S_v, H_v, 1, 1]
+
+        s_new = s;
+    } else {
+        // ----- Chunked path (prefill, n > 1) -----
+        // Ported from llama.cpp delta-net-base.cpp build_delta_net_chunking.
+        // Processes tokens in chunks of 64, using matrix ops for numerical
+        // stability instead of the sequential scan.
+        const float scale = 1.0f / sqrtf((float)S_k);
+        ggml_tensor* q_ch = ggml_scale(gctx, Qc, scale);
+
+        q_ch = ggml_permute(gctx, q_ch, 0, 2, 1, 3); // [S_k, n, H_k, 1]
+        ggml_tensor* k_ch = ggml_permute(gctx, Kc, 0, 2, 1, 3);
+        ggml_tensor* v_ch = ggml_permute(gctx, Vc, 0, 2, 1, 3);
+        ggml_tensor* g_ch = ggml_permute(gctx, g, 0, 2, 1, 3);    // [1, n, H_v, 1]
+        ggml_tensor* b_ch = ggml_permute(gctx, beta, 0, 2, 1, 3); // [1, n, H_v, 1]
+
+        const int CS = 64;
+        const int pad = (CS - n % CS) % CS;
+        const int n_chunks = (n + pad) / CS;
+
+        q_ch = ggml_pad(gctx, q_ch, 0, pad, 0, 0);
+        k_ch = ggml_pad(gctx, k_ch, 0, pad, 0, 0);
+        v_ch = ggml_pad(gctx, v_ch, 0, pad, 0, 0);
+        g_ch = ggml_pad(gctx, g_ch, 0, pad, 0, 0);
+        b_ch = ggml_pad(gctx, b_ch, 0, pad, 0, 0);
+
+        ggml_tensor* v_b  = ggml_mul(gctx, v_ch, b_ch);
+        ggml_tensor* k_b  = ggml_mul(gctx, k_ch, b_ch);
+
+        q_ch = ggml_reshape_4d(gctx, q_ch, S_k, CS, n_chunks, H_k * n_seqs);
+        k_ch = ggml_reshape_4d(gctx, k_ch, S_k, CS, n_chunks, H_k * n_seqs);
+        k_b  = ggml_reshape_4d(gctx, k_b,  S_k, CS, n_chunks, H_v * n_seqs);
+        v_ch = ggml_reshape_4d(gctx, v_ch, S_v, CS, n_chunks, H_v * n_seqs);
+        v_b  = ggml_reshape_4d(gctx, v_b,  S_v, CS, n_chunks, H_v * n_seqs);
+
+        g_ch = ggml_reshape_4d(gctx, g_ch, g_ch->ne[0], CS, n_chunks, H_v * n_seqs);
+        b_ch = ggml_reshape_4d(gctx, b_ch, 1,            CS, n_chunks, H_v * n_seqs);
+
+        // Cumulative sum of g along time axis (within each chunk).
+        // g_ch is [1, CS, n_chunks, H_v*n_seqs]; transpose to put CS
+        // on dim0 for ggml_cumsum, then cumsum → [CS, 1, n_chunks, H_v*n_seqs].
+        ggml_tensor* g_cs = ggml_cumsum(gctx, ggml_cont(gctx, ggml_transpose(gctx, g_ch)));
+
+        // Non-KDA path (scalar g per head): g_cs is [CS, 1, n_chunks, H_v*n_seqs]
+        ggml_tensor* g_cs_i = g_cs;
+        ggml_tensor* g_cs_j = ggml_reshape_4d(gctx, g_cs, 1, CS, n_chunks, H_v * n_seqs);
+        g_cs_j = ggml_repeat_4d(gctx, g_cs_j, CS, CS, n_chunks, H_v * n_seqs);
+
+        // decay_mask = exp(tri_lower_diag(g_cs_j - g_cs_i))
+        ggml_tensor* decay_mask = ggml_sub(gctx, g_cs_j, g_cs_i);
+        decay_mask = ggml_tri(gctx, decay_mask, GGML_TRI_TYPE_LOWER_DIAG);
+        decay_mask = ggml_exp(gctx, decay_mask);
+
+        // kb = k^T @ k_b * decay_mask  [CS, CS, n_chunks, H_k*n_seqs]
+        ggml_tensor* kb = ggml_mul_mat(gctx, k_ch, k_b);
+        kb = ggml_mul(gctx, kb, decay_mask);
+
+        // kq = k^T @ q * decay_mask  [CS, CS, n_chunks, H_k*n_seqs]
+        ggml_tensor* kq = ggml_mul_mat(gctx, k_ch, q_ch);
+        kq = ggml_mul(gctx, kq, decay_mask);
+
+        kq = ggml_tri(gctx, kq, GGML_TRI_TYPE_LOWER_DIAG);
+
+        // Solve the linear system for numerically stable recurrence.
+        // attn = tri_lower(kb)
+        ggml_tensor* attn_ch = ggml_tri(gctx, kb, GGML_TRI_TYPE_LOWER);
+
+        // identity matrix from first chunk row
+        ggml_tensor* identity = ggml_view_1d(gctx, attn_ch, CS, 0);
+        identity = ggml_fill(gctx, identity, 1.0f);
+        identity = ggml_diag(gctx, identity);
+
+        ggml_tensor* lhs = ggml_add(gctx, attn_ch, identity);
+
+        attn_ch = ggml_neg(gctx, attn_ch);
+
+        ggml_tensor* lin_solve = ggml_solve_tri(gctx, lhs, attn_ch, true, true, false);
+        attn_ch = ggml_add(gctx, lin_solve, identity);
+
+        // v = v_b^T @ attn_ch  [S_v, CS, n_chunks, H_v*n_seqs]
+        v_ch = ggml_mul_mat(gctx, ggml_cont(gctx, ggml_transpose(gctx, v_b)), attn_ch);
+
+        // g_exp for inter-chunk state propagation
+        ggml_tensor* g_exp = ggml_exp(gctx, g_cs);
+
+        k_b = ggml_cont(gctx, ggml_transpose(gctx, k_b));
+
+        // kbg = k_b * g_exp  [CS, S_k, n_chunks, H_k*n_seqs]
+        ggml_tensor* kbg = ggml_mul(gctx, k_b, g_exp);
+
+        // k_cd = kbg^T @ attn_ch  [S_k, CS, n_chunks, H_k*n_seqs]
+        ggml_tensor* k_cd = ggml_mul_mat(gctx, kbg, attn_ch);
+
+        // q * exp(g)^T for inter-chunk query
+        ggml_tensor* g_exp_t = ggml_cont(gctx, ggml_transpose(gctx, g_exp));
+        ggml_tensor* q_g_exp = ggml_mul(gctx, q_ch, g_exp_t);
+
+        // g_last: last element in g_cumsum along CS dimension
+        ggml_tensor* g_last = ggml_view_4d(gctx, g_cs, 1, g_cs->ne[1], g_cs->ne[2], g_cs->ne[3],
+                g_cs->nb[1], g_cs->nb[2], g_cs->nb[3],
+                ggml_row_size(g_cs->type, g_cs->ne[0] - 1));
+        g_last = ggml_cont(gctx, g_last);
+
+        ggml_tensor* g_last_exp_t = ggml_transpose(gctx, ggml_exp(gctx, g_last));
+
+        // g_diff = -(g_cs - g_last) for key decay within chunk
+        ggml_tensor* g_diff = ggml_neg(gctx, ggml_sub(gctx, g_cs, g_last));
+        ggml_tensor* g_diff_exp_t = ggml_cont(gctx, ggml_transpose(gctx, ggml_exp(gctx, g_diff)));
+
+        // kg = k * exp(g_diff)^T  [S_k, CS, n_chunks, H_v*n_seqs]
+        ggml_tensor* kg = ggml_mul(gctx, k_ch, g_diff_exp_t);
+        ggml_tensor* kg_t = ggml_cont(gctx, ggml_transpose(gctx, kg));
+
+        s = ggml_reshape_4d(gctx, s, S_v, S_v, 1, H_v * n_seqs);
+
+        // v_t for chunk loop [CS, S_v, n_chunks, H_v*n_seqs]
+        ggml_tensor* v_t = ggml_cont(gctx, ggml_transpose(gctx, v_ch));
+
+        // --- Per-chunk loop: inter-chunk state propagation ---
+        for (int chunk = 0; chunk < n_chunks; chunk++) {
+            // get_slice_2d: view into 3rd dimension at index `chunk`
+            auto slice = [&](ggml_tensor* t, int c) -> ggml_tensor* {
+                return ggml_view_4d(gctx, t, t->ne[0], t->ne[1], 1, t->ne[3],
+                    t->nb[1], t->nb[2], t->nb[3], t->nb[2] * c);
+            };
+
+            ggml_tensor* ch_k_cd    = slice(k_cd,    chunk);
+            ggml_tensor* ch_v_t     = slice(v_t,     chunk);
+            ggml_tensor* ch_kq      = slice(kq,      chunk);
+            ggml_tensor* ch_q_g_exp = slice(q_g_exp, chunk);
+            ggml_tensor* ch_kg_t    = slice(kg_t,    chunk);
+
+            // v_prime = k_cd^T @ s
+            ggml_tensor* v_t_p = ggml_mul_mat(gctx, ch_k_cd, s);
+
+            // v_new = v_chunk - v_prime
+            ggml_tensor* v_t_new = ggml_sub(gctx, ch_v_t, v_t_p);
+
+            // v_attn = v_new^T @ kq_chunk (intra-chunk)
+            ggml_tensor* v_attn = ggml_mul_mat(gctx, v_t_new, ch_kq);
+
+            // attn_inter = s^T @ q_g_exp_chunk (inter-chunk)
+            ggml_tensor* attn_inter = ggml_mul_mat(gctx, s, ch_q_g_exp);
+
+            // output for this chunk
+            ggml_tensor* o_ch = ggml_add(gctx, attn_inter, v_attn);
+
+            // Write chunk output back into v_ch
+            v_ch = ggml_set_inplace(gctx, v_ch, o_ch, v_ch->nb[1], v_ch->nb[2], v_ch->nb[3],
+                                    chunk * v_ch->nb[2]);
+
+            // Update state: s = s * exp(g_last) + kg^T @ v_new
+            ggml_tensor* kgv = ggml_mul_mat(gctx, ch_kg_t, v_t_new);
+
+            ggml_tensor* ch_g_last_exp_t = slice(g_last_exp_t, chunk);
+            s = ggml_mul(gctx, s, ch_g_last_exp_t);
+            s = ggml_add(gctx, s, kgv);
+        }
+
+        // Truncate padded tokens and permute to output layout
+        ggml_tensor* o = ggml_view_4d(gctx, v_ch,
+                S_v, n, H_v, n_seqs,
+                ggml_row_size(v_ch->type, S_v),
+                ggml_row_size(v_ch->type, S_v * CS * n_chunks),
+                ggml_row_size(v_ch->type, S_v * CS * n_chunks * H_v), 0);
+        attn = ggml_permute(gctx, o, 0, 2, 1, 3);  // [S_v, H_v, n, 1]
+
+        s_new = ggml_reshape_4d(gctx, s, S_v, S_v, H_v, n_seqs);
+    }
 
     attn = ggml_cont(gctx, attn);
     attn = ggml_reshape_3d(gctx, attn, S_v, H_v, n);  // match downstream [head_v_dim, num_v_heads, n]
 
     if (sp_gdn_diag_enabled()) {
         std::fprintf(stderr, "[sp-gdn-diag] build_block_gdn: path=%s attn=[%lld,%lld,%lld] s_new=[%lld,%lld,%lld,%lld]\n",
-                     "fused",
+                     (n == 1) ? "AR" : "chunked",
                      (long long)attn->ne[0], (long long)attn->ne[1], (long long)attn->ne[2],
                      (long long)s_new->ne[0], (long long)s_new->ne[1], (long long)s_new->ne[2], (long long)s_new->ne[3]);
     }
@@ -2004,11 +2035,8 @@ bool ForwardContext::forward_full(const std::vector<int32_t>& token_ids,
         // MOE_* variants are qwen35moe-specific.
         switch (L.kind) {
         case LlamaLayerKind::STANDARD: {
-            // Per-layer SWA dispatch: local gemma3/4 layers swap mask + rope base.
-            // Gemma3: hardcoded 5-local : 1-global pattern (every 6th is global).
-            // Gemma4: local ⟺ V-shared layers (wv backfilled from global neighbor).
-            const bool local = sp_is_gemma3_swa_layer(i, impl_->swa_window)
-                               || (impl_->swa_window > 0 && L.gemma4_v_shared);
+            // Per-layer SWA dispatch: local gemma3 layers swap mask + rope base.
+            const bool local = sp_is_gemma3_swa_layer(i, impl_->swa_window);
             ggml_tensor* layer_mask = local ? kq_mask_swa : kq_mask;
             const float layer_freq_base = local ? impl_->swa_rope_freq_base
                                                  : impl_->rope_freq_base;
@@ -2035,8 +2063,7 @@ bool ForwardContext::forward_full(const std::vector<int32_t>& token_ids,
                                       impl_->is_moe,
                                       capture ? &k_cap : nullptr,
                                       capture ? &v_cap : nullptr,
-                                      curriculum_active ? &sel_cap : nullptr,
-                                      impl_->crt_dispatch);
+                                      curriculum_active ? &sel_cap : nullptr);
             break;
         }
         case LlamaLayerKind::MOE_GDN: {
@@ -2045,7 +2072,6 @@ bool ForwardContext::forward_full(const std::vector<int32_t>& token_ids,
             // GdnStateCache; build_block_gdn writes the new state views
             // into our two out-vectors so forward_full can mark them as
             // graph outputs and persist them back to the cache.
-            //
             ggml_tensor* conv_out = nullptr;
             ggml_tensor* ssm_out  = nullptr;
             x = build_block_gdn(gctx, x,
@@ -2266,24 +2292,21 @@ bool ForwardContext::forward_full(const std::vector<int32_t>& token_ids,
     // null from the dispatch loop) — leave the corresponding per_layer
     // slots empty so the caller can skip them cleanly.
     if (capture) {
+        const size_t kv_elems = (size_t)n * impl_->n_head_kv * impl_->head_dim;
         for (int i = 0; i < impl_->n_layer; ++i) {
             if (!cap_K[(size_t)i] || !cap_V[(size_t)i]) {
                 (*per_layer_K)[(size_t)i].clear();
                 (*per_layer_V)[(size_t)i].clear();
                 continue;
             }
-            // Per-layer readback: use actual tensor size (which reflects
-            // per-layer head_dim for gemma4 local vs global layers).
-            const size_t k_bytes = ggml_nbytes(cap_K[(size_t)i]);
-            const size_t v_bytes = ggml_nbytes(cap_V[(size_t)i]);
-            (*per_layer_K)[(size_t)i].resize(k_bytes / sizeof(float));
-            (*per_layer_V)[(size_t)i].resize(v_bytes / sizeof(float));
+            (*per_layer_K)[(size_t)i].resize(kv_elems);
+            (*per_layer_V)[(size_t)i].resize(kv_elems);
             ggml_backend_tensor_get(cap_K[(size_t)i],
                                     (*per_layer_K)[(size_t)i].data(),
-                                    0, k_bytes);
+                                    0, kv_elems * sizeof(float));
             ggml_backend_tensor_get(cap_V[(size_t)i],
                                     (*per_layer_V)[(size_t)i].data(),
-                                    0, v_bytes);
+                                    0, kv_elems * sizeof(float));
         }
     }
 
@@ -2414,7 +2437,6 @@ static ggml_tensor* build_block_decode(ggml_context* gctx,
                                         float freq_scale,
                                         float rms_eps,
                                         int   rope_mode,
-                                        bool  ffn_gelu,
                                         float attn_logit_softcap,
                                         ggml_tensor** k_capture,
                                         ggml_tensor** v_capture,
@@ -2450,22 +2472,9 @@ static ggml_tensor* build_block_decode(ggml_context* gctx,
         if (L.bv) V = ggml_add(gctx, V, L.bv);
     }
 
-    // Reshape Q/K/V — same per-layer head_dim logic as build_block.
-    // Gemma4 local vs global layers may have different Q/K/V projection sizes.
-    const int hd_dec = (n_head > 0) ? (int)(ggml_nelements(Q) / (n * n_head)) : head_dim;
-    const int akv_dec = (n_head_kv > 0) ? (int)(ggml_nelements(K) / (n * n_head_kv)) : hd_dec;
-
-    const int base_kv_heads_dec = (n_rot > 0 && hd_dec > 0) ? (n_head_kv * hd_dec) / n_rot : 0;
-    const bool kv_fold = (n_rot > hd_dec && hd_dec > 0 && base_kv_heads_dec > 0);
-    if (kv_fold) {
-        Q = ggml_reshape_3d(gctx, Q, hd_dec, n_head,            n);
-        K = ggml_reshape_3d(gctx, K, n_rot,  base_kv_heads_dec, n);
-        V = ggml_reshape_3d(gctx, V, hd_dec, n_head_kv,         n);
-    } else {
-        Q = ggml_reshape_3d(gctx, Q, hd_dec,   n_head,    n);
-        K = ggml_reshape_3d(gctx, K, akv_dec,  n_head_kv, n);
-        V = ggml_reshape_3d(gctx, V, akv_dec,  n_head_kv, n);
-    }
+    Q = ggml_reshape_3d(gctx, Q, head_dim, n_head,    n);
+    K = ggml_reshape_3d(gctx, K, head_dim, n_head_kv, n);
+    V = ggml_reshape_3d(gctx, V, head_dim, n_head_kv, n);
 
     if (L.attn_q_norm) {
         Q = ggml_rms_norm(gctx, Q, rms_eps);
@@ -2476,16 +2485,10 @@ static ggml_tensor* build_block_decode(ggml_context* gctx,
         K = ggml_mul(gctx, K, L.attn_k_norm);
     }
 
-    const int layer_n_rot_dec = (n_rot > hd_dec) ? hd_dec : n_rot;
-    const int q_n_rot = kv_fold ? hd_dec : layer_n_rot_dec;
     Q = ggml_rope_ext(gctx, Q, pos, freq_factors,
-                      q_n_rot, rope_mode, 0, freq_base, freq_scale, 0, 1, 32, 1);
+                      n_rot, rope_mode, 0, freq_base, freq_scale, 0, 1, 32, 1);
     K = ggml_rope_ext(gctx, K, pos, freq_factors,
-                      kv_fold ? n_rot : layer_n_rot_dec, rope_mode, 0, freq_base, freq_scale, 0, 1, 32, 1);
-
-    if (kv_fold) {
-        K = ggml_reshape_3d(gctx, K, hd_dec, n_head_kv, n);
-    }
+                      n_rot, rope_mode, 0, freq_base, freq_scale, 0, 1, 32, 1);
 
     // V at this point is a ggml_reshape_3d view over the projection
     // output. Materialise it once via ggml_cont and reuse for both the
@@ -2510,20 +2513,20 @@ static ggml_tensor* build_block_decode(ggml_context* gctx,
 
     if (n_head != n_head_kv) {
         const int n_rep = n_head / n_head_kv;
-        ggml_tensor* Kx = ggml_reshape_4d(gctx, K_full, hd_dec, 1, n_head_kv, kv_total);
-        ggml_tensor* Kt = ggml_new_tensor_4d(gctx, K_full->type, hd_dec, n_rep, n_head_kv, kv_total);
+        ggml_tensor* Kx = ggml_reshape_4d(gctx, K_full, head_dim, 1, n_head_kv, kv_total);
+        ggml_tensor* Kt = ggml_new_tensor_4d(gctx, K_full->type, head_dim, n_rep, n_head_kv, kv_total);
         Kx = ggml_repeat(gctx, Kx, Kt);
-        K_full = ggml_reshape_3d(gctx, Kx, hd_dec, n_head, kv_total);
-        ggml_tensor* Vx = ggml_reshape_4d(gctx, V_full, hd_dec, 1, n_head_kv, kv_total);
-        ggml_tensor* Vt = ggml_new_tensor_4d(gctx, V_full->type, hd_dec, n_rep, n_head_kv, kv_total);
+        K_full = ggml_reshape_3d(gctx, Kx, head_dim, n_head, kv_total);
+        ggml_tensor* Vx = ggml_reshape_4d(gctx, V_full, head_dim, 1, n_head_kv, kv_total);
+        ggml_tensor* Vt = ggml_new_tensor_4d(gctx, V_full->type, head_dim, n_rep, n_head_kv, kv_total);
         Vx = ggml_repeat(gctx, Vx, Vt);
-        V_full = ggml_reshape_3d(gctx, Vx, hd_dec, n_head, kv_total);
+        V_full = ggml_reshape_3d(gctx, Vx, head_dim, n_head, kv_total);
     }
 
     ggml_tensor* Qp = ggml_cont(gctx, ggml_permute(gctx, Q,      0, 2, 1, 3));
     ggml_tensor* Kp = ggml_cont(gctx, ggml_permute(gctx, K_full, 0, 2, 1, 3));
     ggml_tensor* KQ = ggml_mul_mat(gctx, Kp, Qp);
-    KQ = ggml_scale(gctx, KQ, 1.0f / sqrtf((float)hd_dec));
+    KQ = ggml_scale(gctx, KQ, 1.0f / sqrtf((float)head_dim));
     if (attn_logit_softcap > 0.0f) {
         KQ = ggml_scale(gctx, KQ, 1.0f / attn_logit_softcap);
         KQ = ggml_tanh(gctx, KQ);
@@ -2534,8 +2537,7 @@ static ggml_tensor* build_block_decode(ggml_context* gctx,
     ggml_tensor* Vp = ggml_cont(gctx, ggml_permute(gctx, V_full, 1, 2, 0, 3));
     ggml_tensor* attn = ggml_mul_mat(gctx, Vp, KQ);
     attn = ggml_cont(gctx, ggml_permute(gctx, attn, 0, 2, 1, 3));
-    const int layer_n_embd_q_dec = n_head * hd_dec;
-    attn = ggml_reshape_2d(gctx, attn, layer_n_embd_q_dec, n);
+    attn = ggml_reshape_2d(gctx, attn, n_embd_q, n);
 
     ggml_tensor* y1 = sp_crt_mul_mat(gctx, L.wo, attn, crt);
     if (L.bo) y1 = ggml_add(gctx, y1, L.bo);
@@ -2546,9 +2548,6 @@ static ggml_tensor* build_block_decode(ggml_context* gctx,
     }
 
     x = ggml_add(gctx, x, y1);
-
-    // FFN skip guard for gemma4 layers without FFN tensors.
-    if (!L.ffn_norm || !L.ffn_down) return x;
 
     ggml_tensor* xb = ggml_rms_norm(gctx, x, rms_eps);
     xb = ggml_mul(gctx, xb, L.ffn_norm);
@@ -2570,7 +2569,7 @@ static ggml_tensor* build_block_decode(ggml_context* gctx,
         gate = ggml_cont(gctx, ggml_view_2d(gctx, gu, n_ff, n_tok, row_stride, 0));
         up   = ggml_cont(gctx, ggml_view_2d(gctx, gu, n_ff, n_tok, row_stride, gate_bytes));
     }
-    gate = ffn_gelu ? ggml_gelu(gctx, gate) : ggml_silu(gctx, gate);
+    gate = ggml_silu(gctx, gate);
     ggml_tensor* ffn  = ggml_mul(gctx, gate, up);
     ffn  = sp_crt_mul_mat(gctx, L.ffn_down, ffn, crt);
 
@@ -2621,20 +2620,16 @@ bool ForwardContext::prefill(const std::vector<int32_t>& token_ids,
         }
         if (impl_->cache->calibrate_begin()) {
             const int H  = impl_->n_head_kv;
+            const int hd = impl_->head_dim;
             for (int L = 0; L < impl_->n_layer; ++L) {
                 // Skip layers with no K (qwen35moe GDN layers) — they
                 // don't contribute to the attention KV cache.
                 if (Ks[(size_t)L].empty()) continue;
-                // Per-layer head_dim: gemma4 local layers have 256,
-                // global layers have 512. Derive from actual K data size.
-                const int lhd = (!impl_->per_layer_hd.empty())
-                              ? impl_->per_layer_hd[(size_t)L]
-                              : impl_->head_dim;
                 const float* K_data = Ks[(size_t)L].data();
-                // Layout: K_data[(q * H + h) * lhd + d]
+                // Layout: K_data[(q * H + h) * hd + d]
                 for (int q = 0; q < n; ++q) {
                     for (int h = 0; h < H; ++h) {
-                        const float* vec = K_data + (size_t)(q * H + h) * lhd;
+                        const float* vec = K_data + (size_t)(q * H + h) * hd;
                         if (hier) {
                             impl_->cache->calibrate_feed(L * H + h, vec);
                         } else {
@@ -2650,32 +2645,8 @@ bool ForwardContext::prefill(const std::vector<int32_t>& token_ids,
     // Push every layer to the bound cache at offset = current kv_pos.
     // GDN layers leave Ks[L]/Vs[L] empty — those are fed through the
     // separate GdnStateCache bound alongside. Skip them here.
-    //
-    // Gemma4 varying head_dim: the cache is allocated at max_head_dim
-    // (e.g. 512 for E2B). Local layers produce 256-dim K/V per head.
-    // Pad to cache_head_dim before writing.
-    const int cache_hd = impl_->cache ? impl_->cache->head_dim() : impl_->head_dim;
     for (int L = 0; L < impl_->n_layer; ++L) {
         if (Ks[(size_t)L].empty() || Vs[(size_t)L].empty()) continue;
-        const int lhd = (!impl_->per_layer_hd.empty())
-                       ? impl_->per_layer_hd[(size_t)L] : impl_->head_dim;
-        if (lhd < cache_hd) {
-            // Pad: interleave zeros so per-head dim goes from lhd → cache_hd.
-            const int n_kv_local = impl_->n_head_kv;
-            auto pad = [&](std::vector<float>& data) {
-                const size_t old_stride = (size_t)lhd;
-                const size_t new_stride = (size_t)cache_hd;
-                const size_t n_vecs = (size_t)n * n_kv_local;
-                std::vector<float> padded(n_vecs * new_stride, 0.0f);
-                for (size_t v = 0; v < n_vecs; ++v)
-                    std::memcpy(padded.data() + v * new_stride,
-                                data.data() + v * old_stride,
-                                old_stride * sizeof(float));
-                data = std::move(padded);
-            };
-            pad(Ks[(size_t)L]);
-            pad(Vs[(size_t)L]);
-        }
         if (!impl_->cache->write(L, impl_->kv_pos, n,
                                  Ks[(size_t)L].data(), Vs[(size_t)L].data())) {
             std::fprintf(stderr, "[sp-engine] prefill: cache write layer %d failed\n", L);
@@ -2732,26 +2703,6 @@ bool ForwardContext::decode(int32_t token_id,
                 return false;
             }
         }
-        // Gemma4 varying head_dim: cache stores at max_head_dim. Trim
-        // local layers' data from cache_hd → per-layer lhd.
-        if (!impl_->per_layer_hd.empty()) {
-            const int chd = impl_->cache->head_dim();
-            for (int L = 0; L < impl_->n_layer; ++L) {
-                const int lhd = impl_->per_layer_hd[(size_t)L];
-                if (lhd >= chd) continue;  // global layer, no trim
-                auto trim = [&](std::vector<float>& d) {
-                    const size_t n_vecs = (size_t)past_n * n_kv;
-                    std::vector<float> trimmed(n_vecs * (size_t)lhd);
-                    for (size_t v = 0; v < n_vecs; ++v)
-                        std::memcpy(trimmed.data() + v * (size_t)lhd,
-                                    d.data() + v * (size_t)chd,
-                                    (size_t)lhd * sizeof(float));
-                    d = std::move(trimmed);
-                };
-                trim(past_K_all[(size_t)L]);
-                trim(past_V_all[(size_t)L]);
-            }
-        }
     }
 
     ggml_init_params gip = {};
@@ -2777,61 +2728,39 @@ bool ForwardContext::decode(int32_t token_id,
 
     // Per-layer past K/V inputs (only when past_n > 0).
     //
-    // Two paths:
-    //  (a) Uniform head_dim (all models except gemma4 with local/global):
-    //      allocate ONE contiguous [hd, n_kv, past_n, n_layer] tensor and
-    //      expose per-layer views. Upload is 2 cudaMemcpy calls total.
-    //  (b) Varying head_dim (gemma4): allocate per-layer individual
-    //      tensors since dimensions differ between local (256) and global
-    //      (512) layers.
-    const bool varying_hd = !impl_->per_layer_hd.empty();
+    // Step-2 batching: allocate ONE contiguous [hd, n_kv, past_n, n_layer]
+    // tensor for all layers' past K (same for V), expose per-layer
+    // [hd, n_kv, past_n] views into it. The upload then uses 2
+    // ggml_backend_tensor_set calls per decode step instead of
+    // 2 * n_layer. On Qwen3-8B (32 layers) that's 64 -> 2 cudaMemcpys.
     ggml_tensor* past_K_big = nullptr;
     ggml_tensor* past_V_big = nullptr;
     std::vector<ggml_tensor*> past_K_tens(impl_->n_layer, nullptr);
     std::vector<ggml_tensor*> past_V_tens(impl_->n_layer, nullptr);
     if (past_n > 0) {
-        if (!varying_hd) {
-            past_K_big = ggml_new_tensor_4d(gctx, GGML_TYPE_F32, hd, n_kv, past_n, impl_->n_layer);
-            past_V_big = ggml_new_tensor_4d(gctx, GGML_TYPE_F32, hd, n_kv, past_n, impl_->n_layer);
-            ggml_set_input(past_K_big);
-            ggml_set_input(past_V_big);
-            const size_t layer_stride = (size_t)hd * n_kv * past_n * sizeof(float);
-            for (int L = 0; L < impl_->n_layer; ++L) {
-                past_K_tens[(size_t)L] = ggml_view_3d(gctx, past_K_big, hd, n_kv, past_n,
-                                                       past_K_big->nb[1], past_K_big->nb[2],
-                                                       (size_t)L * layer_stride);
-                past_V_tens[(size_t)L] = ggml_view_3d(gctx, past_V_big, hd, n_kv, past_n,
-                                                       past_V_big->nb[1], past_V_big->nb[2],
-                                                       (size_t)L * layer_stride);
-            }
-        } else {
-            for (int L = 0; L < impl_->n_layer; ++L) {
-                const int lhd = impl_->per_layer_hd[(size_t)L];
-                past_K_tens[(size_t)L] = ggml_new_tensor_3d(gctx, GGML_TYPE_F32, lhd, n_kv, past_n);
-                past_V_tens[(size_t)L] = ggml_new_tensor_3d(gctx, GGML_TYPE_F32, lhd, n_kv, past_n);
-                ggml_set_input(past_K_tens[(size_t)L]);
-                ggml_set_input(past_V_tens[(size_t)L]);
-            }
+        past_K_big = ggml_new_tensor_4d(gctx, GGML_TYPE_F32, hd, n_kv, past_n, impl_->n_layer);
+        past_V_big = ggml_new_tensor_4d(gctx, GGML_TYPE_F32, hd, n_kv, past_n, impl_->n_layer);
+        ggml_set_input(past_K_big);
+        ggml_set_input(past_V_big);
+        const size_t layer_stride = (size_t)hd * n_kv * past_n * sizeof(float);
+        for (int L = 0; L < impl_->n_layer; ++L) {
+            past_K_tens[(size_t)L] = ggml_view_3d(gctx, past_K_big, hd, n_kv, past_n,
+                                                   past_K_big->nb[1], past_K_big->nb[2],
+                                                   (size_t)L * layer_stride);
+            past_V_tens[(size_t)L] = ggml_view_3d(gctx, past_V_big, hd, n_kv, past_n,
+                                                   past_V_big->nb[1], past_V_big->nb[2],
+                                                   (size_t)L * layer_stride);
         }
     }
 
-    // Output side: collect new K/V captures. Same uniform/varying split.
-    ggml_tensor* new_K_big = nullptr;
-    ggml_tensor* new_V_big = nullptr;
-    std::vector<ggml_tensor*> new_K_tens(impl_->n_layer, nullptr);
-    std::vector<ggml_tensor*> new_V_tens(impl_->n_layer, nullptr);
-    size_t new_layer_stride = 0;
-    if (!varying_hd) {
-        new_K_big = ggml_new_tensor_4d(gctx, GGML_TYPE_F32, hd, n_kv, 1, impl_->n_layer);
-        new_V_big = ggml_new_tensor_4d(gctx, GGML_TYPE_F32, hd, n_kv, 1, impl_->n_layer);
-        new_layer_stride = (size_t)hd * n_kv * 1 * sizeof(float);
-    } else {
-        for (int L = 0; L < impl_->n_layer; ++L) {
-            const int lhd = impl_->per_layer_hd[(size_t)L];
-            new_K_tens[(size_t)L] = ggml_new_tensor_3d(gctx, GGML_TYPE_F32, lhd, n_kv, 1);
-            new_V_tens[(size_t)L] = ggml_new_tensor_3d(gctx, GGML_TYPE_F32, lhd, n_kv, 1);
-        }
-    }
+    // Step-2 batching (output side): allocate ONE contiguous
+    // [hd, n_kv, 1, n_layer] tensor for all layers' new K (same for V),
+    // ggml_cpy each layer's k_cap/v_cap into its slice, mark only the
+    // big tensors as outputs. Download is then 2 ggml_backend_tensor_get
+    // calls instead of 2 * n_layer.
+    ggml_tensor* new_K_big = ggml_new_tensor_4d(gctx, GGML_TYPE_F32, hd, n_kv, 1, impl_->n_layer);
+    ggml_tensor* new_V_big = ggml_new_tensor_4d(gctx, GGML_TYPE_F32, hd, n_kv, 1, impl_->n_layer);
+    const size_t new_layer_stride = (size_t)hd * n_kv * 1 * sizeof(float);
 
     // Causal mask: 1 query × kv_total keys. Always present so the
     // graph topology is identical between Standard and ALiBi PE
@@ -2861,54 +2790,39 @@ bool ForwardContext::decode(int32_t token_id,
     for (int L = 0; L < impl_->n_layer; ++L) {
         ggml_tensor* k_cap = nullptr;
         ggml_tensor* v_cap = nullptr;
-        // Per-layer SWA dispatch: local gemma3/4 layers swap mask + rope base.
-        const auto& layer = W->layers()[(size_t)L];
-        const bool local = sp_is_gemma3_swa_layer(L, impl_->swa_window)
-                           || (impl_->swa_window > 0 && layer.gemma4_v_shared);
+        // Per-layer SWA dispatch: local gemma3 layers swap mask + rope base.
+        const bool local = sp_is_gemma3_swa_layer(L, impl_->swa_window);
         ggml_tensor* layer_mask = local ? mask_swa : mask;
         const float layer_freq_base = local ? impl_->swa_rope_freq_base
                                              : impl_->rope_freq_base;
-        const int lhd = varying_hd ? impl_->per_layer_hd[(size_t)L] : hd;
         x = build_block_decode(gctx, x, pos,
                                past_n > 0 ? past_K_tens[(size_t)L] : nullptr,
                                past_n > 0 ? past_V_tens[(size_t)L] : nullptr,
                                layer_mask, freq_factors, impl_->alibi_max_bias,
                                W->layers()[(size_t)L],
-                               past_n, lhd, impl_->n_head, n_kv,
+                               past_n, hd, impl_->n_head, n_kv,
                                impl_->n_rot,
                                layer_freq_base, impl_->rope_freq_scale,
-                               impl_->rms_norm_eps, impl_->rope_mode,
-                               impl_->ffn_gelu, impl_->attn_logit_softcapping,
+                               impl_->rms_norm_eps, impl_->rope_mode, impl_->attn_logit_softcapping,
                                &k_cap, &v_cap,
                                impl_->crt_dispatch);
-        // Copy this layer's capture into its output destination.
-        if (!varying_hd) {
-            ggml_tensor* dst_k = ggml_view_3d(gctx, new_K_big, hd, n_kv, 1,
-                                               new_K_big->nb[1], new_K_big->nb[2],
-                                               (size_t)L * new_layer_stride);
-            ggml_tensor* dst_v = ggml_view_3d(gctx, new_V_big, hd, n_kv, 1,
-                                               new_V_big->nb[1], new_V_big->nb[2],
-                                               (size_t)L * new_layer_stride);
-            cpy_K[(size_t)L] = ggml_cpy(gctx, k_cap, dst_k);
-            cpy_V[(size_t)L] = ggml_cpy(gctx, v_cap, dst_v);
-        } else {
-            cpy_K[(size_t)L] = ggml_cpy(gctx, k_cap, new_K_tens[(size_t)L]);
-            cpy_V[(size_t)L] = ggml_cpy(gctx, v_cap, new_V_tens[(size_t)L]);
-        }
+        // Copy this layer's capture into its slice of the batched
+        // output tensors. ggml_cpy returns the destination view.
+        ggml_tensor* dst_k = ggml_view_3d(gctx, new_K_big, hd, n_kv, 1,
+                                           new_K_big->nb[1], new_K_big->nb[2],
+                                           (size_t)L * new_layer_stride);
+        ggml_tensor* dst_v = ggml_view_3d(gctx, new_V_big, hd, n_kv, 1,
+                                           new_V_big->nb[1], new_V_big->nb[2],
+                                           (size_t)L * new_layer_stride);
+        cpy_K[(size_t)L] = ggml_cpy(gctx, k_cap, dst_k);
+        cpy_V[(size_t)L] = ggml_cpy(gctx, v_cap, dst_v);
         if (L == 0 && dbg_X_layer0) {
             x_layer0 = x;
             ggml_set_output(x_layer0);
         }
     }
-    if (!varying_hd) {
-        ggml_set_output(new_K_big);
-        ggml_set_output(new_V_big);
-    } else {
-        for (int L = 0; L < impl_->n_layer; ++L) {
-            ggml_set_output(new_K_tens[(size_t)L]);
-            ggml_set_output(new_V_tens[(size_t)L]);
-        }
-    }
+    ggml_set_output(new_K_big);
+    ggml_set_output(new_V_big);
 
     ggml_tensor* h = ggml_rms_norm(gctx, x, impl_->rms_norm_eps);
     h = ggml_mul(gctx, h, W->output_norm);
@@ -2942,28 +2856,12 @@ bool ForwardContext::decode(int32_t token_id,
     // pinning, alloc_graph hits GGML_ASSERT(buffer_id >= 0).
     std::vector<ggml_tensor*> pin_to_gpu;
     if (impl_->backend_sched) {
-        pin_to_gpu = {ids, pos, mask};
-        if (!varying_hd) {
-            pin_to_gpu.push_back(new_K_big);
-            pin_to_gpu.push_back(new_V_big);
-        } else {
-            for (int L = 0; L < impl_->n_layer; ++L) {
-                pin_to_gpu.push_back(new_K_tens[(size_t)L]);
-                pin_to_gpu.push_back(new_V_tens[(size_t)L]);
-            }
-        }
+        pin_to_gpu = {ids, pos, mask, new_K_big, new_V_big};
         if (freq_factors && freq_factors != impl_->model_rope_freqs)
             pin_to_gpu.push_back(freq_factors);
         if (mask_swa) pin_to_gpu.push_back(mask_swa);
-        if (!varying_hd) {
-            if (past_K_big) pin_to_gpu.push_back(past_K_big);
-            if (past_V_big) pin_to_gpu.push_back(past_V_big);
-        } else if (past_n > 0) {
-            for (int L = 0; L < impl_->n_layer; ++L) {
-                pin_to_gpu.push_back(past_K_tens[(size_t)L]);
-                pin_to_gpu.push_back(past_V_tens[(size_t)L]);
-            }
-        }
+        if (past_K_big) pin_to_gpu.push_back(past_K_big);
+        if (past_V_big) pin_to_gpu.push_back(past_V_big);
     }
     if (!impl_->alloc_graph(graph, pin_to_gpu)) {
         std::fprintf(stderr, "[sp-engine] decode: gallocr failed (past_n=%d)\n", past_n);
@@ -3013,7 +2911,7 @@ bool ForwardContext::decode(int32_t token_id,
             // way to guarantee the reads are visible to the graph.
             cudaDeviceSynchronize();
 #endif
-        } else if (!varying_hd) {
+        } else {
             const size_t elems_per_layer = (size_t)hd * n_kv * past_n;
             packed_K.resize(elems_per_layer * impl_->n_layer);
             packed_V.resize(elems_per_layer * impl_->n_layer);
@@ -3029,16 +2927,6 @@ bool ForwardContext::decode(int32_t token_id,
                                     packed_K.size() * sizeof(float));
             ggml_backend_tensor_set(past_V_big, packed_V.data(), 0,
                                     packed_V.size() * sizeof(float));
-        } else {
-            // Varying head_dim: upload per-layer tensors individually.
-            for (int L = 0; L < impl_->n_layer; ++L) {
-                ggml_backend_tensor_set(past_K_tens[(size_t)L],
-                                        past_K_all[(size_t)L].data(), 0,
-                                        past_K_all[(size_t)L].size() * sizeof(float));
-                ggml_backend_tensor_set(past_V_tens[(size_t)L],
-                                        past_V_all[(size_t)L].data(), 0,
-                                        past_V_all[(size_t)L].size() * sizeof(float));
-            }
         }
     }
     {
@@ -3080,7 +2968,7 @@ bool ForwardContext::decode(int32_t token_id,
     //   - host cache: batched download into 2 contiguous host buffers,
     //     then per-layer host-side compress.
     const size_t kv_elems = (size_t)hd * n_kv;
-    if (gpu_cache && !varying_hd) {
+    if (gpu_cache) {
         const float* d_new_K = (const float*)new_K_big->data;
         const float* d_new_V = (const float*)new_V_big->data;
         if (!d_new_K || !d_new_V) {
@@ -3100,7 +2988,7 @@ bool ForwardContext::decode(int32_t token_id,
             ggml_backend_tensor_get(new_K_big, dbg_K_layer0->data(), 0,
                                     kv_elems * sizeof(float));
         }
-    } else if (!varying_hd) {
+    } else {
         std::vector<float> packed_new_K(kv_elems * impl_->n_layer);
         std::vector<float> packed_new_V(kv_elems * impl_->n_layer);
         ggml_backend_tensor_get(new_K_big, packed_new_K.data(), 0,
@@ -3114,37 +3002,6 @@ bool ForwardContext::decode(int32_t token_id,
                 dbg_K_layer0->assign(K_one, K_one + kv_elems);
             }
             if (!impl_->cache->write(L, past_n, 1, K_one, V_one)) {
-                std::fprintf(stderr, "[sp-engine] decode: cache write layer %d failed\n", L);
-                ggml_free(gctx); return false;
-            }
-        }
-    } else {
-        // Varying head_dim: download + write per-layer individually.
-        // Cache expects cache_head_dim per head; pad local layers.
-        const int chd = impl_->cache->head_dim();
-        for (int L = 0; L < impl_->n_layer; ++L) {
-            const int lhd = impl_->per_layer_hd[(size_t)L];
-            const size_t lkv = (size_t)lhd * n_kv;
-            std::vector<float> K_one(lkv), V_one(lkv);
-            ggml_backend_tensor_get(new_K_tens[(size_t)L], K_one.data(), 0, lkv * sizeof(float));
-            ggml_backend_tensor_get(new_V_tens[(size_t)L], V_one.data(), 0, lkv * sizeof(float));
-            if (L == 0 && dbg_K_layer0) {
-                dbg_K_layer0->assign(K_one.begin(), K_one.end());
-            }
-            if (lhd < chd) {
-                // Pad per-head dim from lhd → chd.
-                auto pad1 = [&](std::vector<float>& d) {
-                    std::vector<float> p((size_t)chd * n_kv, 0.0f);
-                    for (int h = 0; h < n_kv; ++h)
-                        std::memcpy(p.data() + (size_t)h * chd,
-                                    d.data() + (size_t)h * lhd,
-                                    (size_t)lhd * sizeof(float));
-                    d = std::move(p);
-                };
-                pad1(K_one);
-                pad1(V_one);
-            }
-            if (!impl_->cache->write(L, past_n, 1, K_one.data(), V_one.data())) {
                 std::fprintf(stderr, "[sp-engine] decode: cache write layer %d failed\n", L);
                 ggml_free(gctx); return false;
             }
