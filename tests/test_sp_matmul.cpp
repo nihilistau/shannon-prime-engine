@@ -209,6 +209,111 @@ TEST(matmul_after_frobenius_shim_preserves_product) {
 }
 
 // =========================================================================
+// Omega cross-term verification — both a and b nonzero across operands.
+//
+// This is the load-bearing test: the multiply rule
+//   (a1 + b1*omega) * (a2 + b2*omega)
+//   = (a1*a2 - 41*b1*b2) + (a1*b2 + a2*b1 + b1*b2)*omega
+// MUST accumulate correctly across a full matmul. Phase 1's encode path
+// always set b=0; this test puts b nonzero so the omega-direction
+// arithmetic gets exercised end-to-end.
+// =========================================================================
+
+TEST(matmul_ok_omega_cross_terms_compose_correctly) {
+    // Construct W and X DIRECTLY (not via encode) with deliberate nonzero
+    // a AND b on every element. Then verify sp_matmul_ok produces the
+    // result predicted by the omega multiplication rule.
+    constexpr int M = 2, K = 3, N = 2;
+
+    sp_ok_arena arena(8 * 1024);
+    sp_ok_tensor W, X, Y;
+    int64_t w_shape[4] = { K, M, 1, 1 };
+    int64_t x_shape[4] = { N, K, 1, 1 };
+    int64_t y_shape[4] = { N, M, 1, 1 };
+    W.reset(2, w_shape); ASSERT(arena.alloc_tensor(W));
+    X.reset(2, x_shape); ASSERT(arena.alloc_tensor(X));
+    Y.reset(2, y_shape); ASSERT(arena.alloc_tensor(Y));
+    W.scale_recip = 1; W.frobenius_scale = 1;
+    X.scale_recip = 1; X.frobenius_scale = 1;
+
+    // Hand-pick W[2x3] and X[3x2] elements with nontrivial (a, b).
+    // W row 0: (1, 2), (3, -1), (0, 4)
+    // W row 1: (-2, 1), (5, 0), (1, 1)
+    // (note our shape[0] is innermost=K, so W[i*K+k] gives row i col k)
+    W.data[0*K + 0] = sp_ok_t{ 1, 2}; W.data[0*K + 1] = sp_ok_t{ 3, -1}; W.data[0*K + 2] = sp_ok_t{0, 4};
+    W.data[1*K + 0] = sp_ok_t{-2, 1}; W.data[1*K + 1] = sp_ok_t{ 5,  0}; W.data[1*K + 2] = sp_ok_t{1, 1};
+
+    // X[3x2] (shape[0]=N=2 innermost, shape[1]=K=3 outer)
+    // X row 0: ( 2,  1), ( 0, -3)
+    // X row 1: ( 1,  0), (-1,  2)
+    // X row 2: ( 4, -1), ( 2,  1)
+    X.data[0*N + 0] = sp_ok_t{ 2,  1}; X.data[0*N + 1] = sp_ok_t{ 0, -3};
+    X.data[1*N + 0] = sp_ok_t{ 1,  0}; X.data[1*N + 1] = sp_ok_t{-1,  2};
+    X.data[2*N + 0] = sp_ok_t{ 4, -1}; X.data[2*N + 1] = sp_ok_t{ 2,  1};
+
+    ASSERT(sp_matmul_ok(W, X, Y));
+
+    // Compute the expected products via the omega multiplication rule:
+    //   (a1 + b1*w)*(a2 + b2*w) = (a1*a2 - 41*b1*b2, a1*b2 + a2*b1 + b1*b2)
+    auto ok_mul = [](sp_ok_t u, sp_ok_t v) {
+        sp_ok_t r;
+        r.a = u.a*v.a - 41 * u.b * v.b;
+        r.b = u.a*v.b + v.a*u.b + u.b*v.b;
+        return r;
+    };
+    auto ok_add = [](sp_ok_t u, sp_ok_t v) {
+        return sp_ok_t{ u.a+v.a, u.b+v.b };
+    };
+
+    for (int i = 0; i < M; ++i) {
+        for (int j = 0; j < N; ++j) {
+            sp_ok_t expected = sp_ok_t{0, 0};
+            for (int k = 0; k < K; ++k) {
+                expected = ok_add(expected, ok_mul(W.data[i*K + k], X.data[k*N + j]));
+            }
+            sp_ok_t got = Y.data[i*N + j];
+            if (got.a != expected.a || got.b != expected.b) {
+                std::fprintf(stderr,
+                    "  Y[%d,%d]: got (%lld, %lld) expected (%lld, %lld)\n",
+                    i, j, (long long)got.a, (long long)got.b,
+                    (long long)expected.a, (long long)expected.b);
+            }
+            ASSERT(got.a == expected.a);
+            ASSERT(got.b == expected.b);
+        }
+    }
+}
+
+// Spot-check a single omega product by hand to make ABSOLUTELY sure
+// the formula matches the textbook: omega^2 = omega - 41.
+//
+// (1 + 2w) * (3 + 4w):
+//   a = 1*3 - 41*2*4 = 3 - 328 = -325
+//   b = 1*4 + 3*2 + 2*4 = 4 + 6 + 8 = 18
+TEST(matmul_ok_hand_computed_single_product) {
+    sp_ok_arena arena(1024);
+    sp_ok_tensor W, X, Y;
+    int64_t s1[4] = { 1, 1, 1, 1 };  // 1x1 matrices
+    W.reset(2, s1); ASSERT(arena.alloc_tensor(W));
+    X.reset(2, s1); ASSERT(arena.alloc_tensor(X));
+    Y.reset(2, s1); ASSERT(arena.alloc_tensor(Y));
+    W.scale_recip = 1; W.frobenius_scale = 1;
+    X.scale_recip = 1; X.frobenius_scale = 1;
+    W.data[0] = sp_ok_t{ 1, 2 };
+    X.data[0] = sp_ok_t{ 3, 4 };
+    ASSERT(sp_matmul_ok(W, X, Y));
+    ASSERT(Y.data[0].a == -325);
+    ASSERT(Y.data[0].b == 18);
+}
+
+// Verify the SP_OK_OMEGA_NORM constant matches the formula. If someone
+// edits the header and accidentally changes 41 to something else, this
+// catches it.
+TEST(matmul_ok_omega_norm_constant_is_41) {
+    ASSERT(SP_OK_OMEGA_NORM == 41);
+}
+
+// =========================================================================
 // Driver
 // =========================================================================
 
