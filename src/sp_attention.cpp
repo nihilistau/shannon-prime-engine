@@ -307,11 +307,20 @@ void sp_attention_poly_ring(const sp_ok_tensor& q,
         return enabled;
     }();
     const bool use_ntt_here = g_use_ntt && (N == SP_NTT_N);
-    std::vector<int64_t>  ntt_int_scratch;
-    std::vector<uint64_t> ntt_u64_scratch;
+    // Phase 5b: hoist NTT(Q) out of the per-t inner loop. We compute
+    // NTT(Q) once per (h, qi) and reuse it for every t. K is encoded
+    // and forward-NTT'd per t inside the cached dot product.
+    std::vector<int64_t>  ntt_Q_int_scratch;  // [SP_NTT_N]
+    std::vector<uint64_t> ntt_Q_buf;          // [SP_NTT_N] — NTT(Q) cached
+    std::vector<int64_t>  ntt_K_int_scratch;  // [SP_NTT_N]
+    std::vector<uint64_t> ntt_K_buf;          // [SP_NTT_N] — NTT(K_rev) per t
+    std::vector<uint64_t> ntt_C_buf;          // [SP_NTT_N] — product NTT domain
     if (use_ntt_here) {
-        ntt_int_scratch.assign(2 * SP_NTT_N, 0);
-        ntt_u64_scratch.assign(3 * SP_NTT_N, 0);
+        ntt_Q_int_scratch.assign(SP_NTT_N, 0);
+        ntt_Q_buf.assign(SP_NTT_N, 0);
+        ntt_K_int_scratch.assign(SP_NTT_N, 0);
+        ntt_K_buf.assign(SP_NTT_N, 0);
+        ntt_C_buf.assign(SP_NTT_N, 0);
     }
 
     for (int h = 0; h < n_head; ++h) {
@@ -325,6 +334,13 @@ void sp_attention_poly_ring(const sp_ok_tensor& q,
                 const sp_ok_t& q_d =
                     q.data[((int64_t)h * head_dim + d) * n_q + qi];
                 q_vec[d] = (float)((double)q_d.a / q_div);
+            }
+
+            // Phase 5b: hoist NTT(Q) once per (h, qi).
+            if (use_ntt_here) {
+                sp_poly_encode_ntt_q(ntt_Q_buf.data(),
+                                     q_vec.data(), head_dim, delta,
+                                     ntt_Q_int_scratch.data());
             }
 
             const int swa_lo = (swa_window > 0)
@@ -342,12 +358,11 @@ void sp_attention_poly_ring(const sp_ok_tensor& q,
                 float dot;
                 if (use_ntt_here) {
                     int ok = 0;
-                    dot = sp_poly_dot_product_ntt(
-                        q_vec.data(), k_vec.data(), head_dim, delta,
-                        ntt_int_scratch.data(), ntt_u64_scratch.data(),
-                        &ok);
+                    dot = sp_poly_dot_product_ntt_q_cached(
+                        ntt_Q_buf.data(), k_vec.data(), head_dim, delta,
+                        ntt_K_int_scratch.data(), ntt_K_buf.data(),
+                        ntt_C_buf.data(), &ok);
                     if (!ok) {
-                        // Should not happen — head_dim ≤ N == SP_NTT_N.
                         dot = sp_poly_dot_product(
                             q_vec.data(), k_vec.data(), head_dim, N, delta,
                             poly_scratch.data());
