@@ -158,6 +158,12 @@ bool sp_weights_load_from_fp16_source(sp_weights& out,
         if (lyr.ffn_norm) {
             sp_weights_set_ffn_norm(out, L, lyr.ffn_norm);
         } else { ++n_missing; }
+
+        // Phase 2.3b: optional norms.
+        if (lyr.attn_q_norm)    sp_weights_set_attn_q_norm(out, L, lyr.attn_q_norm);
+        if (lyr.attn_k_norm)    sp_weights_set_attn_k_norm(out, L, lyr.attn_k_norm);
+        if (lyr.attn_post_norm) sp_weights_set_attn_post_norm(out, L, lyr.attn_post_norm);
+        if (lyr.ffn_post_norm)  sp_weights_set_ffn_post_norm(out, L, lyr.ffn_post_norm);
     }
 
     // --- Apply Frobenius shim per cfg ---
@@ -286,9 +292,13 @@ bool sp_weights_load_from_llama(sp_weights& out,
     std::vector<sp_weights_layer_fp16_source> layer_srcs(n_layers);
     // Bypass-list norms are fp32 — dequant into per-tensor scratch pools
     // owned by this function so the pointers stay valid through
-    // sp_weights_load_from_fp16_source.
-    std::vector<std::vector<float>> norm_scratch(n_layers * 2);
+    // sp_weights_load_from_fp16_source. 6 slots per layer:
+    //   [0]=attn_norm [1]=ffn_norm [2]=q_norm [3]=k_norm
+    //   [4]=attn_post_norm [5]=ffn_post_norm
+    std::vector<std::vector<float>> norm_scratch(n_layers * 6);
     std::vector<float> final_norm_scratch;
+    int n_q_norm_seen = 0, n_k_norm_seen = 0;
+    int n_attn_post_seen = 0, n_ffn_post_seen = 0;
 
     for (int L = 0; L < n_layers; ++L) {
         const auto& lyr = layers[L];
@@ -308,9 +318,37 @@ bool sp_weights_load_from_llama(sp_weights& out,
         s.ffn_up   = tensor_fp16(lyr.ffn_up,   "ffn_up");
         s.ffn_down = tensor_fp16(lyr.ffn_down, "ffn_down");
         s.attn_norm = tensor_fp32_or_dequant(
-            lyr.attn_norm, norm_scratch[L * 2 + 0], n_embd, "attn_norm");
+            lyr.attn_norm, norm_scratch[L * 6 + 0], n_embd, "attn_norm");
         s.ffn_norm  = tensor_fp32_or_dequant(
-            lyr.ffn_norm,  norm_scratch[L * 2 + 1], n_embd, "ffn_norm");
+            lyr.ffn_norm,  norm_scratch[L * 6 + 1], n_embd, "ffn_norm");
+        // Phase 2.3b: optional norms. attn_q_norm / attn_k_norm are
+        // [head_dim]-sized; sandwich norms are [n_embd]-sized.
+        if (lyr.attn_q_norm) {
+            s.attn_q_norm = tensor_fp32_or_dequant(
+                lyr.attn_q_norm, norm_scratch[L * 6 + 2], head_dim, "attn_q_norm");
+            if (s.attn_q_norm) ++n_q_norm_seen;
+        }
+        if (lyr.attn_k_norm) {
+            s.attn_k_norm = tensor_fp32_or_dequant(
+                lyr.attn_k_norm, norm_scratch[L * 6 + 3], head_dim, "attn_k_norm");
+            if (s.attn_k_norm) ++n_k_norm_seen;
+        }
+        if (lyr.attn_post_norm) {
+            s.attn_post_norm = tensor_fp32_or_dequant(
+                lyr.attn_post_norm, norm_scratch[L * 6 + 4], n_embd, "attn_post_norm");
+            if (s.attn_post_norm) ++n_attn_post_seen;
+        }
+        if (lyr.ffn_post_norm) {
+            s.ffn_post_norm = tensor_fp32_or_dequant(
+                lyr.ffn_post_norm, norm_scratch[L * 6 + 5], n_embd, "ffn_post_norm");
+            if (s.ffn_post_norm) ++n_ffn_post_seen;
+        }
+    }
+    if (n_q_norm_seen + n_k_norm_seen + n_attn_post_seen + n_ffn_post_seen > 0) {
+        std::fprintf(stderr,
+            "[sp-weights-loader] Phase 2.3b norms: q_norm=%d k_norm=%d "
+            "attn_post=%d ffn_post=%d (per-layer counts)\n",
+            n_q_norm_seen, n_k_norm_seen, n_attn_post_seen, n_ffn_post_seen);
     }
 
     sp_weights_fp16_source src;

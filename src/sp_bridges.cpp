@@ -142,4 +142,69 @@ void sp_silu_inplace(float* x, int n) {
     for (int i = 0; i < n; ++i) x[i] = silu_scalar(x[i]);
 }
 
+// =========================================================================
+// Phase 2.3b helpers
+// =========================================================================
+
+bool sp_per_head_rmsnorm_native(sp_ok_tensor& qk,
+                                  const float* scale_fp32,
+                                  float eps,
+                                  int n_heads, int head_dim, int n_tokens) {
+    if (qk.data == nullptr || scale_fp32 == nullptr) return false;
+    if (n_heads <= 0 || head_dim <= 0 || n_tokens <= 0) return false;
+    if (qk.n_dims < 2) return false;
+    const int64_t T = qk.shape[0];
+    const int64_t F = qk.shape[1];
+    if (T != (int64_t)n_tokens) return false;
+    if (F != (int64_t)n_heads * head_dim) return false;
+
+    const double in_divisor = (double)qk.scale_recip * (double)qk.frobenius_scale;
+    if (in_divisor == 0.0) return false;
+    const int64_t S = qk.scale_recip;
+    const double  S_d = (double)S;
+
+    // Layout: qk.data[(h * head_dim + d) * T + t]
+    for (int t = 0; t < n_tokens; ++t) {
+        for (int h = 0; h < n_heads; ++h) {
+            // Pass 1: sum of squares over head_dim for (h, t).
+            double sum_sq = 0.0;
+            for (int d = 0; d < head_dim; ++d) {
+                const int64_t f = (int64_t)h * head_dim + d;
+                double v = (double)qk.data[f * T + t].a / in_divisor;
+                sum_sq += v * v;
+            }
+            const double inv_rms =
+                1.0 / std::sqrt(sum_sq / (double)head_dim + (double)eps);
+
+            // Pass 2: normalize, multiply by per-feature scale, re-encode.
+            for (int d = 0; d < head_dim; ++d) {
+                const int64_t f = (int64_t)h * head_dim + d;
+                double v   = (double)qk.data[f * T + t].a / in_divisor;
+                double y   = v * inv_rms * (double)scale_fp32[d];
+                int64_t a  = (int64_t)std::llrint(y * S_d);
+                qk.data[f * T + t] = sp_ok_t{ a, 0 };
+            }
+        }
+    }
+    qk.frobenius_scale = 1;
+    return true;
+}
+
+void sp_rmsnorm_fp32(const float* x, const float* scale_fp32, float* out,
+                       int n_embd, int n_tokens, float eps) {
+    for (int t = 0; t < n_tokens; ++t) {
+        const float* row_in  = x   + (size_t)t * n_embd;
+        float*       row_out = out + (size_t)t * n_embd;
+        double ss = 0.0;
+        for (int i = 0; i < n_embd; ++i) {
+            ss += (double)row_in[i] * (double)row_in[i];
+        }
+        const float inv_rms =
+            1.0f / std::sqrt((float)(ss / (double)n_embd) + eps);
+        for (int i = 0; i < n_embd; ++i) {
+            row_out[i] = row_in[i] * inv_rms * scale_fp32[i];
+        }
+    }
+}
+
 }  // namespace sp::engine

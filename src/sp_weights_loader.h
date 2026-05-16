@@ -44,6 +44,11 @@ struct sp_weights_layer_fp16_source {
     const uint16_t* ffn_down   = nullptr;   // [n_embd * d_ff]
     const float*    attn_norm  = nullptr;   // [n_embd]   (fp32 bypass)
     const float*    ffn_norm   = nullptr;   // [n_embd]   (fp32 bypass)
+    // Phase 2.3b: optional Gemma3 / Qwen3 norms. Null = not applied.
+    const float*    attn_q_norm    = nullptr;  // [head_dim]
+    const float*    attn_k_norm    = nullptr;  // [head_dim]
+    const float*    attn_post_norm = nullptr;  // [n_embd]
+    const float*    ffn_post_norm  = nullptr;  // [n_embd]
 };
 
 struct sp_weights_fp16_source {

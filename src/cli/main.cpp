@@ -862,9 +862,13 @@ int main(int argc, char** argv) {
             }
 
             sp::engine::sp_forward_context ctx;
+            const float native_rope_base = m->rope_freq_base();
+            std::fprintf(stderr,
+                "[sp-engine] perplexity-native: rope_freq_base=%.1f\n",
+                (double)native_rope_base);
             if (!sp::engine::sp_forward_context_init(
                     ctx, spW, /*n_ctx*/ n_ctx,
-                    /*rope_base*/ 10000.0f, /*rms_eps*/ 1e-5f)) {
+                    /*rope_base*/ native_rope_base, /*rms_eps*/ 1e-5f)) {
                 std::fprintf(stderr,
                     "[sp-engine] perplexity-native: context init failed\n");
                 return 8;

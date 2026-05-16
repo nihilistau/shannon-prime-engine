@@ -102,4 +102,35 @@ void sp_silu_bridge(const float* gate, const float* up, int n, float* out);
 // Plain silu without the gating multiply (for non-SwiGLU activation paths).
 void sp_silu_inplace(float* x, int n);
 
+// -----------------------------------------------------------------------
+// Phase 2.3b — Gemma3 / Qwen3 supplementary norms.
+// -----------------------------------------------------------------------
+
+// sp_per_head_rmsnorm_native — in-place per-head RMSNorm on an O_K Q or K
+// tensor. For each (token, head) pair, normalizes over the head_dim slice
+// using its own RMS, then elementwise-multiplies by the per-feature
+// `scale_fp32` vector of length head_dim (shared across heads).
+//
+// qk:        shape = { n_tokens, n_heads * head_dim }, in place.
+// scale_fp32: [head_dim] weight vector.
+// eps:       RMSNorm epsilon.
+// n_heads:   number of heads in qk (n_head for Q, n_kv_head for K).
+// head_dim:  per-head dimension.
+// n_tokens:  number of tokens (= qk.shape[0]).
+//
+// Output: qk.scale_recip unchanged; qk.frobenius_scale RESET to 1
+// (the per-head norm is a scale-reset valve, same as sp_rmsnorm_native).
+bool sp_per_head_rmsnorm_native(sp_ok_tensor& qk,
+                                  const float* scale_fp32,
+                                  float eps,
+                                  int n_heads, int head_dim, int n_tokens);
+
+// sp_rmsnorm_fp32 — fp32 input / fp32 output RMSNorm. Used for the
+// Gemma3 sandwich norms on projection outputs that are already in fp32
+// units (post sp_matmul_ok_to_fp32). No O_K state involved.
+//
+// Operates on n_tokens rows of length n_embd.
+void sp_rmsnorm_fp32(const float* x, const float* scale_fp32, float* out,
+                       int n_embd, int n_tokens, float eps);
+
 }  // namespace sp::engine

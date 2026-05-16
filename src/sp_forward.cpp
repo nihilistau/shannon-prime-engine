@@ -165,6 +165,11 @@ bool sp_weights_alloc(sp_weights& out, int n_layers, int n_embd,
     out.ffn_down.resize(n_layers);
     out.attn_norm_w.resize(n_layers);
     out.ffn_norm_w.resize(n_layers);
+    // Phase 2.3b — optional per-layer norms left empty by default.
+    out.attn_q_norm_w.assign(n_layers, std::vector<float>{});
+    out.attn_k_norm_w.assign(n_layers, std::vector<float>{});
+    out.attn_post_norm_w.assign(n_layers, std::vector<float>{});
+    out.ffn_post_norm_w.assign(n_layers, std::vector<float>{});
 
     // Compute exact arena requirement using the *actual* head_dim
     // (NOT n_embd/n_head — those can differ, e.g. Gemma3).
@@ -280,6 +285,28 @@ bool sp_weights_set_ffn_norm(sp_weights& out, int L, const float* src) {
 bool sp_weights_set_final_norm(sp_weights& out, const float* src) {
     if (src == nullptr) return false;
     std::memcpy(out.final_norm_w.data(), src, sizeof(float) * out.n_embd);
+    return true;
+}
+
+// Phase 2.3b — Gemma3 / Qwen3 optional norms.
+bool sp_weights_set_attn_q_norm(sp_weights& out, int L, const float* src) {
+    if (L < 0 || L >= out.n_layers || src == nullptr) return false;
+    out.attn_q_norm_w[L].assign(src, src + out.head_dim);
+    return true;
+}
+bool sp_weights_set_attn_k_norm(sp_weights& out, int L, const float* src) {
+    if (L < 0 || L >= out.n_layers || src == nullptr) return false;
+    out.attn_k_norm_w[L].assign(src, src + out.head_dim);
+    return true;
+}
+bool sp_weights_set_attn_post_norm(sp_weights& out, int L, const float* src) {
+    if (L < 0 || L >= out.n_layers || src == nullptr) return false;
+    out.attn_post_norm_w[L].assign(src, src + out.n_embd);
+    return true;
+}
+bool sp_weights_set_ffn_post_norm(sp_weights& out, int L, const float* src) {
+    if (L < 0 || L >= out.n_layers || src == nullptr) return false;
+    out.ffn_post_norm_w[L].assign(src, src + out.n_embd);
     return true;
 }
 
@@ -440,6 +467,28 @@ bool sp_forward_step(sp_forward_context& ctx,
         if (!sp_matmul_ok(weights.wk[L], ctx.x_norm_ok, ctx.k_ok)) return false;
         if (!sp_matmul_ok(weights.wv[L], ctx.x_norm_ok, ctx.v_ok)) return false;
 
+        // 2c.5) Phase 2.3b: optional per-head Q/K norms (Gemma3 / Qwen3).
+        // These reset frobenius_scale → 1, so subsequent RoPE re-encodes
+        // at qk.scale_recip (unchanged) with frob=1.
+        if (!weights.attn_q_norm_w[L].empty()) {
+            if (!sp_per_head_rmsnorm_native(
+                    ctx.q_ok,
+                    weights.attn_q_norm_w[L].data(),
+                    ctx.rms_eps, n_head, head_dim, n_tokens)) {
+                std::fprintf(stderr, "[sp_forward] L%d q-norm failed\n", L);
+                return false;
+            }
+        }
+        if (!weights.attn_k_norm_w[L].empty()) {
+            if (!sp_per_head_rmsnorm_native(
+                    ctx.k_ok,
+                    weights.attn_k_norm_w[L].data(),
+                    ctx.rms_eps, n_kv_head, head_dim, n_tokens)) {
+                std::fprintf(stderr, "[sp_forward] L%d k-norm failed\n", L);
+                return false;
+            }
+        }
+
         // 2d) RoPE on Q and K (frobenius_scale → 1 after each call).
         if (!sp_rope_apply_ok(ctx.q_ok, n_head,    head_dim, n_tokens,
                                 rope_pos, ctx.rope_base, 1.0f)) return false;
@@ -503,6 +552,15 @@ bool sp_forward_step(sp_forward_context& ctx,
             return false;
         }
 
+        // 2g.5) Phase 2.3b: Gemma3 attn sandwich norm on Wo output.
+        if (!weights.attn_post_norm_w[L].empty()) {
+            sp_rmsnorm_fp32(
+                ctx.proj_out_fp32.data(),
+                weights.attn_post_norm_w[L].data(),
+                ctx.proj_out_fp32.data(),
+                n_embd, n_tokens, ctx.rms_eps);
+        }
+
         // 2h) Residual: x_fp32 += wo_out_fp32 (both fp32).
         for (int i = 0; i < n_embd; ++i) {
             ctx.x_fp32[i] += ctx.proj_out_fp32[i];
@@ -537,6 +595,15 @@ bool sp_forward_step(sp_forward_context& ctx,
                                      ctx.layer_arena)) {
             std::fprintf(stderr, "[sp_forward] L%d FFN failed\n", L);
             return false;
+        }
+
+        // 2k.5) Phase 2.3b: Gemma3 FFN sandwich norm on down output.
+        if (!weights.ffn_post_norm_w[L].empty()) {
+            sp_rmsnorm_fp32(
+                ctx.proj_out_fp32.data(),
+                weights.ffn_post_norm_w[L].data(),
+                ctx.proj_out_fp32.data(),
+                n_embd, n_tokens, ctx.rms_eps);
         }
 
         // 2l) Residual: x_fp32 += ffn_out_fp32

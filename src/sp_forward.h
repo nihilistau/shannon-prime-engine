@@ -91,9 +91,17 @@ struct sp_weights {
     sp_ok_tensor              lm_head;         // [n_embd, vocab]
 
     // Bypass-list (fp32 norms; scale-reset valve per Phase 1.7 policy):
-    std::vector<std::vector<float>> attn_norm_w;   // per-layer [n_embd]
-    std::vector<std::vector<float>> ffn_norm_w;    // per-layer [n_embd]
-    std::vector<float>              final_norm_w;  // [n_embd]
+    std::vector<std::vector<float>> attn_norm_w;       // per-layer [n_embd]
+    std::vector<std::vector<float>> ffn_norm_w;        // per-layer [n_embd]
+    std::vector<float>              final_norm_w;      // [n_embd]
+    // Phase 2.3b: Gemma3 / Qwen3 per-head Q/K norms (empty = not applied).
+    // Sized [head_dim]; shared across all heads (broadcast per head).
+    std::vector<std::vector<float>> attn_q_norm_w;     // per-layer [head_dim] or empty
+    std::vector<std::vector<float>> attn_k_norm_w;     // per-layer [head_dim] or empty
+    // Phase 2.3b: Gemma3 sandwich norms — applied to projection output
+    // BEFORE the residual add. Empty = not applied.
+    std::vector<std::vector<float>> attn_post_norm_w;  // per-layer [n_embd] or empty
+    std::vector<std::vector<float>> ffn_post_norm_w;   // per-layer [n_embd] or empty
 
     // Owning storage for every sp_ok_tensor above.
     sp_ok_arena               storage;
@@ -216,6 +224,14 @@ bool sp_weights_set_lm_head(sp_weights& out, const float* src);
 bool sp_weights_set_attn_norm(sp_weights& out, int layer, const float* src);
 bool sp_weights_set_ffn_norm(sp_weights& out, int layer, const float* src);
 bool sp_weights_set_final_norm(sp_weights& out, const float* src);
+
+// Phase 2.3b: optional Gemma3 / Qwen3 norms. Pass null `src` (or skip
+// the call entirely) to leave the slot empty (= norm not applied).
+// q/k norms are sized [head_dim]; post norms are sized [n_embd].
+bool sp_weights_set_attn_q_norm(sp_weights& out, int layer, const float* src);
+bool sp_weights_set_attn_k_norm(sp_weights& out, int layer, const float* src);
+bool sp_weights_set_attn_post_norm(sp_weights& out, int layer, const float* src);
+bool sp_weights_set_ffn_post_norm(sp_weights& out, int layer, const float* src);
 
 // Apply the Frobenius / Sato-Tate shim to every shim-list tensor. The
 // bypass-list (norms) is NOT touched. Returns the number of tensors that
