@@ -520,10 +520,12 @@ if(SP_ENGINE_WITH_CUDA)
     target_link_libraries(sp_engine PUBLIC CUDA::cudart)
 endif()
 target_compile_features(sp_engine PUBLIC cxx_std_17)
+# Phase 8: AVX-512 GEMV fast-path in sp_matmul_ok requires AVX2/AVX-512
+# intrinsics + __AVX512F__ macro. Tiger Lake (i9-11900KB) is the floor.
 if(MSVC)
-    target_compile_options(sp_engine PRIVATE /W3)
+    target_compile_options(sp_engine PRIVATE /W3 /arch:AVX512)
 else()
-    target_compile_options(sp_engine PRIVATE -Wall -Wextra)
+    target_compile_options(sp_engine PRIVATE -Wall -Wextra -mavx512f -mavx2)
 endif()
 
 # --------------------------------------------------------------------
