@@ -66,3 +66,8 @@ add_test(NAME sp_frobenius COMMAND test_sp_frobenius
 add_executable(test_sp_encode test_sp_encode.cpp)
 target_link_libraries(test_sp_encode PRIVATE sp_engine)
 add_test(NAME sp_encode COMMAND test_sp_encode)
+
+# ─── SP load-time Frobenius shim (Phase 1.7) ──────────────────────────
+add_executable(test_sp_load_shim test_sp_load_shim.cpp)
+target_link_libraries(test_sp_load_shim PRIVATE sp_engine)
+add_test(NAME sp_load_shim COMMAND test_sp_load_shim)
