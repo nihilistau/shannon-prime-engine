@@ -142,3 +142,33 @@ set_target_properties(test_sp_weil_attention PROPERTIES
     CXX_STANDARD 17
 )
 add_test(NAME sp_weil_attention COMMAND test_sp_weil_attention)
+
+# ─── SP Phase 3 pivot: polynomial ring kernel ──────────────────────────
+# Naive Z[x]/(x^N+1) multiplier + CKKS-style fp32 round-trip.
+# Validates the dot-product identity before plumbing into attention.
+add_executable(test_sp_poly_ring
+    test_sp_poly_ring.cpp
+    ../lib/shannon-prime/core/sp_poly_ring.c
+)
+target_include_directories(test_sp_poly_ring PRIVATE
+    ../lib/shannon-prime/core
+)
+set_target_properties(test_sp_poly_ring PROPERTIES
+    C_STANDARD 11
+    CXX_STANDARD 17
+)
+add_test(NAME sp_poly_ring COMMAND test_sp_poly_ring)
+
+# ─── SP Phase 3 pivot: CKKS-polynomial attention vs softmax bench ──────
+add_executable(test_sp_poly_attention
+    test_sp_poly_attention.cpp
+    ../lib/shannon-prime/core/sp_poly_ring.c
+)
+target_include_directories(test_sp_poly_attention PRIVATE
+    ../lib/shannon-prime/core
+)
+set_target_properties(test_sp_poly_attention PROPERTIES
+    C_STANDARD 11
+    CXX_STANDARD 17
+)
+add_test(NAME sp_poly_attention COMMAND test_sp_poly_attention)

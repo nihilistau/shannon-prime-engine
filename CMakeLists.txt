@@ -120,6 +120,7 @@ set(SP_CORE_SRC
     ${SP_CORE_DIR}/core/sp_ok_arith.c
     ${SP_CORE_DIR}/core/sp_frobenius.c
     ${SP_CORE_DIR}/core/sp_ec_weil.c
+    ${SP_CORE_DIR}/core/sp_poly_ring.c
     ${SP_CORE_DIR}/backends/crt/sp_crt.c
     ${SP_CORE_DIR}/backends/crt/sp_crt_dispatch.c
     ${SP_CORE_DIR}/backends/crt/sp_theoretical.c)
