@@ -99,3 +99,8 @@ add_test(NAME sp_prefill COMMAND test_sp_prefill)
 add_executable(test_sp_weights test_sp_weights.cpp)
 target_link_libraries(test_sp_weights PRIVATE sp_engine)
 add_test(NAME sp_weights COMMAND test_sp_weights)
+
+# ─── SP Phase 2.2c: sp_weights_loader (fp16-source + LlamaWeights walker) ─
+add_executable(test_sp_weights_loader test_sp_weights_loader.cpp)
+target_link_libraries(test_sp_weights_loader PRIVATE sp_engine)
+add_test(NAME sp_weights_loader COMMAND test_sp_weights_loader)

@@ -239,12 +239,12 @@ int sp_weights_apply_frobenius_shim(sp_weights& out,
         ++n_transformed;
     };
 
-    // Top-level shim-list. Note: lm_head is BYPASS per Phase 1.7 policy
-    // (it's the readout, not an interior matmul). tok_embed is bypass too.
-    // For now we still shim everything to match the Phase 1.8 PPL baseline.
-    // The Phase 2.2c GGUF walker will respect the bypass policy.
-    apply_one(out.tok_embed);
-    apply_one(out.lm_head);
+    // Phase 1.7 BYPASS POLICY: tok_embed and lm_head stay un-shimmed.
+    //   tok_embed: first residual stream, "scale-reset" valve
+    //   lm_head:   logit readout, scale ≠ softmax temperature
+    // Both keep frobenius_scale=1 so downstream uses see the original
+    // fp32 values (with no Theorem-4 cancellation needed since they
+    // never compose with each other in a single matmul).
 
     for (int L = 0; L < out.n_layers; ++L) {
         apply_one(out.wq[L]);

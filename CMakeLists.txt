@@ -416,6 +416,7 @@ add_library(sp_engine STATIC
     src/sp_ffn.cpp
     src/sp_rope.cpp
     src/sp_kv_cache_ok.cpp
+    src/sp_weights_loader.cpp
     src/sp_sampler.cpp
     src/sp_quant.cpp
     src/sp_quant_frobenius.cpp
