@@ -41,3 +41,23 @@ add_test(NAME sp_quant_q5k COMMAND test_sp_quant_q5k)
 add_executable(test_sp_kernels test_sp_kernels.cpp)
 target_link_libraries(test_sp_kernels PRIVATE sp_engine ggml ggml-base ggml-cpu)
 add_test(NAME sp_kernels COMMAND test_sp_kernels)
+
+# ─── SP Frobenius / Sato-Tate unit tests (Phase 0 Theory-First) ───────
+# Self-contained: compiles the math submodule's C files directly so this
+# test target doesn't pull in the full sp_engine library. Validates
+# bit-exact contract against test-suite/src/sp_algebra.py via
+# tests/sato_tate_golden.json.
+add_executable(test_sp_frobenius
+    test_sp_frobenius.cpp
+    ../lib/shannon-prime/core/sp_ok_arith.c
+    ../lib/shannon-prime/core/sp_frobenius.c
+)
+target_include_directories(test_sp_frobenius PRIVATE
+    ../lib/shannon-prime/core
+)
+set_target_properties(test_sp_frobenius PROPERTIES
+    C_STANDARD 11
+    CXX_STANDARD 17
+)
+add_test(NAME sp_frobenius COMMAND test_sp_frobenius
+         WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})

@@ -49,3 +49,5 @@ logs/*.sp_freq_factors.bin
 
 # Internal templates not for the published repo
 COPYRIGHT_HEADER.txt
+
+build_test_sp_frobenius.bat

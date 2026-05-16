@@ -51,7 +51,7 @@ static int g_fail = 0;
 TEST(omega_squared_equals_omega_minus_41) {
     sp_ok_t w = SP_OK_OMEGA;
     sp_ok_t w2 = sp_ok_mul(w, w);
-    sp_ok_t expected = sp_ok_sub(w, (sp_ok_t){41, 0});
+    sp_ok_t expected = sp_ok_sub(w, sp_ok_t{41, 0});
     ASSERT_OK_EQ(w2, expected);
 }
 
@@ -62,7 +62,7 @@ TEST(omega_norm_is_41) {
 TEST(omega_times_omega_bar_is_norm) {
     sp_ok_t wbar = sp_ok_conjugate(SP_OK_OMEGA);
     sp_ok_t prod = sp_ok_mul(SP_OK_OMEGA, wbar);
-    ASSERT_OK_EQ(prod, ((sp_ok_t){41, 0}));
+    ASSERT_OK_EQ(prod, (sp_ok_t{41, 0}));
 }
 
 TEST(commutativity_random) {
@@ -208,15 +208,15 @@ static bool parse_golden(const std::string &path, std::vector<std::pair<sp_ok_t,
         size_t lb1 = s.find('[', in_pos);
         size_t rb1 = s.find(']', lb1);
         std::string in_arr = s.substr(lb1 + 1, rb1 - lb1 - 1);
-        long a_in = 0, b_in = 0;
-        std::sscanf(in_arr.c_str(), " %ld , %ld", &a_in, &b_in);
+        long long a_in = 0, b_in = 0;
+        std::sscanf(in_arr.c_str(), " %lld , %lld", &a_in, &b_in);
 
         size_t out_pos = s.find("\"out\"", rb1);
         size_t lb2 = s.find('[', out_pos);
         size_t rb2 = s.find(']', lb2);
         std::string out_arr = s.substr(lb2 + 1, rb2 - lb2 - 1);
-        long a_out = 0, b_out = 0;
-        std::sscanf(out_arr.c_str(), " %ld , %ld", &a_out, &b_out);
+        long long a_out = 0, b_out = 0;
+        std::sscanf(out_arr.c_str(), " %lld , %lld", &a_out, &b_out);
 
         out.push_back({{(int64_t)a_in, (int64_t)b_in}, {(int64_t)a_out, (int64_t)b_out}});
         pos = rb2 + 1;
