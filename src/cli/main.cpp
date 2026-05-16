@@ -9,6 +9,7 @@
 #include "gdn_state.h"
 #include "gguf_loader.h"
 #include "http_server.h"
+#include "sp_load_shim.h"
 #include "kv_cache.h"
 #include "llama_weights.h"
 #include "prime_pe.h"
@@ -2579,6 +2580,64 @@ int main(int argc, char** argv) {
             return 2;
         }
         rest.emplace_back(a);
+    }
+
+    if (cmd == "shim-plan") {
+        // Phase 1.7b smoke verb: load a GGUF, run sp_shim_decide for every
+        // tensor name, print the dispatch decision and a summary. Validates
+        // the bypass policy on a real production model without yet
+        // applying the transformation.
+        if (cfg.model_path.empty()) {
+            std::fprintf(stderr, "shim-plan requires --model <path.gguf>\n");
+            return 1;
+        }
+        auto m = sp::engine::Model::load(cfg.model_path);
+        if (!m) return 2;
+        std::printf("\n=== sp_shim_decide on %s ===\n", cfg.model_path.c_str());
+        std::printf("  arch=%s n_tensors=%lld\n",
+                    m->architecture().c_str(), (long long)m->tensor_count());
+        std::printf("  --frobenius-quant=%d  --sato-tate-mix=%d\n",
+                    (int)cfg.frobenius_quant, (int)cfg.sato_tate_mix);
+        std::printf("\n");
+        int n_total = 0, n_bypass = 0, n_shim = 0;
+        int64_t total_bytes = 0, shim_bytes = 0;
+        bool verbose = (std::getenv("SP_SHIM_VERBOSE") != nullptr);
+        for (size_t i = 0; i < m->tensor_count(); ++i) {
+            auto ti = m->tensor_info(i);
+            auto d = sp::engine::sp_shim_decide(ti.name,
+                cfg.frobenius_quant, cfg.sato_tate_mix);
+            ++n_total;
+            int64_t bytes = (int64_t)ti.n_bytes;
+            total_bytes += bytes;
+            const char* mode_str = "?";
+            switch (d.mode) {
+                case sp::engine::sp_shim_mode::Bypass:         mode_str = "BYPASS"; ++n_bypass; break;
+                case sp::engine::sp_shim_mode::FrobeniusQuant: mode_str = "FROBQ";  ++n_shim;
+                                                                shim_bytes += bytes; break;
+                case sp::engine::sp_shim_mode::SatoTateMix:    mode_str = "STMIX";  ++n_shim;
+                                                                shim_bytes += bytes; break;
+            }
+            if (verbose || i < 20) {
+                std::printf("  [%3zu] %-50s %-7s %s\n",
+                            i, ti.name.c_str(), mode_str, d.reason);
+            }
+        }
+        if (!verbose && (size_t)n_total > 20) {
+            std::printf("  ... (%d more, set SP_SHIM_VERBOSE=1 to see all)\n",
+                        n_total - 20);
+        }
+        std::printf("\n  ----- summary -----\n");
+        std::printf("  total tensors:    %d\n", n_total);
+        std::printf("  BYPASS:           %d (%.1f%%)\n", n_bypass, 100.0 * n_bypass / std::max(1, n_total));
+        std::printf("  SHIM:             %d (%.1f%%)\n", n_shim,   100.0 * n_shim   / std::max(1, n_total));
+        std::printf("  total bytes:      %lld (%.1f MiB)\n",
+                    (long long)total_bytes,
+                    (double)total_bytes / (1024.0 * 1024.0));
+        std::printf("  shim'd bytes:     %lld (%.1f MiB, %.1f%% of model)\n",
+                    (long long)shim_bytes,
+                    (double)shim_bytes / (1024.0 * 1024.0),
+                    total_bytes ? (100.0 * (double)shim_bytes / (double)total_bytes) : 0.0);
+        return 0;
     }
 
     if (cmd == "info") {
