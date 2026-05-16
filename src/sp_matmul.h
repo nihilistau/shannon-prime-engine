@@ -1,0 +1,95 @@
+// Shannon-Prime Engine — native O_K matrix multiplication.
+// Copyright (C) 2026 Ray Daniels. All Rights Reserved. AGPLv3 / commercial.
+//
+// Phase 2.0 — the foundational primitive for the theory-first forward pass.
+// Both sp_attention and sp_ffn reduce to "sp_matmul + nonlinearity bridge".
+//
+// Semantics:
+//   Y[i,j] = sum_k W[i,k] * X[k,j]
+// where all operands are sp_ok_tensors (int64 (a, b) coordinates) and the
+// multiply-accumulate runs in the O_K ring exactly. The output Y stays in
+// O_K coordinates with its `scale_recip` and `frobenius_scale` derived
+// from the operands (multiplicative composition).
+//
+// Why a separate file from sp_kernels_cpu:
+//   sp_kernels_cpu operates on fp32 / fp16 / Q*K tensors. sp_matmul
+//   operates on the integer-coordinate sp_ok_tensor — a different element
+//   type. Code paths and rounding semantics differ; better to keep them
+//   separate for clarity.
+//
+// Numerical concerns:
+//   - Inputs are sp_ok_t = { int64 a, int64 b }. The product of two such
+//     elements multiplies a*a or 41*b*b, so intermediate values can grow
+//     by ~6 bits per multiply. For typical Phi-3 / Gemma3 dimensions with
+//     scale_recip ~ 2^14, this is safe up to ~32-bit dot-product partials.
+//     For larger k or higher scale_recip, we accumulate in __int128.
+//   - The fp32-bridge variant decodes to fp32 *at the output* so that
+//     softmax / silu can run in fp32 without losing the algebraic
+//     structure on the input side.
+
+#pragma once
+
+#include "sp_ok_tensor.h"
+
+#include <cstddef>
+#include <cstdint>
+
+namespace sp::engine {
+
+// -----------------------------------------------------------------------
+// O_K @ O_K → O_K matmul (the workhorse).
+// -----------------------------------------------------------------------
+//
+// W: weight matrix, shape [out_rows, in_cols], row-major
+// X: input matrix,  shape [in_cols, n_cols],   row-major
+// Y: output matrix, shape [out_rows, n_cols],  row-major (caller-allocated)
+//
+// All three tensors hold sp_ok_t elements. Y's data is overwritten.
+// Y.scale_recip is set to W.scale_recip * X.scale_recip;
+// Y.frobenius_scale is set to W.frobenius_scale * X.frobenius_scale.
+//
+// Returns true on success, false on shape mismatch or null data.
+bool sp_matmul_ok(const sp_ok_tensor& W,
+                   const sp_ok_tensor& X,
+                   sp_ok_tensor&       Y);
+
+// -----------------------------------------------------------------------
+// O_K @ O_K → fp32 matmul (bridge to softmax/silu).
+// -----------------------------------------------------------------------
+//
+// Same shapes as above. Y_fp32 is [out_rows, n_cols] caller-allocated
+// fp32 buffer. Internally accumulates the O_K dot product into the
+// a-coordinate of an sp_ok_t scratch, then decodes:
+//
+//   Y_fp32[i,j] = (sp_ok_dot_product_a) /
+//                 (W.scale_recip * X.scale_recip *
+//                  W.frobenius_scale * X.frobenius_scale)
+//
+// This is the bridge for layers that feed into a non-O_K operation
+// (softmax, silu). The Frobenius scale is correctly divided out so the
+// downstream nonlinearity sees the original fp32 product (to ULP).
+bool sp_matmul_ok_to_fp32(const sp_ok_tensor& W,
+                           const sp_ok_tensor& X,
+                           float*              Y_fp32,
+                           int                 out_rows,
+                           int                 n_cols);
+
+// -----------------------------------------------------------------------
+// Convenience: matmul where weights are O_K but input is fp32.
+// Used at the boundary where fp32 activations from softmax/silu feed
+// back into an O_K linear projection.
+// -----------------------------------------------------------------------
+//
+// W: O_K weight matrix [out_rows, in_cols]
+// X_fp32: fp32 input matrix [in_cols, n_cols], row-major
+// Y: O_K output [out_rows, n_cols]
+//
+// Y.scale_recip carries forward from W; Y.frobenius_scale carries from W.
+// Internally re-encodes X_fp32 to a per-call scale matching W's scale.
+bool sp_matmul_fp32_input_to_ok(const sp_ok_tensor& W,
+                                  const float*        X_fp32,
+                                  int                 in_cols,
+                                  int                 n_cols,
+                                  sp_ok_tensor&       Y);
+
+}  // namespace sp::engine

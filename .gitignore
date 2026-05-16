@@ -58,3 +58,5 @@ build_sp_engine_bin.bat
 build_tests.bat
 
 build_test_load_shim.bat
+
+build_test_matmul.bat

@@ -71,3 +71,8 @@ add_test(NAME sp_encode COMMAND test_sp_encode)
 add_executable(test_sp_load_shim test_sp_load_shim.cpp)
 target_link_libraries(test_sp_load_shim PRIVATE sp_engine)
 add_test(NAME sp_load_shim COMMAND test_sp_load_shim)
+
+# ─── SP native O_K matmul (Phase 2.0) ──────────────────────────────────
+add_executable(test_sp_matmul test_sp_matmul.cpp)
+target_link_libraries(test_sp_matmul PRIVATE sp_engine)
+add_test(NAME sp_matmul COMMAND test_sp_matmul)
