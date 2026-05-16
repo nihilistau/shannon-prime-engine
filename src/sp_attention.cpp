@@ -73,10 +73,11 @@ void sp_attention_dot_product(const sp_ok_tensor& q,
     const int pos_offset = (pos_offset_arg < 0)
                              ? (int)(T_valid - n_q) : pos_offset_arg;
 
-    // Combined divisor for QK^T dot product.
-    const double qk_divisor = (double)k.scale_recip * (double)q.scale_recip *
-                               (double)k.frobenius_scale * (double)q.frobenius_scale;
-    if (qk_divisor == 0.0) return;
+    // Sanity check on the per-side divisors (per-element decode happens
+    // inside the inner loop now — the old single qk_divisor would have
+    // overflowed double for head_dim>=256).
+    if (q.scale_recip == 0 || q.frobenius_scale == 0 ||
+        k.scale_recip == 0 || k.frobenius_scale == 0) return;
 
     // V divisor.
     const double v_divisor = (double)v.scale_recip * (double)v.frobenius_scale;
@@ -110,19 +111,41 @@ void sp_attention_dot_product(const sp_ok_tensor& q,
                 ? std::max(0, q_pos - swa_window + 1)
                 : 0;
 
-            // 1) scores[t] = (K_h[t]^T · q_h[qi]) / sqrt(head_dim)
+            // 1) scores[t] = (K_h[t]^T · q_h[qi]) / sqrt(head_dim).
+            //
+            // Phase 3.x bugfix: the previous int64 accumulator
+            // overflowed at head_dim ≥ 256 because q.a * k.a is ~2^56
+            // per element, summed over 256 entries → 2^64 wraps. By
+            // the time attention runs, Q and K already have
+            // frobenius_scale = 1 (RoPE reset), so there's no
+            // Theorem-4 reason to keep the multiplication in the
+            // integer domain — just decode to fp64 per element and
+            // accumulate. Matches what sp_attention_poly_ring does
+            // and what the unit test always assumed.
+            const double q_div_inner = (double)q.scale_recip *
+                                          (double)q.frobenius_scale;
+            const double k_div_inner = (double)k.scale_recip *
+                                          (double)k.frobenius_scale;
             for (int64_t t = 0; t < T_valid; ++t) {
-                int64_t acc_a = 0;
+                double acc = 0.0;
                 for (int d = 0; d < head_dim; ++d) {
                     const sp_ok_t& k_dt =
                         k.data[((int64_t)kv_h * head_dim + d) * T_stride + t];
                     const sp_ok_t& q_d  =
                         q.data[((int64_t)h    * head_dim + d) * n_q + qi];
-                    acc_a += k_dt.a * q_d.a
-                           - SP_OK_OMEGA_NORM * k_dt.b * q_d.b;
+                    double k_val = (double)k_dt.a / k_div_inner;
+                    double q_val = (double)q_d.a  / q_div_inner;
+                    acc += q_val * k_val;
+                    // b-component coupling (sp_ok_mul). After RoPE both
+                    // b's are 0 so this is normally a no-op, but keep
+                    // the path for correctness in pre-RoPE flows.
+                    if (k_dt.b != 0 || q_d.b != 0) {
+                        double k_b = (double)k_dt.b / k_div_inner;
+                        double q_b = (double)q_d.b  / q_div_inner;
+                        acc -= (double)SP_OK_OMEGA_NORM * k_b * q_b;
+                    }
                 }
-                scores[t] = (float)(((double)acc_a / qk_divisor)
-                                    * (double)inv_sqrt_d);
+                scores[t] = (float)(acc * (double)inv_sqrt_d);
             }
 
             // 2a) Apply logit softcap BEFORE masking so the masked positions
