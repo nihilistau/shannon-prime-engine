@@ -81,3 +81,8 @@ add_test(NAME sp_matmul COMMAND test_sp_matmul)
 add_executable(test_sp_bridges test_sp_bridges.cpp)
 target_link_libraries(test_sp_bridges PRIVATE sp_engine)
 add_test(NAME sp_bridges COMMAND test_sp_bridges)
+
+# ─── SP attention + FFN core kernels (Phase 2.2a) ─────────────────────
+add_executable(test_sp_attention_ffn test_sp_attention_ffn.cpp)
+target_link_libraries(test_sp_attention_ffn PRIVATE sp_engine)
+add_test(NAME sp_attention_ffn COMMAND test_sp_attention_ffn)
