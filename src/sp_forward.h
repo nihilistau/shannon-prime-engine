@@ -88,19 +88,14 @@ struct sp_forward_context {
     //   1 = CKKS polynomial-ring (Z[x]/(x^N+1) negacyclic convolution)
     int    attn_mode            = 0;
 
-    // Phase 7: persistent NTT-domain K cache (only allocated when
-    // attn_mode == 1 AND SP_ENGINE_POLY_NTT_K_PERSIST=1). Sized
-    // [n_layers * n_kv_head * n_ctx * SP_NTT_N] uint64s. Populated at
-    // each K-append site; consumed by sp_attention_poly_ring via its
-    // k_ntt_slab parameter. Empty means "off".
-    std::vector<uint64_t> k_ntt_cache;
-    bool                  k_ntt_persist = false;
-
-    // Phase 9b: dual-prime CRT NTT-domain K cache (SoA layout). When
-    // SP_ENGINE_POLY_NTT_CRT=1, the engine routes attention through the
-    // CRT path; both slabs are populated at K-append time and read
-    // together at attention time. Each slab is sized identically to the
-    // 60-bit k_ntt_cache. Empty means "off".
+    // Phase 9b (post Plan C): dual-prime CRT NTT-domain K cache is now
+    // the only NTT path the engine calls. SoA layout, two parallel
+    // slabs sized [n_layers * n_kv_head * n_ctx * SP_NTT_CRT_N] uint64s.
+    // Populated at K-append time, read by sp_attention_poly_ring under
+    // SP_ENGINE_POLY_NTT_CRT=1 (default-on when SP_ENGINE_POLY_NTT=1).
+    // The 60-bit single-prime sp_ntt path is kept only as the parity
+    // test reference (see test_sp_ntt + test_sp_ntt_crt); engine never
+    // calls into it. Empty slabs means "scalar O(N^2) fallback".
     std::vector<uint64_t> k_ntt_cache_q1;
     std::vector<uint64_t> k_ntt_cache_q2;
     bool                  k_ntt_crt = false;

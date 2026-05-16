@@ -31,7 +31,6 @@
 
 extern "C" {
 #include "../lib/shannon-prime/core/sp_poly_ring.h"
-#include "../lib/shannon-prime/core/sp_ntt.h"
 #include "../lib/shannon-prime/core/sp_ntt_crt.h"
 }
 
@@ -235,7 +234,6 @@ void sp_attention_poly_ring(const sp_ok_tensor& q,
                               int   pos_offset_arg,
                               int   swa_window,
                               float attn_logit_softcap,
-                              const uint64_t* k_ntt_slab,
                               const uint64_t* k_ntt_slab_q1,
                               const uint64_t* k_ntt_slab_q2) {
     if (q.data == nullptr || k.data == nullptr || v.data == nullptr ||
@@ -296,78 +294,41 @@ void sp_attention_poly_ring(const sp_ok_tensor& q,
     std::vector<float> scores(T_valid);
     std::vector<float> weights(T_valid);
 
-    // Phase 4: NTT-accelerated polynomial multiply when N matches the
-    // pre-computed constant tables (SP_NTT_N = 256, q ≈ 2^60). Opt-in
-    // via SP_ENGINE_POLY_NTT=1; falls back to O(N^2) sp_poly_dot_product
-    // otherwise. Logged once per process.
+    // Phase 9b (post Plan C): NTT path is the CRT pipeline, gated by
+    // SP_ENGINE_POLY_NTT=1 (defaulted on by main.cpp when attn_mode==1).
+    // Falls back to scalar sp_poly_dot_product when off or when the
+    // dual K-cache slabs are not supplied.
     static const bool g_use_ntt = []() {
         const char* env = std::getenv("SP_ENGINE_POLY_NTT");
-        bool enabled = env && env[0] && env[0] != '0';
+        bool enabled = (env == nullptr) || (env[0] && env[0] != '0');
         if (enabled) {
-            std::fprintf(stderr, "[sp-attention] POLY_RING NTT path ENABLED "
-                "(SP_NTT_N=%d, q=%llu)\n",
-                (int)SP_NTT_N, (unsigned long long)SP_NTT_Q);
+            std::fprintf(stderr,
+                "[sp-attention] POLY_RING CRT path ENABLED "
+                "(N=%d, q1=%llu, q2=%llu)\n",
+                (int)SP_NTT_CRT_N,
+                (unsigned long long)SP_NTT_CRT_Q1,
+                (unsigned long long)SP_NTT_CRT_Q2);
         }
         return enabled;
     }();
-    const bool use_ntt_here = g_use_ntt && (N == SP_NTT_N);
-    // Phase 9b: route through the CRT NTT path when both dual slabs are
-    // supplied AND the ring size matches. The CRT path is preferred over
-    // the 60-bit single-prime path when active because it has no
-    // __int128 dependency.
+    // Phase 9b (post Plan C): the CRT NTT path is the only NTT path
+    // the engine calls. When both dual slabs are supplied AND head_dim
+    // fits the ring, route through CRT. Otherwise fall back to scalar
+    // sp_poly_dot_product (the O(N^2) baseline).
     const bool use_crt_here =
         g_use_ntt && (head_dim <= SP_NTT_CRT_N)
         && (k_ntt_slab_q1 != nullptr) && (k_ntt_slab_q2 != nullptr);
-    // Phase 5b: hoist NTT(Q) out of the per-t inner loop. Phase 6: also
-    // pre-NTT every K once per call into K_ntt_cache so the (qi, t) inner
-    // loop is just pointwise multiply + inverse + extract. K's NTT only
-    // depends on (kv_h, t), not on (h, qi), so each K is transformed once
-    // and reused across all queries in this attention call.
-    std::vector<int64_t>  ntt_Q_int_scratch;       // [SP_NTT_N]
-    std::vector<uint64_t> ntt_Q_buf;               // [SP_NTT_N]
-    std::vector<int64_t>  ntt_K_int_scratch;       // [SP_NTT_N]
-    std::vector<uint64_t> ntt_C_buf;               // [SP_NTT_N]
-    std::vector<uint64_t> K_ntt_cache;             // [n_kv_head * T_valid * SP_NTT_N]
-    std::vector<float>    k_decode_buf;            // [head_dim]
-    // Phase 9b CRT scratch (dual-universe Q + per-call inverse buffers).
-    std::vector<int64_t>  crt_int_scratch;         // [SP_NTT_CRT_N] shared encoder workspace
-    std::vector<uint64_t> crt_Q_q1;                // [SP_NTT_CRT_N]
-    std::vector<uint64_t> crt_Q_q2;                // [SP_NTT_CRT_N]
-    std::vector<uint64_t> crt_c_q1;                // [SP_NTT_CRT_N]
-    std::vector<uint64_t> crt_c_q2;                // [SP_NTT_CRT_N]
+    std::vector<int64_t>  crt_int_scratch;
+    std::vector<uint64_t> crt_Q_q1;
+    std::vector<uint64_t> crt_Q_q2;
+    std::vector<uint64_t> crt_c_q1;
+    std::vector<uint64_t> crt_c_q2;
     if (use_crt_here) {
         crt_int_scratch.assign(SP_NTT_CRT_N, 0);
         crt_Q_q1.assign(SP_NTT_CRT_N, 0);
         crt_Q_q2.assign(SP_NTT_CRT_N, 0);
         crt_c_q1.assign(SP_NTT_CRT_N, 0);
         crt_c_q2.assign(SP_NTT_CRT_N, 0);
-    }
-    if (use_ntt_here && !use_crt_here) {
-        ntt_Q_int_scratch.assign(SP_NTT_N, 0);
-        ntt_Q_buf.assign(SP_NTT_N, 0);
-        ntt_K_int_scratch.assign(SP_NTT_N, 0);
-        ntt_C_buf.assign(SP_NTT_N, 0);
-        if (k_ntt_slab == nullptr) {
-            // Phase 6: in-call build of the K-NTT cache.
-            K_ntt_cache.assign((size_t)n_kv_head * (size_t)T_valid * (size_t)SP_NTT_N, 0);
-            k_decode_buf.assign(head_dim, 0.0f);
-            for (int kvh = 0; kvh < n_kv_head; ++kvh) {
-                for (int64_t t = 0; t < T_valid; ++t) {
-                    for (int d = 0; d < head_dim; ++d) {
-                        const sp_ok_t& k_dt =
-                            k.data[((int64_t)kvh * head_dim + d) * T_stride + t];
-                        k_decode_buf[d] = (float)((double)k_dt.a / k_div);
-                    }
-                    uint64_t* slot = K_ntt_cache.data() +
-                        ((size_t)kvh * (size_t)T_valid + (size_t)t) * (size_t)SP_NTT_N;
-                    sp_poly_encode_ntt_k_reversed(slot, k_decode_buf.data(),
-                                                  head_dim, delta,
-                                                  ntt_K_int_scratch.data());
-                }
-            }
-        }
-        // Else: Phase 7 — caller supplied a persistent slab. We index into it
-        // directly at (kvh * T_stride + t) * SP_NTT_N during the inner loop.
     }
 
     for (int h = 0; h < n_head; ++h) {
@@ -383,13 +344,8 @@ void sp_attention_poly_ring(const sp_ok_tensor& q,
                 q_vec[d] = (float)((double)q_d.a / q_div);
             }
 
-            // Phase 5b: hoist NTT(Q) once per (h, qi).
-            if (use_ntt_here && !use_crt_here) {
-                sp_poly_encode_ntt_q(ntt_Q_buf.data(),
-                                     q_vec.data(), head_dim, delta,
-                                     ntt_Q_int_scratch.data());
-            }
-            // Phase 9b: dual-universe Q-encode + forward NTT once per (h, qi).
+            // Phase 9b (post Plan C): dual-universe Q-encode + forward
+            // NTT once per (h, qi). Reused for every t in the inner loop.
             if (use_crt_here) {
                 sp_poly_encode_ntt_q_crt(crt_Q_q1.data(), crt_Q_q2.data(),
                                           q_vec.data(), head_dim, delta,
@@ -424,17 +380,6 @@ void sp_attention_poly_ring(const sp_ok_tensor& q,
                             q_vec.data(), k_vec.data(), head_dim, N, delta,
                             poly_scratch.data());
                     }
-                } else if (use_ntt_here) {
-                    const uint64_t* K_ntt = (k_ntt_slab != nullptr)
-                        // Phase 7: persistent slab, indexed by t_stride.
-                        ? (k_ntt_slab +
-                            ((size_t)kv_h * (size_t)T_stride + (size_t)t) * (size_t)SP_NTT_N)
-                        // Phase 6: in-call cache, indexed by T_valid.
-                        : (K_ntt_cache.data() +
-                            ((size_t)kv_h * (size_t)T_valid + (size_t)t) * (size_t)SP_NTT_N);
-                    dot = sp_poly_dot_product_ntt_qk_cached(
-                        ntt_Q_buf.data(), K_ntt, head_dim, delta,
-                        ntt_C_buf.data());
                 } else {
                     // Decode K for this (kv_h, t) only on the fallback path.
                     for (int d = 0; d < head_dim; ++d) {

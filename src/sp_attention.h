@@ -86,18 +86,12 @@ void sp_attention_weil_pairing(const sp_ok_tensor& q,
 // inside per (qi, t) pair, with N picked as the smallest power of 2 ≥
 // head_dim (typically N = 2*head_dim).
 // =========================================================================
-// Phase 7 optional: persistent K-NTT slab. When non-null, the caller is
-// asserting that for every (kv_h, t) in [0, T_valid), the slot at offset
-// (kv_h * t_stride + t) * SP_NTT_N already holds the forward NTT of the
-// reversed-encoded K at that position. The attention function then skips
-// the K decode + encode + forward NTT and goes straight to the pointwise
-// multiply. When null (default), Phase 6 in-call build is used.
-//
-// Phase 9b optional: dual CRT slabs. When BOTH k_ntt_slab_q1 and
-// k_ntt_slab_q2 are non-null, attention routes through the CRT NTT
-// path (no __int128, portable to any 64-bit ALU). Their slot offset
-// is (kv_h * t_stride + t) * SP_NTT_CRT_N within each slab. Takes
-// precedence over the single-prime k_ntt_slab when both are supplied.
+// Phase 9b (post Plan C) — the CRT NTT path is the only NTT path the
+// engine calls. When BOTH k_ntt_slab_q1 and k_ntt_slab_q2 are non-null,
+// attention routes through the CRT pipeline (no __int128, portable to
+// any 64-bit ALU). Their slot offset is (kv_h * t_stride + t) *
+// SP_NTT_CRT_N within each slab. When the slabs are null, attention
+// falls back to scalar sp_poly_dot_product (O(N^2), correct but slow).
 void sp_attention_poly_ring(const sp_ok_tensor& q,
                               const sp_ok_tensor& k,
                               const sp_ok_tensor& v,
@@ -108,7 +102,6 @@ void sp_attention_poly_ring(const sp_ok_tensor& q,
                               int   pos_offset           = -1,
                               int   swa_window           = 0,
                               float attn_logit_softcap   = 0.0f,
-                              const uint64_t* k_ntt_slab    = nullptr,
                               const uint64_t* k_ntt_slab_q1 = nullptr,
                               const uint64_t* k_ntt_slab_q2 = nullptr);
 
