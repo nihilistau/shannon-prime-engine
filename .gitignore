@@ -60,3 +60,5 @@ build_tests.bat
 build_test_load_shim.bat
 
 build_test_matmul.bat
+
+build_test_bridges.bat

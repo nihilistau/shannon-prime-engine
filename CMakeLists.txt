@@ -410,6 +410,7 @@ add_library(sp_engine STATIC
     src/sp_ok_encode.cpp
     src/sp_load_shim.cpp
     src/sp_matmul.cpp
+    src/sp_bridges.cpp
     src/sp_forward.cpp
     src/sp_attention.cpp
     src/sp_ffn.cpp

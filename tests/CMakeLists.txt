@@ -76,3 +76,8 @@ add_test(NAME sp_load_shim COMMAND test_sp_load_shim)
 add_executable(test_sp_matmul test_sp_matmul.cpp)
 target_link_libraries(test_sp_matmul PRIVATE sp_engine)
 add_test(NAME sp_matmul COMMAND test_sp_matmul)
+
+# ─── SP fp32 bridges (Phase 2.1) ──────────────────────────────────────
+add_executable(test_sp_bridges test_sp_bridges.cpp)
+target_link_libraries(test_sp_bridges PRIVATE sp_engine)
+add_test(NAME sp_bridges COMMAND test_sp_bridges)
