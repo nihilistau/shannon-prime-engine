@@ -109,3 +109,19 @@ add_test(NAME sp_weights_loader COMMAND test_sp_weights_loader)
 add_executable(test_sp_forward_step test_sp_forward_step.cpp)
 target_link_libraries(test_sp_forward_step PRIVATE sp_engine)
 add_test(NAME sp_forward_step COMMAND test_sp_forward_step)
+
+# ─── SP Phase 3 part 1: elliptic-curve + Weil pairing math core ────────
+# Standalone — compiles the C source directly so the test can run
+# even if the rest of sp_engine has a regression.
+add_executable(test_sp_ec_weil
+    test_sp_ec_weil.cpp
+    ../lib/shannon-prime/core/sp_ec_weil.c
+)
+target_include_directories(test_sp_ec_weil PRIVATE
+    ../lib/shannon-prime/core
+)
+set_target_properties(test_sp_ec_weil PROPERTIES
+    C_STANDARD 11
+    CXX_STANDARD 17
+)
+add_test(NAME sp_ec_weil COMMAND test_sp_ec_weil)
