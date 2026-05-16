@@ -116,13 +116,16 @@ void sp_ok_tensor_scalar_mul(sp_ok_tensor& t, sp_ok_t scalar) {
     }
 }
 
-void sp_ok_tensor_add_inplace(sp_ok_tensor& t, const sp_ok_tensor& other) {
+bool sp_ok_tensor_add_inplace(sp_ok_tensor& t, const sp_ok_tensor& other) {
     int64_t n = t.numel();
     int64_t no = other.numel();
-    if (no != n) return;  // silent shape mismatch — caller should check
+    if (no != n) return false;
+    if (t.scale_recip      != other.scale_recip)      return false;
+    if (t.frobenius_scale  != other.frobenius_scale)  return false;
     for (int64_t i = 0; i < n; ++i) {
         t.data[i] = sp_ok_add(t.data[i], other.data[i]);
     }
+    return true;
 }
 
 void sp_ok_tensor_negate(sp_ok_tensor& t) {

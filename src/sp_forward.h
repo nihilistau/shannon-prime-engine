@@ -15,6 +15,7 @@
 #pragma once
 
 #include "sp_ok_tensor.h"
+#include "sp_kv_cache_ok.h"
 #include "engine.h"
 
 #include <cstddef>
@@ -24,30 +25,50 @@
 namespace sp::engine {
 
 // -----------------------------------------------------------------------
-// sp_forward_context — per-request inference state. Holds the residual
-// stream, KV cache, current layer index, working arena.
+// sp_forward_context — per-request inference state.
+//
+// The residual stream lives in fp32 (`x_fp32`). At the start of each
+// layer we encode it into the O_K mirror `x_ok` for the RMSNorm + Q/K/V
+// matmuls. The output projections (Wo, ffn_down) run through
+// sp_matmul_ok_to_fp32 so their Frobenius factor is divided out cleanly,
+// and the result lands directly in fp32 for residual addition. This is
+// the design called out in the Phase 2.2d watchout: every residual-add
+// crosses through an explicit fp32 island so scale_recip / frobenius_
+// scale mismatches can never silently corrupt the stream.
 // -----------------------------------------------------------------------
 struct sp_forward_context {
-    sp_ok_tensor x;          // residual stream  [n_embd, batch]
-    sp_ok_tensor x_norm;     // post-RMSNorm scratch
-    sp_ok_tensor q;          // Q-projection scratch
-    sp_ok_tensor k;          // K-projection scratch
-    sp_ok_tensor v;          // V-projection scratch
-    sp_ok_tensor attn_out;   // attention output scratch
-    sp_ok_tensor ffn_out;    // FFN output scratch
+    // fp32 residual stream [n_tokens * n_embd].
+    std::vector<float> x_fp32;
+    // fp32 buffers for post-projection output (n_tokens * n_embd).
+    std::vector<float> proj_out_fp32;
+    // fp32 buffer for the final logits [vocab].
+    std::vector<float> logits_fp32;
 
-    sp_ok_arena  arena;      // per-step scratch arena (reset between layers)
+    // Per-layer working tensors (mirrors of x_fp32 in O_K + matmul scratch).
+    sp_ok_tensor x_ok;         // encoded residual stream, scale_recip=S, frob=1
+    sp_ok_tensor x_norm_ok;    // post-RMSNorm
+    sp_ok_tensor q_ok;
+    sp_ok_tensor k_ok;
+    sp_ok_tensor v_ok;
+    sp_ok_tensor attn_out_ok;
+    sp_ok_arena  layer_arena;  // reset per layer
 
-    int          n_layers;
-    int          n_embd;
-    int          n_head;
-    int          n_kv_head;
-    int          head_dim;
+    // KV cache (lives across decode steps).
+    sp_ok_kv_cache kv_cache;
+    sp_ok_arena    kv_arena;
+
+    int     n_layers   = 0;
+    int     n_embd     = 0;
+    int     n_head     = 0;
+    int     n_kv_head  = 0;
+    int     head_dim   = 0;
+    int     n_ctx      = 0;       // max cache len
+    int64_t residual_scale = 0;   // scale_recip for x_ok encoding
+    float   rms_eps    = 1e-5f;
+    float   rope_base  = 10000.0f;
 
     // Poncelet adaptive depth tracking (Paper A §7, Theorem 5).
-    // Partial sum of layer-endomorphisms in O_K. When the partial sum
-    // vanishes modulo the working prime, sp_forward_step exits early.
-    sp_ok_t      poncelet_delta;
+    sp_ok_t poncelet_delta = sp_ok_t{ 0, 0 };
 };
 
 // -----------------------------------------------------------------------
@@ -94,22 +115,46 @@ struct sp_weights {
 
 // Run a single forward step: given a token id, produce logits[vocab].
 //
-// Phase 1.6 SKELETON: this delegates to forward.cpp with weights that
-// have been encoded → Frobenius-applied → decoded back to fp16. The
-// "pure" sp_forward (no decode step) is Phase 2 work.
-void sp_forward_step(sp_forward_context& ctx,
+// Phase 2.2d (LIVE):
+//   1. Embedding lookup: weights.tok_embed[token_id] → x_fp32 (n_embd)
+//   2. For each layer L:
+//      a. encode x_fp32 → x_ok (scale_recip=residual_scale, frob=1)
+//      b. x_norm_ok = sp_rmsnorm_native(x_ok, attn_norm_w[L])
+//      c. q_ok = Wq[L] @ x_norm_ok  (frob=pi^k)
+//         k_ok = Wk[L] @ x_norm_ok  (frob=pi^k)
+//         v_ok = Wv[L] @ x_norm_ok  (frob=pi^k)
+//      d. sp_rope_apply_ok(q_ok); sp_rope_apply_ok(k_ok)   (frob → 1)
+//      e. kv_cache.append(L, k_ok, v_ok)
+//      f. attn_out_ok = attention(q_ok, K_view, V_view, ...)  (frob=1)
+//      g. wo_out_fp32 = sp_matmul_ok_to_fp32(Wo[L], attn_out_ok)
+//      h. x_fp32 += wo_out_fp32                            (residual)
+//      i. encode x_fp32 → x_ok
+//      j. x_norm2_ok = sp_rmsnorm_native(x_ok, ffn_norm_w[L])
+//      k. ffn_out_fp32 = sp_ffn_swiglu_to_fp32(x_norm2_ok, gate, up, down)
+//      l. x_fp32 += ffn_out_fp32                           (residual)
+//   3. encode x_fp32 → x_ok
+//   4. x_final_ok = sp_rmsnorm_native(x_ok, final_norm_w)
+//   5. logits_fp32 = sp_matmul_ok_to_fp32(lm_head, x_final_ok)
+//   6. write logits_fp32 → logits_out
+//
+// Single-token mode (n_tokens=1). Multi-token prefill lands in 2.2d2.
+bool sp_forward_step(sp_forward_context& ctx,
                      const sp_weights&   weights,
                      int                 token_id,
                      int                 position,
                      std::vector<float>& logits_out);
 
-// Initialize a forward context for a given model.
-void sp_forward_context_init(sp_forward_context& ctx,
-                              const Config&       cfg,
-                              int                 n_embd,
-                              int                 n_layers,
-                              int                 n_head,
-                              int                 n_kv_head);
+// Initialize a forward context for a given model. Allocates KV cache,
+// scratch arenas, and the residual-stream buffers. Reads V's expected
+// frobenius_scale from weights.wv[0] so the V cache slot matches.
+//
+// `n_ctx`: maximum KV cache length (typically Config::n_ctx).
+// `rope_base`, `rms_eps`: per-model hyperparameters.
+bool sp_forward_context_init(sp_forward_context& ctx,
+                              const sp_weights&   weights,
+                              int                 n_ctx,
+                              float               rope_base = 10000.0f,
+                              float               rms_eps   = 1e-5f);
 
 // Initialize sp_weights by encoding fp16 weights from a loaded model.
 // Returns true on success. Weights remain valid for the lifetime of

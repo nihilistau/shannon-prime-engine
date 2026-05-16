@@ -104,3 +104,8 @@ add_test(NAME sp_weights COMMAND test_sp_weights)
 add_executable(test_sp_weights_loader test_sp_weights_loader.cpp)
 target_link_libraries(test_sp_weights_loader PRIVATE sp_engine)
 add_test(NAME sp_weights_loader COMMAND test_sp_weights_loader)
+
+# ─── SP Phase 2.2d: sp_forward_step — native O_K end-to-end forward pass ─
+add_executable(test_sp_forward_step test_sp_forward_step.cpp)
+target_link_libraries(test_sp_forward_step PRIVATE sp_engine)
+add_test(NAME sp_forward_step COMMAND test_sp_forward_step)

@@ -19,6 +19,7 @@
 #include "sp_ffn.h"
 #include "sp_matmul.h"
 #include "sp_bridges.h"
+#include "sp_ok_encode.h"
 
 #include <cstdio>
 #include <vector>
@@ -70,6 +71,67 @@ void sp_ffn_swiglu(const sp_ok_tensor& x,
         std::fprintf(stderr, "[sp_ffn] down matmul failed\n");
         return;
     }
+}
+
+// =========================================================================
+// sp_ffn_swiglu_to_fp32 — Phase 2.2d residual-bound path.
+//
+// Same as sp_ffn_swiglu but the final down-projection writes to fp32 via
+// sp_matmul_ok_to_fp32 so down_w's Frobenius factor is divided out at
+// the matmul boundary. The output is in original (un-shimmed) fp32 units
+// — caller can residual-add directly against the fp32 residual stream.
+// =========================================================================
+
+bool sp_ffn_swiglu_to_fp32(const sp_ok_tensor& x,
+                            const sp_ok_tensor& gate_w,
+                            const sp_ok_tensor& up_w,
+                            const sp_ok_tensor& down_w,
+                            float*              out_fp32,
+                            int                 n_tokens,
+                            sp_ok_arena&        scratch_arena) {
+    if (x.data == nullptr || gate_w.data == nullptr || up_w.data == nullptr ||
+        down_w.data == nullptr || out_fp32 == nullptr) return false;
+    const int n_embd = (int)gate_w.shape[0];
+    const int d_ff   = (int)gate_w.shape[1];
+    if (n_embd <= 0 || d_ff <= 0 || n_tokens <= 0) return false;
+    if (up_w.shape[0] != n_embd || up_w.shape[1] != d_ff) return false;
+    if (down_w.shape[0] != d_ff || down_w.shape[1] != n_embd) return false;
+    if (x.shape[0] != n_tokens || x.shape[1] != n_embd) return false;
+
+    // For each token we run the SwiGLU activation independently; the
+    // down-projection then absorbs all tokens at once via matmul.
+    std::vector<float> gate_all(d_ff * n_tokens);
+    std::vector<float> up_all(d_ff * n_tokens);
+    std::vector<float> act_all(d_ff * n_tokens);
+
+    if (!sp_matmul_ok_to_fp32(gate_w, x, gate_all.data(), d_ff, n_tokens)) {
+        return false;
+    }
+    if (!sp_matmul_ok_to_fp32(up_w, x, up_all.data(), d_ff, n_tokens)) {
+        return false;
+    }
+    // SwiGLU per element across the whole (d_ff * n_tokens) block —
+    // gate / up have the same layout, silu is pointwise.
+    sp_silu_bridge(gate_all.data(), up_all.data(), d_ff * n_tokens, act_all.data());
+
+    // Encode the post-silu activation as O_K so we can run
+    // sp_matmul_ok_to_fp32(down_w, act_ok, ...) → fp32 out with Frobenius
+    // automatically absorbed.
+    sp_ok_tensor act_ok;
+    int64_t act_shape[4] = { n_tokens, d_ff, 1, 1 };
+    if (!sp_ok_encode_from_fp32(act_ok, act_all.data(), 2, act_shape,
+                                  /*scale*/ down_w.scale_recip,
+                                  scratch_arena)) {
+        return false;
+    }
+    // act_ok.frobenius_scale = 1.
+    // sp_matmul_ok_to_fp32 divides by down_w.scale_recip * act_ok.scale_recip
+    //                              * down_w.frobenius_scale * 1
+    // which gives us fp32 in the original units.
+    if (!sp_matmul_ok_to_fp32(down_w, act_ok, out_fp32, n_embd, n_tokens)) {
+        return false;
+    }
+    return true;
 }
 
 }  // namespace sp::engine

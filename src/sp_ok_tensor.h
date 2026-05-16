@@ -121,8 +121,16 @@ void sp_ok_tensor_scalar_mul(sp_ok_tensor& t, sp_ok_t scalar);
 
 // In-place element-wise addition.
 //   t[i] = t[i] + other[i]
-// Shapes must match.
-void sp_ok_tensor_add_inplace(sp_ok_tensor& t, const sp_ok_tensor& other);
+// Shapes, scale_recip, AND frobenius_scale must all match — otherwise
+// the addition is semantically invalid (Theorem 4 cancellation only
+// works when both operands share the same scale). Returns false on
+// any mismatch and leaves `t` unchanged.
+//
+// For residual stream + (Wo @ attn_out) where the projections produce
+// pi^k-scaled outputs, the caller must first decode to fp32 (via
+// sp_matmul_ok_to_fp32) and add in fp32 — DO NOT use this function
+// across mismatched scales.
+bool sp_ok_tensor_add_inplace(sp_ok_tensor& t, const sp_ok_tensor& other);
 
 // In-place negation.
 void sp_ok_tensor_negate(sp_ok_tensor& t);
