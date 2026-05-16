@@ -172,3 +172,18 @@ set_target_properties(test_sp_poly_attention PROPERTIES
     CXX_STANDARD 17
 )
 add_test(NAME sp_poly_attention COMMAND test_sp_poly_attention)
+
+# ─── SP Phase 4: NTT parity test (sp_poly_mul_ntt vs O(N^2) baseline) ──
+add_executable(test_sp_ntt
+    test_sp_ntt.cpp
+    ../lib/shannon-prime/core/sp_poly_ring.c
+    ../lib/shannon-prime/core/sp_ntt.c
+)
+target_include_directories(test_sp_ntt PRIVATE
+    ../lib/shannon-prime/core
+)
+set_target_properties(test_sp_ntt PROPERTIES
+    C_STANDARD 11
+    CXX_STANDARD 17
+)
+add_test(NAME sp_ntt COMMAND test_sp_ntt)
