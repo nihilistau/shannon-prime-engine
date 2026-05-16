@@ -31,11 +31,13 @@
 
 extern "C" {
 #include "../lib/shannon-prime/core/sp_poly_ring.h"
+#include "../lib/shannon-prime/core/sp_ntt.h"
 }
 
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>   // getenv
 #include <limits>
 #include <vector>
 
@@ -290,6 +292,28 @@ void sp_attention_poly_ring(const sp_ok_tensor& q,
     std::vector<float> scores(T_valid);
     std::vector<float> weights(T_valid);
 
+    // Phase 4: NTT-accelerated polynomial multiply when N matches the
+    // pre-computed constant tables (SP_NTT_N = 256, q ≈ 2^60). Opt-in
+    // via SP_ENGINE_POLY_NTT=1; falls back to O(N^2) sp_poly_dot_product
+    // otherwise. Logged once per process.
+    static const bool g_use_ntt = []() {
+        const char* env = std::getenv("SP_ENGINE_POLY_NTT");
+        bool enabled = env && env[0] && env[0] != '0';
+        if (enabled) {
+            std::fprintf(stderr, "[sp-attention] POLY_RING NTT path ENABLED "
+                "(SP_NTT_N=%d, q=%llu)\n",
+                (int)SP_NTT_N, (unsigned long long)SP_NTT_Q);
+        }
+        return enabled;
+    }();
+    const bool use_ntt_here = g_use_ntt && (N == SP_NTT_N);
+    std::vector<int64_t>  ntt_int_scratch;
+    std::vector<uint64_t> ntt_u64_scratch;
+    if (use_ntt_here) {
+        ntt_int_scratch.assign(2 * SP_NTT_N, 0);
+        ntt_u64_scratch.assign(3 * SP_NTT_N, 0);
+    }
+
     for (int h = 0; h < n_head; ++h) {
         const int kv_h = (h * n_kv_head) / n_head;
 
@@ -315,9 +339,24 @@ void sp_attention_poly_ring(const sp_ok_tensor& q,
                         k.data[((int64_t)kv_h * head_dim + d) * T_stride + t];
                     k_vec[d] = (float)((double)k_dt.a / k_div);
                 }
-                float dot = sp_poly_dot_product(
-                    q_vec.data(), k_vec.data(), head_dim, N, delta,
-                    poly_scratch.data());
+                float dot;
+                if (use_ntt_here) {
+                    int ok = 0;
+                    dot = sp_poly_dot_product_ntt(
+                        q_vec.data(), k_vec.data(), head_dim, delta,
+                        ntt_int_scratch.data(), ntt_u64_scratch.data(),
+                        &ok);
+                    if (!ok) {
+                        // Should not happen — head_dim ≤ N == SP_NTT_N.
+                        dot = sp_poly_dot_product(
+                            q_vec.data(), k_vec.data(), head_dim, N, delta,
+                            poly_scratch.data());
+                    }
+                } else {
+                    dot = sp_poly_dot_product(
+                        q_vec.data(), k_vec.data(), head_dim, N, delta,
+                        poly_scratch.data());
+                }
                 scores[t] = dot * inv_sqrt_d;
             }
 
