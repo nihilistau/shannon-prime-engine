@@ -117,6 +117,8 @@ set(SP_CORE_SRC
     ${SP_CORE_DIR}/core/shannon_prime_sqfree.c
     ${SP_CORE_DIR}/core/shannon_prime_cauchy.c
     ${SP_CORE_DIR}/core/shannon_prime_modelpack.c
+    ${SP_CORE_DIR}/core/sp_ok_arith.c
+    ${SP_CORE_DIR}/core/sp_frobenius.c
     ${SP_CORE_DIR}/backends/crt/sp_crt.c
     ${SP_CORE_DIR}/backends/crt/sp_crt_dispatch.c
     ${SP_CORE_DIR}/backends/crt/sp_theoretical.c)
@@ -405,6 +407,7 @@ add_library(sp_engine STATIC
     src/http_server.cpp
     src/sp_tensor.cpp
     src/sp_quant.cpp
+    src/sp_quant_frobenius.cpp
     src/sp_kernels_cpu.cpp
     src/sp_threadpool.cpp
     src/forward_native.cpp

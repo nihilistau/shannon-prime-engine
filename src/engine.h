@@ -145,6 +145,26 @@ struct Config {
     float       s12_threshold     = 2.0f;  // entropy threshold (nats)
     // System 2 cache type: "hier" (default) or "sqfree"
     std::string s12_sys2          = "hier";
+
+    // -------------------------------------------------------------------
+    // Phase 0 Theory-First: Frobenius / Sato-Tate quantization tiers.
+    // Backed by lib/shannon-prime/core/sp_frobenius.{c,h}; verified by
+    // tests/test_sp_frobenius (bit-exact vs Python oracle).
+    //
+    // --frobenius-quant: single split-prime Frobenius (Paper D Config B).
+    //                    Default p=41 (smallest split in K=Q(sqrt(-163))), k=8.
+    //
+    // --sato-tate-mix p1,k1,p2,k2: asymmetric inert+split (Paper D Config E).
+    //                    Default 2,2,41,8 — inert (zero drift) + split.
+    // -------------------------------------------------------------------
+    bool        frobenius_quant    = false;
+    int64_t     frobenius_p        = 41;     // split prime
+    int64_t     frobenius_k        = 8;      // Frobenius power
+    bool        sato_tate_mix      = false;
+    int64_t     st_p1              = 2;      // inert prime (zero-drift)
+    int64_t     st_k1              = 2;      // phi_p1^k1 (k1 must be even)
+    int64_t     st_p2              = 41;     // split prime (bounded-drift)
+    int64_t     st_k2              = 8;      // phi_p2^k2
 };
 
 // Seed Config fields from environment variables. Called by each CLI verb
