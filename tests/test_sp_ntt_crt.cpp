@@ -23,6 +23,7 @@ extern "C" {
 #include <cstdint>
 #include <random>
 #include <vector>
+#include <chrono>
 
 #define TEST(name) static void name(); static int reg_##name = (g_tests.push_back({#name, name}), 0); static void name()
 struct TE { const char *name; void (*fn)(); };
@@ -265,6 +266,74 @@ TEST(crt_engine_helpers_match_60bit_qk_cached) {
         "  [crt-vs-60bit] dot60=%.6f dotcrt=%.6f diff=%.3e\n",
         dot60, dotcrt, diff);
     ASSERT(diff < 1e-3);
+}
+
+/* Test 7 — Phase 10 prelude: scalar kernel microbench.
+ *
+ * Times the four hot CRT kernel functions per call. Captures the
+ * baseline we will compare against once SIMD vectorization lands.
+ * Prints microseconds-per-op; not a pass/fail gate (no ASSERT) — the
+ * fixed delta=2^14 self-check inside catches correctness drift. */
+TEST(crt_scalar_kernel_microbench) {
+    using clk = std::chrono::steady_clock;
+    constexpr int reps = 4000;
+
+    std::mt19937_64 rng(0xBEEFCAFE);
+    std::vector<uint64_t> A(N), B(N), C(N);
+    for (int i = 0; i < N; ++i) {
+        A[i] = rng() % SP_NTT_CRT_Q1;
+        B[i] = rng() % SP_NTT_CRT_Q1;
+    }
+
+    /* sp_ntt_crt_forward */
+    auto t0 = clk::now();
+    std::vector<uint64_t> tmp = A;
+    for (int r = 0; r < reps; ++r) {
+        tmp = A;
+        sp_ntt_crt_forward(tmp.data(), &SP_NTT_CRT_CTX_Q1);
+    }
+    auto t1 = clk::now();
+    double us_fwd = std::chrono::duration<double, std::micro>(t1 - t0).count() / reps;
+
+    /* sp_ntt_crt_inverse */
+    auto t2 = clk::now();
+    for (int r = 0; r < reps; ++r) {
+        tmp = A;
+        sp_ntt_crt_inverse(tmp.data(), &SP_NTT_CRT_CTX_Q1);
+    }
+    auto t3 = clk::now();
+    double us_inv = std::chrono::duration<double, std::micro>(t3 - t2).count() / reps;
+
+    /* sp_ntt_crt_pointwise_mul — the engine's hottest inner loop */
+    auto t4 = clk::now();
+    for (int r = 0; r < reps; ++r) {
+        sp_ntt_crt_pointwise_mul(C.data(), A.data(), B.data(),
+                                  &SP_NTT_CRT_CTX_Q1);
+    }
+    auto t5 = clk::now();
+    double us_pw = std::chrono::duration<double, std::micro>(t5 - t4).count() / reps;
+
+    /* sp_ntt_crt_poly_mul — full dual-prime chain */
+    std::vector<int64_t> a_i(N), b_i(N), c_i(N);
+    for (int i = 0; i < N; ++i) {
+        a_i[i] = (int64_t)(rng() % (1ULL << 24));
+        b_i[i] = (int64_t)(rng() % (1ULL << 24));
+    }
+    std::vector<uint64_t> ws(6 * N);
+    auto t6 = clk::now();
+    for (int r = 0; r < reps; ++r) {
+        sp_ntt_crt_poly_mul(c_i.data(), a_i.data(), b_i.data(), N, ws.data());
+    }
+    auto t7 = clk::now();
+    double us_full = std::chrono::duration<double, std::micro>(t7 - t6).count() / reps;
+
+    std::fprintf(stderr,
+        "  [scalar baseline, %d reps each]\n"
+        "    forward(N=%d, q1):           %.2f us/call\n"
+        "    inverse(N=%d, q1):           %.2f us/call\n"
+        "    pointwise_mul(N=%d, q1):     %.3f us/call  (engine inner loop)\n"
+        "    poly_mul(full dual chain):   %.2f us/call\n",
+        reps, N, us_fwd, N, us_inv, N, us_pw, us_full);
 }
 
 int main() {
