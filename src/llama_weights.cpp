@@ -3,6 +3,7 @@
 
 #include "llama_weights.h"
 #include "gguf_loader.h"
+#include "sp_load_shim.h"
 
 #include "ggml.h"
 #include "ggml-alloc.h"
@@ -38,6 +39,13 @@ struct LlamaWeights::Impl {
     // hold GPU 1..N-1. All contexts must be freed on destruction.
     std::vector<ggml_context*>        gpu_ctxs;      // per-GPU tensor contexts [0..n_gpus-1]
     std::vector<ggml_backend_buffer*> gpu_bufs;      // per-GPU backend buffers [0..n_gpus-1]
+
+    // Phase 1.7c: side buffers owning the post-Frobenius-shim weight data.
+    // When apply_frobenius_shim() transforms a tensor, the tensor's data
+    // pointer is repointed at one of these heap-allocated buffers (so the
+    // read-only mmap region stays untouched). Memory is freed when the
+    // LlamaWeights is destroyed.
+    std::vector<std::vector<uint8_t>> shim_buffers;
 
     ~Impl() {
         // Multi-GPU cleanup (reverse order).
@@ -856,6 +864,97 @@ void LlamaWeights::print_summary(std::FILE* f) const {
                  (output == tok_embd && output) ? " (tied to tok_embd)" : "");
     std::fprintf(f, "  rope_freqs:         %s (optional)\n",
                  rope_freqs ? "OK" : "absent");
+}
+
+// ============================================================================
+// Phase 1.7c — apply_frobenius_shim: load-time weight interception.
+// ============================================================================
+//
+// Walks every tensor in the bound ggml_context, dispatches via sp_shim_decide,
+// and for SHIM-mode fp16 tensors allocates a side-buffer, memcpy's the mmap'd
+// fp16 bytes, applies sp_load_shim_apply_frobenius / _sato_tate, and re-points
+// tensor->data at the side buffer.
+//
+// Non-fp16 tensors (Q4_K, Q8_0, etc.) are SKIPPED with a single-line warning —
+// the shim is fp16-only in Phase 1.7. Phase 2 will add dequant→shim→requant
+// for the quantized cases.
+//
+// Returns the number of tensors that were actually transformed.
+
+int LlamaWeights::apply_frobenius_shim(bool frobenius_quant,
+                                        bool sato_tate_mix,
+                                        int64_t p,  int64_t k,
+                                        int64_t p1, int64_t k1,
+                                        int64_t p2, int64_t k2) {
+    if (!frobenius_quant && !sato_tate_mix) return 0;
+    ggml_context* tctx = impl_->ctx ? impl_->ctx : impl_->meta_ctx;
+    if (!tctx) return 0;
+
+    int n_shimmed = 0;
+    int n_bypass  = 0;
+    int n_skip_nonfp16 = 0;
+
+    for (ggml_tensor* t = ggml_get_first_tensor(tctx);
+         t != nullptr;
+         t = ggml_get_next_tensor(tctx, t)) {
+        const char* name = t->name;
+        if (!name || !*name) continue;
+        auto decision = sp_shim_decide(name, frobenius_quant, sato_tate_mix);
+        if (decision.mode == sp_shim_mode::Bypass) {
+            ++n_bypass;
+            continue;
+        }
+        // Only fp16 in Phase 1.7
+        if (t->type != GGML_TYPE_F16) {
+            std::fprintf(stderr,
+                "[sp-frobenius-shim] SKIP non-fp16 tensor (type=%d): %s\n",
+                (int)t->type, name);
+            ++n_skip_nonfp16;
+            continue;
+        }
+        // Allocate side buffer (matching original size in bytes).
+        const size_t nbytes = ggml_nbytes(t);
+        const size_t nelems = (size_t)ggml_nelements(t);
+        impl_->shim_buffers.emplace_back(nbytes);
+        uint8_t* side = impl_->shim_buffers.back().data();
+        std::memcpy(side, t->data, nbytes);
+
+        int64_t scale_chosen = 0;
+        int rc = 0;
+        if (decision.mode == sp_shim_mode::FrobeniusQuant) {
+            rc = sp_load_shim_apply_frobenius(
+                reinterpret_cast<uint16_t*>(side), nelems, p, k, &scale_chosen);
+        } else {  // SatoTateMix
+            rc = sp_load_shim_apply_sato_tate(
+                reinterpret_cast<uint16_t*>(side), nelems,
+                p1, k1, p2, k2, &scale_chosen);
+        }
+        if (rc != 0) {
+            std::fprintf(stderr,
+                "[sp-frobenius-shim] FAIL rc=%d on %s — leaving as bypass\n",
+                rc, name);
+            impl_->shim_buffers.pop_back();
+            continue;
+        }
+        // Re-point the tensor's data pointer at the transformed buffer.
+        // ggml_tensor::data is non-const; the read-only mmap region stays
+        // untouched, our owned side buffer takes over.
+        t->data = side;
+        ++n_shimmed;
+    }
+
+    const char* mode_str = sato_tate_mix ? "sato-tate-mix" :
+                           frobenius_quant ? "frobenius-quant" : "?";
+    std::fprintf(stderr,
+        "[sp-frobenius-shim] mode=%s  shimmed=%d  bypassed=%d  skipped_nonfp16=%d\n",
+        mode_str, n_shimmed, n_bypass, n_skip_nonfp16);
+    if (n_skip_nonfp16 > 0) {
+        std::fprintf(stderr,
+            "[sp-frobenius-shim] NOTE: %d non-fp16 tensors skipped. "
+            "For a clean Theorem 4 PPL test use an fp16-native GGUF (e.g. "
+            "Qwen3-Embedding-0.6B-f16.gguf).\n", n_skip_nonfp16);
+    }
+    return n_shimmed;
 }
 
 } // namespace sp::engine

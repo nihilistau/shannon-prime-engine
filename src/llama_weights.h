@@ -185,6 +185,24 @@ public:
     // Summary — for the `info` verb to confirm binding worked.
     void print_summary(std::FILE* f) const;
 
+    // Phase 1.7c: apply the Frobenius / Sato-Tate shim to loaded weights.
+    // Walks every tensor in the bound ctx(), dispatches via sp_shim_decide,
+    // and for SHIM-mode fp16 tensors:
+    //   1. allocates a side-buffer (owned by Impl::shim_buffers)
+    //   2. memcpy's the mmap'd fp16 bytes into the side buffer
+    //   3. runs sp_load_shim_apply_frobenius / _sato_tate on the side buffer
+    //   4. re-points tensor->data at the side buffer
+    //
+    // Non-fp16 tensors (Q4_K, Q8_0, etc.) are SKIPPED with a warning.
+    // Non-shim tensors are left untouched.
+    //
+    // Returns the number of tensors that were actually transformed.
+    int apply_frobenius_shim(bool frobenius_quant,
+                              bool sato_tate_mix,
+                              int64_t p,  int64_t k,
+                              int64_t p1, int64_t k1,
+                              int64_t p2, int64_t k2);
+
 private:
     LlamaWeights();
     struct Impl;

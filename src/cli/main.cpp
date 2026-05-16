@@ -2582,6 +2582,50 @@ int main(int argc, char** argv) {
         rest.emplace_back(a);
     }
 
+    if (cmd == "shim-run") {
+        // Phase 1.7c: actually run the load-time shim on an fp16 GGUF.
+        // Loads the model, transforms shimmed tensors in side buffers,
+        // and reports how many got transformed. The bound LlamaWeights
+        // then has its data pointers re-routed at the shimmed buffers,
+        // so any downstream forward pass sees the transformed weights.
+        if (cfg.model_path.empty()) {
+            std::fprintf(stderr, "shim-run requires --model <path.gguf>\n");
+            return 1;
+        }
+        if (!cfg.frobenius_quant && !cfg.sato_tate_mix) {
+            std::fprintf(stderr,
+                "shim-run requires --frobenius-quant or --sato-tate-mix.\n");
+            return 1;
+        }
+        auto m = sp::engine::Model::load(cfg.model_path);
+        if (!m) return 2;
+        auto w = sp::engine::LlamaWeights::load(*m, nullptr,
+                    sp::engine::N_GPU_LAYERS_ALL);
+        if (!w) {
+            std::fprintf(stderr, "shim-run: LlamaWeights::load failed\n");
+            return 3;
+        }
+        std::printf("\n=== shim-run on %s ===\n", cfg.model_path.c_str());
+        std::printf("  arch=%s  n_layer=%d\n",
+                    m->architecture().c_str(), w->n_layer());
+        if (cfg.frobenius_quant) {
+            std::printf("  --frobenius-quant p=%lld k=%lld\n",
+                        (long long)cfg.frobenius_p, (long long)cfg.frobenius_k);
+        }
+        if (cfg.sato_tate_mix) {
+            std::printf("  --sato-tate-mix p1=%lld k1=%lld p2=%lld k2=%lld\n",
+                        (long long)cfg.st_p1, (long long)cfg.st_k1,
+                        (long long)cfg.st_p2, (long long)cfg.st_k2);
+        }
+        int n_shimmed = w->apply_frobenius_shim(
+            cfg.frobenius_quant, cfg.sato_tate_mix,
+            cfg.frobenius_p, cfg.frobenius_k,
+            cfg.st_p1, cfg.st_k1, cfg.st_p2, cfg.st_k2);
+        std::printf("\n  RESULT: %d tensor(s) shimmed in place\n", n_shimmed);
+        std::printf("  weights ready for forward pass (theory-first path)\n\n");
+        return 0;
+    }
+
     if (cmd == "shim-plan") {
         // Phase 1.7b smoke verb: load a GGUF, run sp_shim_decide for every
         // tensor name, print the dispatch decision and a summary. Validates
