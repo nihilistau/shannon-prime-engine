@@ -14,6 +14,7 @@
 #include "llama_weights.h"
 #include "prime_pe.h"
 #include "sp_forward.h"
+#include "sp_threadpool.h"
 #include "sp_weights_loader.h"
 #include "tokenizer.h"
 #include "vocab.h"
@@ -53,6 +54,7 @@ extern "C" {
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <thread>
 #include <vector>
 
 // RAII guard: owns an optional ggml_backend_t, frees on scope exit.
@@ -850,6 +852,22 @@ int main(int argc, char** argv) {
             std::fprintf(stderr,
                 "[sp-engine] perplexity: SP_ENGINE_NATIVE=1 — routing "
                 "through native O_K forward pass.\n");
+
+            // Phase 2.3c: spin up the thread pool. Threads partition the
+            // outer-M loop in sp_matmul* — embarrassingly parallel since
+            // each output row's accumulator is independent.
+            int n_threads = 0;
+            if (const char* e = std::getenv("SP_ENGINE_THREADS")) {
+                n_threads = std::atoi(e);
+            }
+            if (n_threads <= 0) {
+                n_threads = (int)std::thread::hardware_concurrency();
+                if (n_threads <= 0) n_threads = 4;
+            }
+            sp::engine::sp_threadpool_init(n_threads);
+            std::fprintf(stderr,
+                "[sp-engine] perplexity-native: thread pool = %d workers\n",
+                n_threads);
 
             // Build sp_weights directly from the loaded LlamaWeights.
             // sp_weights_load_from_llama internally applies the
