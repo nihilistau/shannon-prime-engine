@@ -7,6 +7,10 @@
 #include "../src/sp_ok_encode.h"
 #include "../src/sp_sampler.h"
 
+extern "C" {
+#include "../lib/shannon-prime/core/sp_frobenius.h"
+}
+
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -112,35 +116,48 @@ TEST(encode_b_component_is_zero) {
 // =========================================================================
 
 TEST(shim_inert_phi_2_squared_scales_by_minus_2) {
+    // Phase 1.8 signed convention: phi_p^(2m) = (-p)^m as a SIGNED scalar.
+    // For inert p=2, k=2: m=1, so phi_2^2 = (-2)^1 = -2. The a-component
+    // is multiplied by -2 AND frobenius_scale tracks the signed factor -2,
+    // so decode (a / (scale_recip * frobenius_scale)) recovers +w exactly.
+    // Pre-fix, frobenius_scale was unsigned (= 2) and decode produced -w,
+    // breaking SwiGLU since silu(-x) != -silu(x).
     sp_ok_arena arena(8192);
     sp_ok_tensor t;
     float w[8] = { 0.1f, 0.2f, -0.3f, 0.4f, -0.5f, 0.6f, 0.7f, -0.8f };
     int64_t shape[4] = { 8, 1, 1, 1 };
     ASSERT(sp_ok_encode_from_fp32(t, w, 1, shape, 1024, arena));
-    // Snapshot pre-Frobenius (a-components)
     int64_t pre[8];
     for (int i = 0; i < 8; ++i) pre[i] = t.data[i].a;
 
-    sp_ok_encode_apply_frobenius_quant(t, 2, 2);  // phi_2^2 = -2
+    sp_ok_encode_apply_frobenius_quant(t, 2, 2);
 
-    // a-components scaled by -2, frobenius_scale tracked as 2
+    // a-components scaled by -2 (the shim applies the signed Frobenius).
     for (int i = 0; i < 8; ++i) {
         ASSERT(t.data[i].a == -2 * pre[i]);
     }
-    ASSERT(t.frobenius_scale == 2);
+    // frobenius_scale tracks the SIGNED factor (Phase 1.8 fix).
+    ASSERT(t.frobenius_scale == -2);
 
-    // Decode should recover near-original (sign flip absorbed by
-    // frobenius_scale; the -2 in a-component cancels with /2 in decode).
+    // Decode: a_new / (scale_recip * (-2)) = (-2 * a_orig) / (scale_recip * (-2))
+    //       = a_orig / scale_recip = +w. Sign-flip cancellation.
     float decoded[8];
     sp_ok_decode_to_fp32(decoded, t);
-    // Note: the shim's "scale_factor" gives |w| recovery up to sign.
-    // For phi_2^2 the actual decode gives -w (since (-2*a)/(scale*2) = -a/scale).
     for (int i = 0; i < 8; ++i) {
-        ASSERT_NEAR(decoded[i], -w[i], 2.0f / 1024.0f);
+        ASSERT_NEAR(decoded[i], +w[i], 2.0f / 1024.0f);
     }
 }
 
 TEST(shim_split_p41_k8_norm_growth) {
+    // Phase 1.8 signed-pi^k.a convention: for split p, the shim applies
+    // phi_p^k = pi^k to each O_K element. Norm growth is still p^k
+    // (algebraic invariant of Frobenius), but frobenius_scale tracks
+    // pi^k.a — the SIGNED real-component scaling that actually applies
+    // to (a, 0) inputs — NOT the norm-based p^(k/2).
+    //
+    // Pre-fix: frobenius_scale = p^(k/2) = 41^4 over-corrected by a
+    //          factor of pi^k.a / |pi^k| = cos(theta_k) < 1, shrinking
+    //          decoded weights and exploding PPL ~49 at Config B.
     sp_ok_arena arena(1024 * 64);
     sp_ok_tensor t;
     constexpr int N = 32;
@@ -149,22 +166,28 @@ TEST(shim_split_p41_k8_norm_growth) {
     std::uniform_real_distribution<float> d(-0.5f, 0.5f);
     for (int i = 0; i < N; ++i) w[i] = d(rng);
     int64_t shape[4] = { N, 1, 1, 1 };
-    int64_t scale = 1LL << 12;  // smaller scale to leave int64 headroom
+    int64_t scale = 1LL << 12;
     ASSERT(sp_ok_encode_from_fp32(t, w, 1, shape, scale, arena));
 
     int64_t pre_norm_sum = sp_ok_tensor_sum_norms(t);
-
     sp_ok_encode_apply_frobenius_quant(t, 41, 8);
 
     int64_t post_norm_sum = sp_ok_tensor_sum_norms(t);
-    // N(phi_p^k(state)) = N(state) * p^k = N(state) * 41^8
     int64_t expected_growth = 1;
     for (int i = 0; i < 8; ++i) expected_growth *= 41;
     ASSERT(post_norm_sum == pre_norm_sum * expected_growth);
-    // frobenius_scale recorded as p^(k/2) = 41^4 for even k.
-    int64_t expected_scale = 1;
-    for (int i = 0; i < 4; ++i) expected_scale *= 41;
-    ASSERT(t.frobenius_scale == expected_scale);
+
+    // Expected frobenius_scale = pi^8.a (signed real component).
+    sp_ok_t pi;
+    ASSERT(sp_find_element_of_norm(41, &pi));
+    sp_ok_t pi_pow = sp_ok_pow(pi, 8);
+    ASSERT(t.frobenius_scale == pi_pow.a);
+
+    // Sanity: pi^8.a must be strictly less than 41^4 (the old wrong scale)
+    // — this is the bug's empirical signature.
+    int64_t old_wrong_scale = 1;
+    for (int i = 0; i < 4; ++i) old_wrong_scale *= 41;
+    ASSERT(std::llabs(pi_pow.a) < old_wrong_scale);
 }
 
 TEST(shim_sato_tate_mix_norm_growth_2_2_41_4) {
