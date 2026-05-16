@@ -143,6 +143,31 @@ void sp_silu_inplace(float* x, int n) {
 }
 
 // =========================================================================
+// GELU (tanh approximation) — matches ggml_gelu / gelu_pytorch_tanh / gemma.
+//
+//   c0 = sqrt(2/pi) ≈ 0.7978845608028654
+//   c1 = 0.044715
+//   gelu(x) = 0.5 * x * (1 + tanh(c0 * (x + c1 * x^3)))
+// =========================================================================
+
+static inline float gelu_tanh_scalar(float x) {
+    constexpr float C0 = 0.7978845608028654f;  // sqrt(2/pi)
+    constexpr float C1 = 0.044715f;
+    const float x3 = x * x * x;
+    return 0.5f * x * (1.0f + std::tanh(C0 * (x + C1 * x3)));
+}
+
+void sp_gelu_tanh_bridge(const float* gate, const float* up, int n, float* out) {
+    for (int i = 0; i < n; ++i) {
+        out[i] = gelu_tanh_scalar(gate[i]) * up[i];
+    }
+}
+
+void sp_gelu_tanh_inplace(float* x, int n) {
+    for (int i = 0; i < n; ++i) x[i] = gelu_tanh_scalar(x[i]);
+}
+
+// =========================================================================
 // Phase 2.3b helpers
 // =========================================================================
 

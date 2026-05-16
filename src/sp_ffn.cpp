@@ -88,7 +88,8 @@ bool sp_ffn_swiglu_to_fp32(const sp_ok_tensor& x,
                             const sp_ok_tensor& down_w,
                             float*              out_fp32,
                             int                 n_tokens,
-                            sp_ok_arena&        scratch_arena) {
+                            sp_ok_arena&        scratch_arena,
+                            sp_ffn_act          act) {
     if (x.data == nullptr || gate_w.data == nullptr || up_w.data == nullptr ||
         down_w.data == nullptr || out_fp32 == nullptr) return false;
     const int n_embd = (int)gate_w.shape[0];
@@ -98,7 +99,7 @@ bool sp_ffn_swiglu_to_fp32(const sp_ok_tensor& x,
     if (down_w.shape[0] != d_ff || down_w.shape[1] != n_embd) return false;
     if (x.shape[0] != n_tokens || x.shape[1] != n_embd) return false;
 
-    // For each token we run the SwiGLU activation independently; the
+    // For each token we run the gated activation independently; the
     // down-projection then absorbs all tokens at once via matmul.
     std::vector<float> gate_all(d_ff * n_tokens);
     std::vector<float> up_all(d_ff * n_tokens);
@@ -110,9 +111,15 @@ bool sp_ffn_swiglu_to_fp32(const sp_ok_tensor& x,
     if (!sp_matmul_ok_to_fp32(up_w, x, up_all.data(), d_ff, n_tokens)) {
         return false;
     }
-    // SwiGLU per element across the whole (d_ff * n_tokens) block —
-    // gate / up have the same layout, silu is pointwise.
-    sp_silu_bridge(gate_all.data(), up_all.data(), d_ff * n_tokens, act_all.data());
+    // Gated MLP per element across the whole (d_ff * n_tokens) block.
+    switch (act) {
+    case sp_ffn_act::SwiGLU:
+        sp_silu_bridge(gate_all.data(), up_all.data(), d_ff * n_tokens, act_all.data());
+        break;
+    case sp_ffn_act::GeGLU_tanh:
+        sp_gelu_tanh_bridge(gate_all.data(), up_all.data(), d_ff * n_tokens, act_all.data());
+        break;
+    }
 
     // Encode the post-silu activation as O_K so we can run
     // sp_matmul_ok_to_fp32(down_w, act_ok, ...) → fp32 out with Frobenius

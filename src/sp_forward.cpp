@@ -380,15 +380,25 @@ static bool encode_residual_to_ok(sp_ok_tensor& dst,
 }
 
 // Helper: embedding lookup. weights.tok_embed is shape {n_embd, vocab},
-// so the token's row starts at data[token_id * n_embd]. Decode to fp32.
+// so the token's row starts at data[token_id * n_embd]. Decode to fp32
+// and multiply by embd_scale (Gemma family scales by sqrt(n_embd) before
+// the first block; non-gemma archs leave embd_scale=1.0).
 static void embed_lookup_fp32(float* x_fp32,
                                 const sp_ok_tensor& tok_embed,
-                                int token_id, int n_embd) {
+                                int token_id, int n_embd,
+                                float embd_scale) {
     const double div = (double)tok_embed.scale_recip *
                        (double)tok_embed.frobenius_scale;
     const sp_ok_t* row = tok_embed.data + (int64_t)token_id * n_embd;
-    for (int i = 0; i < n_embd; ++i) {
-        x_fp32[i] = (float)((double)row[i].a / div);
+    if (embd_scale == 1.0f) {
+        for (int i = 0; i < n_embd; ++i) {
+            x_fp32[i] = (float)((double)row[i].a / div);
+        }
+    } else {
+        const double s = (double)embd_scale;
+        for (int i = 0; i < n_embd; ++i) {
+            x_fp32[i] = (float)(((double)row[i].a / div) * s);
+        }
     }
 }
 
@@ -425,8 +435,9 @@ bool sp_forward_step(sp_forward_context& ctx,
     const int64_t matmul_out_scale = S * S;
     const int n_tokens  = 1;  // single-token decode in Phase 2.2d
 
-    // 1) Embedding lookup → x_fp32.
-    embed_lookup_fp32(ctx.x_fp32.data(), weights.tok_embed, token_id, n_embd);
+    // 1) Embedding lookup → x_fp32 (× embd_scale for Gemma family).
+    embed_lookup_fp32(ctx.x_fp32.data(), weights.tok_embed, token_id, n_embd,
+                       ctx.embd_scale);
 
     int32_t rope_pos[1] = { position };
 
@@ -585,14 +596,17 @@ bool sp_forward_step(sp_forward_context& ctx,
             return false;
         }
 
-        // 2k) FFN → fp32 (absorbs ffn_down's frobenius_scale)
+        // 2k) FFN → fp32 (absorbs ffn_down's frobenius_scale). Activation
+        //     selected by ctx.ffn_act: SwiGLU (silu) for Llama / Qwen,
+        //     GeGLU_tanh (gelu) for Gemma family.
         if (!sp_ffn_swiglu_to_fp32(ctx.x_norm_ok,
                                      weights.ffn_gate[L],
                                      weights.ffn_up[L],
                                      weights.ffn_down[L],
                                      ctx.proj_out_fp32.data(),
                                      n_tokens,
-                                     ctx.layer_arena)) {
+                                     ctx.layer_arena,
+                                     ctx.ffn_act)) {
             std::fprintf(stderr, "[sp_forward] L%d FFN failed\n", L);
             return false;
         }

@@ -21,13 +21,24 @@ void sp_ffn_swiglu(const sp_ok_tensor& x,
                     const sp_ok_tensor& down_w,
                     sp_ok_tensor&       out);
 
-// SwiGLU FFN with fp32 output — the down projection runs as
+// Gated-MLP activation kind for sp_ffn_swiglu_to_fp32:
+//   SwiGLU      = silu(gate) * up         (Llama / Qwen / Mistral / Phi)
+//   GeGLU_tanh  = gelu_tanh(gate) * up    (Gemma / Gemma2 / Gemma3)
+enum class sp_ffn_act {
+    SwiGLU      = 0,
+    GeGLU_tanh  = 1,
+};
+
+// Gated-MLP FFN with fp32 output — the down projection runs as
 // sp_matmul_ok_to_fp32 so down_w's Frobenius factor is divided out at the
 // matmul boundary. This is the variant sp_forward_step uses when adding
 // FFN output back into the residual stream.
 //
+// `act` selects the gate activation. Default SwiGLU preserves Phase 2.2d
+// behavior.
+//
 // out_fp32: [n_embd, n_tokens] (or just [n_embd] for single-token).
-// scratch_arena: caller-provided arena used to encode the post-silu
+// scratch_arena: caller-provided arena used to encode the post-act
 //                activations to O_K for the final matmul. Must have
 //                room for ~d_ff sp_ok_t elements.
 //
@@ -38,6 +49,7 @@ bool sp_ffn_swiglu_to_fp32(const sp_ok_tensor& x,
                             const sp_ok_tensor& down_w,
                             float*              out_fp32,
                             int                 n_tokens,
-                            sp_ok_arena&        scratch_arena);
+                            sp_ok_arena&        scratch_arena,
+                            sp_ffn_act          act = sp_ffn_act::SwiGLU);
 
 }  // namespace sp::engine

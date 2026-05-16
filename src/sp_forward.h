@@ -16,6 +16,7 @@
 
 #include "sp_ok_tensor.h"
 #include "sp_kv_cache_ok.h"
+#include "sp_ffn.h"
 #include "engine.h"
 
 #include <cstddef>
@@ -66,6 +67,9 @@ struct sp_forward_context {
     int64_t residual_scale = 0;   // scale_recip for x_ok encoding
     float   rms_eps    = 1e-5f;
     float   rope_base  = 10000.0f;
+    // Phase 2.3b iter 2 — Gemma3 arch knobs:
+    float       embd_scale = 1.0f;                 // sqrt(n_embd) for gemma
+    sp_ffn_act  ffn_act    = sp_ffn_act::SwiGLU;   // GeGLU_tanh for gemma
 
     // Poncelet adaptive depth tracking (Paper A §7, Theorem 5).
     sp_ok_t poncelet_delta = sp_ok_t{ 0, 0 };

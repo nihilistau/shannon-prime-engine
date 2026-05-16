@@ -863,9 +863,29 @@ int main(int argc, char** argv) {
 
             sp::engine::sp_forward_context ctx;
             const float native_rope_base = m->rope_freq_base();
+            // Phase 2.3b iter 2 — Gemma family arch knobs:
+            //   * embedding scale = sqrt(n_embd) before the first block
+            //   * FFN activation  = GeGLU_tanh (gelu_pytorch_tanh)
+            // Other archs leave these at defaults (1.0 / SwiGLU).
+            const std::string& native_arch = m->architecture();
+            const bool is_gemma_family =
+                (native_arch == "gemma"  || native_arch == "gemma2" ||
+                 native_arch == "gemma3");
+            // Gemma scales tok_embd by sqrt(n_embd), NOT sqrt(d_q).
+            // For Gemma3-270m: sqrt(640) ≈ 25.298 — distinct from
+            // sqrt(n_head * head_dim) = sqrt(1024) = 32.
+            const float embd_scale = is_gemma_family
+                ? std::sqrt((float)m->n_embd())
+                : 1.0f;
+            const sp::engine::sp_ffn_act ffn_act = is_gemma_family
+                ? sp::engine::sp_ffn_act::GeGLU_tanh
+                : sp::engine::sp_ffn_act::SwiGLU;
             std::fprintf(stderr,
-                "[sp-engine] perplexity-native: rope_freq_base=%.1f\n",
-                (double)native_rope_base);
+                "[sp-engine] perplexity-native: rope_freq_base=%.1f  "
+                "embd_scale=%.3f  ffn_act=%s\n",
+                (double)native_rope_base, (double)embd_scale,
+                ffn_act == sp::engine::sp_ffn_act::GeGLU_tanh
+                  ? "GeGLU_tanh" : "SwiGLU");
             if (!sp::engine::sp_forward_context_init(
                     ctx, spW, /*n_ctx*/ n_ctx,
                     /*rope_base*/ native_rope_base, /*rms_eps*/ 1e-5f)) {
@@ -873,6 +893,8 @@ int main(int argc, char** argv) {
                     "[sp-engine] perplexity-native: context init failed\n");
                 return 8;
             }
+            ctx.embd_scale = embd_scale;
+            ctx.ffn_act    = ffn_act;
             std::fprintf(stderr,
                 "[sp-engine] perplexity-native: ctx ready  n_layers=%d "
                 "n_embd=%d n_head=%d n_kv_head=%d head_dim=%d d_ff=%d "

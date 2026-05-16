@@ -103,6 +103,21 @@ void sp_silu_bridge(const float* gate, const float* up, int n, float* out);
 void sp_silu_inplace(float* x, int n);
 
 // -----------------------------------------------------------------------
+// sp_gelu_tanh_bridge — GeGLU activation: gelu_tanh(gate) * up, elementwise.
+//
+// Uses the tanh approximation matching ggml_gelu (and PyTorch's
+// gelu_pytorch_tanh / Gemma's act_fn):
+//
+//   gelu(x) = 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+//
+// gate, up: [n] fp32. out: [n] fp32. May alias.
+// -----------------------------------------------------------------------
+void sp_gelu_tanh_bridge(const float* gate, const float* up, int n, float* out);
+
+// Plain GELU without the gating multiply.
+void sp_gelu_tanh_inplace(float* x, int n);
+
+// -----------------------------------------------------------------------
 // Phase 2.3b — Gemma3 / Qwen3 supplementary norms.
 // -----------------------------------------------------------------------
 
