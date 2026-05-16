@@ -140,25 +140,50 @@ void sp_ok_encode_apply_frobenius_quant(sp_ok_tensor& t,
     // For now the decode just produces a uniformly-scaled fp32; the
     // forward pass must handle the residual scale.
     if (sp_is_inert(p)) {
+        // phi_p^(2m) = (-p)^m as SIGNED scalar on (a, b). For odd m the
+        // scalar is negative (e.g. φ_2^2 = -2), and the SIGN MATTERS:
+        // decoding by the absolute value alone produces sign-flipped
+        // weights, which breaks the SwiGLU FFN (silu(-x) ≠ -silu(x))
+        // and explodes PPL in compose paths (Config E).
+        //
+        // We therefore accumulate a SIGNED frobenius_scale = (-p)^m,
+        // and decode divides by (scale_recip * frobenius_scale) where
+        // frobenius_scale is signed. The negative-divisor / negative-
+        // numerator cancellation recovers the original w correctly.
         int64_t m = k / 2;
-        int64_t scale_growth = 1;
-        for (int64_t i = 0; i < m; ++i) scale_growth *= p;
-        t.frobenius_scale *= scale_growth;
+        int64_t signed_scale = 1;
+        for (int64_t i = 0; i < m; ++i) signed_scale *= (-p);
+        t.frobenius_scale *= signed_scale;
     } else if (sp_is_split(p)) {
-        // sqrt of N(pi^k) = p^(k/2). For odd k this is irrational, so
-        // we approximate by p^k and absorb the sqrt into a sampler-side
-        // factor. For even k it's exact: p^(k/2).
-        if (k % 2 == 0) {
-            int64_t half = k / 2;
-            int64_t sc = 1;
-            for (int64_t i = 0; i < half; ++i) sc *= p;
-            t.frobenius_scale *= sc;
-        } else {
-            // For odd k, the proper scale is p^(k/2) which is irrational.
-            // We track p^k and let the caller compensate.
-            int64_t sc = 1;
-            for (int64_t i = 0; i < k; ++i) sc *= p;
-            t.frobenius_scale *= sc;
+        // CRITICAL FIX (Phase 1.8): for a state (a, 0), multiplication by
+        // pi^k = (pi_a, pi_b) produces (a*pi_a, a*pi_b). The a-component
+        // scaling factor is exactly pi^k.a, NOT p^(k/2)=|pi^k|.
+        //
+        // The earlier formula (p^(k/2)) was the *norm*-based scaling,
+        // which is correct only when pi^k = (sqrt(N), 0) — i.e. only
+        // when pi^k is real-valued in our basis. For our canonical pi,
+        // pi^k has nonzero b for any k that doesn't divide the order,
+        // and the real-component scaling is strictly less than p^(k/2).
+        //
+        // Empirical signature of the bug it caused: PPL ~ 49 at Config B
+        // vs baseline 19 because every weight got multiplied by
+        // pi^k.a / p^(k/2) = pi^k.a / |pi^k| = cos(theta_k) < 1.
+        sp_ok_t pi;
+        if (sp_find_element_of_norm(p, &pi)) {
+            sp_ok_t pi_pow = sp_ok_pow(pi, k);
+            if (pi_pow.a != 0) {
+                // Keep the SIGN of pi^k.a so decode correctly inverts the
+                // (a, 0) -> (a * pi_pow.a, a * pi_pow.b) mapping that the
+                // shim applies to weights.
+                t.frobenius_scale *= pi_pow.a;
+            } else {
+                // pi^k has zero real part (rare; happens when k * theta_pi
+                // crosses pi/2). Fall back to the norm-based scale and
+                // accept the residual sign/rotation as a sampler factor.
+                int64_t sc = 1;
+                for (int64_t i = 0; i < k; ++i) sc *= p;
+                t.frobenius_scale *= sc;
+            }
         }
     }
 }

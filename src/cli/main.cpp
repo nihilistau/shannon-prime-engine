@@ -814,6 +814,20 @@ int main(int argc, char** argv) {
         }
         if (!tk || !W) return 3;
 
+        // Phase 1.8: apply the Frobenius / Sato-Tate shim if requested.
+        // Weights get transformed in-place (in side buffers); the forward
+        // pass that follows runs unchanged but on shimmed weights —
+        // Theorem 4's cancellation happens in the algebra of QK·V.
+        if (pc.frobenius_quant || pc.sato_tate_mix) {
+            int n_shimmed = W->apply_frobenius_shim(
+                pc.frobenius_quant, pc.sato_tate_mix,
+                pc.frobenius_p, pc.frobenius_k,
+                pc.st_p1, pc.st_k1, pc.st_p2, pc.st_k2);
+            std::fprintf(stderr,
+                "[sp-engine] perplexity: %d tensors theory-first shimmed\n",
+                n_shimmed);
+        }
+
         // Read whole file. Binary mode so byte-perfect with what llama.cpp's
         // perplexity sees from wiki.test.raw.
         std::FILE* fp = std::fopen(textfile.c_str(), "rb");
