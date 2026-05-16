@@ -125,3 +125,20 @@ set_target_properties(test_sp_ec_weil PROPERTIES
     CXX_STANDARD 17
 )
 add_test(NAME sp_ec_weil COMMAND test_sp_ec_weil)
+
+# ─── SP Phase 3 part 2+3: Weil-pairing attention prototype ─────────────
+# Maps Q/K vectors to E[n] torsion via a fixed hash, computes the Weil
+# pairing as attention score, compares against softmax(QK^T/sqrt(d))
+# on the same random inputs.
+add_executable(test_sp_weil_attention
+    test_sp_weil_attention.cpp
+    ../lib/shannon-prime/core/sp_ec_weil.c
+)
+target_include_directories(test_sp_weil_attention PRIVATE
+    ../lib/shannon-prime/core
+)
+set_target_properties(test_sp_weil_attention PROPERTIES
+    C_STANDARD 11
+    CXX_STANDARD 17
+)
+add_test(NAME sp_weil_attention COMMAND test_sp_weil_attention)
