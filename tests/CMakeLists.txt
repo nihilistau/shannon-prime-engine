@@ -187,3 +187,21 @@ set_target_properties(test_sp_ntt PROPERTIES
     CXX_STANDARD 17
 )
 add_test(NAME sp_ntt COMMAND test_sp_ntt)
+
+# ─── SP Phase 9: dual-prime CRT NTT parity test ─────────────────────────
+# Builds the CRT NTT kernel + the existing 60-bit NTT side-by-side and
+# verifies they produce bit-identical results on random poly pairs.
+add_executable(test_sp_ntt_crt
+    test_sp_ntt_crt.cpp
+    ../lib/shannon-prime/core/sp_poly_ring.c
+    ../lib/shannon-prime/core/sp_ntt.c
+    ../lib/shannon-prime/core/sp_ntt_crt.c
+)
+target_include_directories(test_sp_ntt_crt PRIVATE
+    ../lib/shannon-prime/core
+)
+set_target_properties(test_sp_ntt_crt PROPERTIES
+    C_STANDARD 11
+    CXX_STANDARD 17
+)
+add_test(NAME sp_ntt_crt COMMAND test_sp_ntt_crt)
