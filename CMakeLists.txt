@@ -406,6 +406,12 @@ add_library(sp_engine STATIC
     src/prime_pe.cpp
     src/http_server.cpp
     src/sp_tensor.cpp
+    src/sp_ok_tensor.cpp
+    src/sp_ok_encode.cpp
+    src/sp_forward.cpp
+    src/sp_attention.cpp
+    src/sp_ffn.cpp
+    src/sp_sampler.cpp
     src/sp_quant.cpp
     src/sp_quant_frobenius.cpp
     src/sp_kernels_cpu.cpp

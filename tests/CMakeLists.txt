@@ -61,3 +61,8 @@ set_target_properties(test_sp_frobenius PROPERTIES
 )
 add_test(NAME sp_frobenius COMMAND test_sp_frobenius
          WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+
+# ─── SP encode + sampler unit tests (Phase 1.2/1.3 + Phase 2 prep) ─────
+add_executable(test_sp_encode test_sp_encode.cpp)
+target_link_libraries(test_sp_encode PRIVATE sp_engine)
+add_test(NAME sp_encode COMMAND test_sp_encode)

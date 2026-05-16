@@ -54,3 +54,5 @@ build_test_sp_frobenius.bat
 
 build_sp_engine.bat
 build_sp_engine_bin.bat
+
+build_tests.bat
