@@ -83,6 +83,11 @@ struct sp_forward_context {
     float  attn_logit_softcap   = 0.0f;    // > 0 caps QK^T/sqrt(d)
     float  final_logit_softcap  = 0.0f;    // > 0 caps LM-head output
 
+    // Phase 3 pivot — attention dispatch.
+    //   0 = standard dot product (Phase 2.2a)
+    //   1 = CKKS polynomial-ring (Z[x]/(x^N+1) negacyclic convolution)
+    int    attn_mode            = 0;
+
     // Poncelet adaptive depth tracking (Paper A §7, Theorem 5).
     sp_ok_t poncelet_delta = sp_ok_t{ 0, 0 };
 };

@@ -577,12 +577,19 @@ bool sp_forward_step(sp_forward_context& ctx,
         // the 2^53 fp64 mantissa limit. Higher scale would compound with
         // Wo's pi^k Frobenius factor and lose precision.
         ctx.attn_out_ok.scale_recip = S;
-        sp_attention_dot_product(ctx.q_ok, K_view, V_view, ctx.attn_out_ok,
-                                    n_head, n_kv_head, head_dim,
-                                    t_valid, t_stride, position,
-                                    /*swa_window*/ layer_swa_window,
-                                    /*attn_logit_softcap*/
+        if (ctx.attn_mode == 1) {
+            sp_attention_poly_ring(ctx.q_ok, K_view, V_view, ctx.attn_out_ok,
+                                      n_head, n_kv_head, head_dim,
+                                      t_valid, t_stride, position,
+                                      layer_swa_window,
+                                      ctx.attn_logit_softcap);
+        } else {
+            sp_attention_dot_product(ctx.q_ok, K_view, V_view, ctx.attn_out_ok,
+                                        n_head, n_kv_head, head_dim,
+                                        t_valid, t_stride, position,
+                                        layer_swa_window,
                                         ctx.attn_logit_softcap);
+        }
         // attn_out_ok now has frobenius_scale=1.
 
         // 2g) Wo projection → fp32 (absorbs pi^k via Theorem 4).

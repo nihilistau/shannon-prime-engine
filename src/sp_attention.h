@@ -69,4 +69,30 @@ void sp_attention_weil_pairing(const sp_ok_tensor& q,
                                  sp_ok_tensor&       out,
                                  int n);
 
+// =========================================================================
+// Phase 3 pivot — CKKS-style polynomial-ring attention.
+//
+// Replaces the fp32 dot-product bridge in sp_attention_dot_product with
+// integer polynomial multiplication in Z[x] / (x^N + 1). The score
+// Σ q_i k_i is recovered exactly (to fp32 ULP) at coefficient x^{d-1}
+// of Q(x) * K_rev(x). No metric topology destruction; KL=0 vs softmax
+// in test_sp_poly_attention.
+//
+// Same call signature as sp_attention_dot_product so the forward step
+// can dispatch on env var without changing call sites. Q/K/V are read
+// from the same O_K representation; the polynomial encoding happens
+// inside per (qi, t) pair, with N picked as the smallest power of 2 ≥
+// head_dim (typically N = 2*head_dim).
+// =========================================================================
+void sp_attention_poly_ring(const sp_ok_tensor& q,
+                              const sp_ok_tensor& k,
+                              const sp_ok_tensor& v,
+                              sp_ok_tensor&       out,
+                              int n_head, int n_kv_head, int head_dim,
+                              int   t_valid              = -1,
+                              int   t_stride             = -1,
+                              int   pos_offset           = -1,
+                              int   swa_window           = 0,
+                              float attn_logit_softcap   = 0.0f);
+
 }  // namespace sp::engine

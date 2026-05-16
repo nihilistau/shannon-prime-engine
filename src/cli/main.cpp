@@ -955,6 +955,17 @@ int main(int argc, char** argv) {
             ctx.embd_scale = embd_scale;
             ctx.ffn_act    = ffn_act;
             ctx.rope_mode  = rope_mode;
+            // Phase 3 pivot: SP_ENGINE_POLY_ATTN=1 switches the attention
+            // score function from the fp32 dot product (Phase 2.2a) to
+            // CKKS polynomial-ring multiplication in Z[x]/(x^N+1). The
+            // V-weighting, softmax, masking, and softcap stay identical.
+            if (const char* e = std::getenv("SP_ENGINE_POLY_ATTN")) {
+                ctx.attn_mode = std::atoi(e) ? 1 : 0;
+            }
+            std::fprintf(stderr,
+                "[sp-engine] perplexity-native: attn_mode=%s\n",
+                ctx.attn_mode == 1 ? "POLY_RING(Z[x]/(x^N+1))"
+                                    : "DOT_PRODUCT");
 
             // Probe: what does an attn_norm weight actually look like?
             // Helps disambiguate the Gemma "+1.0 offset" convention.
