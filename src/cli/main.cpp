@@ -916,6 +916,56 @@ int main(int argc, char** argv) {
             ctx.ffn_act    = ffn_act;
             ctx.rope_mode  = rope_mode;
 
+            // Probe: what does an attn_norm weight actually look like?
+            // Helps disambiguate the Gemma "+1.0 offset" convention.
+            if (spW.n_layers > 0 && !spW.attn_norm_w[0].empty()) {
+                double sum = 0, sum_sq = 0; float mn = 1e9, mx = -1e9;
+                const auto& v = spW.attn_norm_w[0];
+                for (float x : v) {
+                    sum += x; sum_sq += (double)x*x;
+                    if (x < mn) mn = x;
+                    if (x > mx) mx = x;
+                }
+                double mean = sum / v.size();
+                double var = sum_sq / v.size() - mean * mean;
+                std::fprintf(stderr,
+                    "[probe] attn_norm[0]: n=%zu  mean=%.4f  std=%.4f  min=%.4f  max=%.4f\n",
+                    v.size(), mean, std::sqrt(var), (double)mn, (double)mx);
+            }
+
+            // Phase 2.3b iter 4 — Gemma RMSNorm convention.
+            //
+            // HF stores gemma norm gains as (true_gain - 1.0). Forward
+            // computes  x_norm * (1 + w_stored). Whether the GGUF
+            // converter pre-bakes the +1.0 varies by converter version.
+            //
+            // If SP_ENGINE_GEMMA_PLUS_ONE=1, we fold the +1.0 into the
+            // stored weights at load time so the rest of the pipeline
+            // uses the standard x_norm * w pattern unchanged.
+            const bool gemma_plus_one = []() {
+                const char* e = std::getenv("SP_ENGINE_GEMMA_PLUS_ONE");
+                return e && std::atoi(e) != 0;
+            }();
+            if (is_gemma_family && gemma_plus_one) {
+                int n_offset = 0;
+                auto offset_vec = [&](std::vector<float>& v) {
+                    for (auto& x : v) x += 1.0f;
+                    if (!v.empty()) ++n_offset;
+                };
+                offset_vec(spW.final_norm_w);
+                for (int L = 0; L < spW.n_layers; ++L) {
+                    offset_vec(spW.attn_norm_w[L]);
+                    offset_vec(spW.ffn_norm_w[L]);
+                    offset_vec(spW.attn_q_norm_w[L]);
+                    offset_vec(spW.attn_k_norm_w[L]);
+                    offset_vec(spW.attn_post_norm_w[L]);
+                    offset_vec(spW.ffn_post_norm_w[L]);
+                }
+                std::fprintf(stderr,
+                    "[sp-engine] perplexity-native: SP_ENGINE_GEMMA_PLUS_ONE=1 "
+                    "— folded +1.0 into %d norm tensors\n", n_offset);
+            }
+
             // Phase 2.3b iter 3 — Gemma3 SWA + softcap from GGUF metadata.
             //
             // SP_ENGINE_NATIVE_NO_SWA=1 disables the per-layer SWA / RoPE
