@@ -307,20 +307,39 @@ void sp_attention_poly_ring(const sp_ok_tensor& q,
         return enabled;
     }();
     const bool use_ntt_here = g_use_ntt && (N == SP_NTT_N);
-    // Phase 5b: hoist NTT(Q) out of the per-t inner loop. We compute
-    // NTT(Q) once per (h, qi) and reuse it for every t. K is encoded
-    // and forward-NTT'd per t inside the cached dot product.
-    std::vector<int64_t>  ntt_Q_int_scratch;  // [SP_NTT_N]
-    std::vector<uint64_t> ntt_Q_buf;          // [SP_NTT_N] — NTT(Q) cached
-    std::vector<int64_t>  ntt_K_int_scratch;  // [SP_NTT_N]
-    std::vector<uint64_t> ntt_K_buf;          // [SP_NTT_N] — NTT(K_rev) per t
-    std::vector<uint64_t> ntt_C_buf;          // [SP_NTT_N] — product NTT domain
+    // Phase 5b: hoist NTT(Q) out of the per-t inner loop. Phase 6: also
+    // pre-NTT every K once per call into K_ntt_cache so the (qi, t) inner
+    // loop is just pointwise multiply + inverse + extract. K's NTT only
+    // depends on (kv_h, t), not on (h, qi), so each K is transformed once
+    // and reused across all queries in this attention call.
+    std::vector<int64_t>  ntt_Q_int_scratch;       // [SP_NTT_N]
+    std::vector<uint64_t> ntt_Q_buf;               // [SP_NTT_N]
+    std::vector<int64_t>  ntt_K_int_scratch;       // [SP_NTT_N]
+    std::vector<uint64_t> ntt_C_buf;               // [SP_NTT_N]
+    std::vector<uint64_t> K_ntt_cache;             // [n_kv_head * T_valid * SP_NTT_N]
+    std::vector<float>    k_decode_buf;            // [head_dim]
     if (use_ntt_here) {
         ntt_Q_int_scratch.assign(SP_NTT_N, 0);
         ntt_Q_buf.assign(SP_NTT_N, 0);
         ntt_K_int_scratch.assign(SP_NTT_N, 0);
-        ntt_K_buf.assign(SP_NTT_N, 0);
         ntt_C_buf.assign(SP_NTT_N, 0);
+        K_ntt_cache.assign((size_t)n_kv_head * (size_t)T_valid * (size_t)SP_NTT_N, 0);
+        k_decode_buf.assign(head_dim, 0.0f);
+        // Pre-compute NTT(K_rev) for every (kv_h, t) once.
+        for (int kvh = 0; kvh < n_kv_head; ++kvh) {
+            for (int64_t t = 0; t < T_valid; ++t) {
+                for (int d = 0; d < head_dim; ++d) {
+                    const sp_ok_t& k_dt =
+                        k.data[((int64_t)kvh * head_dim + d) * T_stride + t];
+                    k_decode_buf[d] = (float)((double)k_dt.a / k_div);
+                }
+                uint64_t* slot = K_ntt_cache.data() +
+                    ((size_t)kvh * (size_t)T_valid + (size_t)t) * (size_t)SP_NTT_N;
+                sp_poly_encode_ntt_k_reversed(slot, k_decode_buf.data(),
+                                              head_dim, delta,
+                                              ntt_K_int_scratch.data());
+            }
+        }
     }
 
     for (int h = 0; h < n_head; ++h) {
@@ -349,25 +368,22 @@ void sp_attention_poly_ring(const sp_ok_tensor& q,
 
             // Per-t scores via polynomial-ring dot product.
             for (int64_t t = 0; t < T_valid; ++t) {
-                // Decode K for this (kv_h, t).
-                for (int d = 0; d < head_dim; ++d) {
-                    const sp_ok_t& k_dt =
-                        k.data[((int64_t)kv_h * head_dim + d) * T_stride + t];
-                    k_vec[d] = (float)((double)k_dt.a / k_div);
-                }
                 float dot;
                 if (use_ntt_here) {
-                    int ok = 0;
-                    dot = sp_poly_dot_product_ntt_q_cached(
-                        ntt_Q_buf.data(), k_vec.data(), head_dim, delta,
-                        ntt_K_int_scratch.data(), ntt_K_buf.data(),
-                        ntt_C_buf.data(), &ok);
-                    if (!ok) {
-                        dot = sp_poly_dot_product(
-                            q_vec.data(), k_vec.data(), head_dim, N, delta,
-                            poly_scratch.data());
-                    }
+                    // Phase 6: K is already in NTT domain in K_ntt_cache.
+                    const uint64_t* K_ntt =
+                        K_ntt_cache.data() +
+                        ((size_t)kv_h * (size_t)T_valid + (size_t)t) * (size_t)SP_NTT_N;
+                    dot = sp_poly_dot_product_ntt_qk_cached(
+                        ntt_Q_buf.data(), K_ntt, head_dim, delta,
+                        ntt_C_buf.data());
                 } else {
+                    // Decode K for this (kv_h, t) only on the fallback path.
+                    for (int d = 0; d < head_dim; ++d) {
+                        const sp_ok_t& k_dt =
+                            k.data[((int64_t)kv_h * head_dim + d) * T_stride + t];
+                        k_vec[d] = (float)((double)k_dt.a / k_div);
+                    }
                     dot = sp_poly_dot_product(
                         q_vec.data(), k_vec.data(), head_dim, N, delta,
                         poly_scratch.data());
