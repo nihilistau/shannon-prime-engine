@@ -233,7 +233,8 @@ void sp_attention_poly_ring(const sp_ok_tensor& q,
                               int   t_stride_arg,
                               int   pos_offset_arg,
                               int   swa_window,
-                              float attn_logit_softcap) {
+                              float attn_logit_softcap,
+                              const uint64_t* k_ntt_slab) {
     if (q.data == nullptr || k.data == nullptr || v.data == nullptr ||
         out.data == nullptr) return;
     if (n_head <= 0 || n_kv_head <= 0 || head_dim <= 0) return;
@@ -323,23 +324,27 @@ void sp_attention_poly_ring(const sp_ok_tensor& q,
         ntt_Q_buf.assign(SP_NTT_N, 0);
         ntt_K_int_scratch.assign(SP_NTT_N, 0);
         ntt_C_buf.assign(SP_NTT_N, 0);
-        K_ntt_cache.assign((size_t)n_kv_head * (size_t)T_valid * (size_t)SP_NTT_N, 0);
-        k_decode_buf.assign(head_dim, 0.0f);
-        // Pre-compute NTT(K_rev) for every (kv_h, t) once.
-        for (int kvh = 0; kvh < n_kv_head; ++kvh) {
-            for (int64_t t = 0; t < T_valid; ++t) {
-                for (int d = 0; d < head_dim; ++d) {
-                    const sp_ok_t& k_dt =
-                        k.data[((int64_t)kvh * head_dim + d) * T_stride + t];
-                    k_decode_buf[d] = (float)((double)k_dt.a / k_div);
+        if (k_ntt_slab == nullptr) {
+            // Phase 6: in-call build of the K-NTT cache.
+            K_ntt_cache.assign((size_t)n_kv_head * (size_t)T_valid * (size_t)SP_NTT_N, 0);
+            k_decode_buf.assign(head_dim, 0.0f);
+            for (int kvh = 0; kvh < n_kv_head; ++kvh) {
+                for (int64_t t = 0; t < T_valid; ++t) {
+                    for (int d = 0; d < head_dim; ++d) {
+                        const sp_ok_t& k_dt =
+                            k.data[((int64_t)kvh * head_dim + d) * T_stride + t];
+                        k_decode_buf[d] = (float)((double)k_dt.a / k_div);
+                    }
+                    uint64_t* slot = K_ntt_cache.data() +
+                        ((size_t)kvh * (size_t)T_valid + (size_t)t) * (size_t)SP_NTT_N;
+                    sp_poly_encode_ntt_k_reversed(slot, k_decode_buf.data(),
+                                                  head_dim, delta,
+                                                  ntt_K_int_scratch.data());
                 }
-                uint64_t* slot = K_ntt_cache.data() +
-                    ((size_t)kvh * (size_t)T_valid + (size_t)t) * (size_t)SP_NTT_N;
-                sp_poly_encode_ntt_k_reversed(slot, k_decode_buf.data(),
-                                              head_dim, delta,
-                                              ntt_K_int_scratch.data());
             }
         }
+        // Else: Phase 7 — caller supplied a persistent slab. We index into it
+        // directly at (kvh * T_stride + t) * SP_NTT_N during the inner loop.
     }
 
     for (int h = 0; h < n_head; ++h) {
@@ -370,10 +375,13 @@ void sp_attention_poly_ring(const sp_ok_tensor& q,
             for (int64_t t = 0; t < T_valid; ++t) {
                 float dot;
                 if (use_ntt_here) {
-                    // Phase 6: K is already in NTT domain in K_ntt_cache.
-                    const uint64_t* K_ntt =
-                        K_ntt_cache.data() +
-                        ((size_t)kv_h * (size_t)T_valid + (size_t)t) * (size_t)SP_NTT_N;
+                    const uint64_t* K_ntt = (k_ntt_slab != nullptr)
+                        // Phase 7: persistent slab, indexed by t_stride.
+                        ? (k_ntt_slab +
+                            ((size_t)kv_h * (size_t)T_stride + (size_t)t) * (size_t)SP_NTT_N)
+                        // Phase 6: in-call cache, indexed by T_valid.
+                        : (K_ntt_cache.data() +
+                            ((size_t)kv_h * (size_t)T_valid + (size_t)t) * (size_t)SP_NTT_N);
                     dot = sp_poly_dot_product_ntt_qk_cached(
                         ntt_Q_buf.data(), K_ntt, head_dim, delta,
                         ntt_C_buf.data());

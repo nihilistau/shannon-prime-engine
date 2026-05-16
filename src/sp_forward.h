@@ -88,6 +88,14 @@ struct sp_forward_context {
     //   1 = CKKS polynomial-ring (Z[x]/(x^N+1) negacyclic convolution)
     int    attn_mode            = 0;
 
+    // Phase 7: persistent NTT-domain K cache (only allocated when
+    // attn_mode == 1 AND SP_ENGINE_POLY_NTT_K_PERSIST=1). Sized
+    // [n_layers * n_kv_head * n_ctx * SP_NTT_N] uint64s. Populated at
+    // each K-append site; consumed by sp_attention_poly_ring via its
+    // k_ntt_slab parameter. Empty means "off".
+    std::vector<uint64_t> k_ntt_cache;
+    bool                  k_ntt_persist = false;
+
     // Poncelet adaptive depth tracking (Paper A §7, Theorem 5).
     sp_ok_t poncelet_delta = sp_ok_t{ 0, 0 };
 };

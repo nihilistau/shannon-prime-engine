@@ -10,6 +10,9 @@
 #include "gguf_loader.h"
 #include "http_server.h"
 #include "sp_load_shim.h"
+extern "C" {
+#include "../lib/shannon-prime/core/sp_ntt_consts.h"
+}
 #include "kv_cache.h"
 #include "llama_weights.h"
 #include "prime_pe.h"
@@ -962,10 +965,28 @@ int main(int argc, char** argv) {
             if (const char* e = std::getenv("SP_ENGINE_POLY_ATTN")) {
                 ctx.attn_mode = std::atoi(e) ? 1 : 0;
             }
+            // Phase 7: persistent NTT-domain K cache.
+            if (const char* e = std::getenv("SP_ENGINE_POLY_NTT_K_PERSIST")) {
+                ctx.k_ntt_persist = std::atoi(e) ? true : false;
+            }
+            if (ctx.attn_mode == 1 && ctx.k_ntt_persist
+                && ctx.head_dim <= SP_NTT_N) {
+                const size_t slab_count =
+                    (size_t)ctx.n_layers * (size_t)ctx.n_kv_head *
+                    (size_t)ctx.n_ctx    * (size_t)SP_NTT_N;
+                ctx.k_ntt_cache.assign(slab_count, 0);
+                std::fprintf(stderr,
+                    "[sp-engine] perplexity-native: K_NTT persistent cache = "
+                    "%.1f MB (n_layers=%d, n_kv_head=%d, n_ctx=%d, N=%d)\n",
+                    (double)(slab_count * sizeof(uint64_t)) / (1024.0 * 1024.0),
+                    ctx.n_layers, ctx.n_kv_head, ctx.n_ctx, (int)SP_NTT_N);
+            }
             std::fprintf(stderr,
-                "[sp-engine] perplexity-native: attn_mode=%s\n",
+                "[sp-engine] perplexity-native: attn_mode=%s%s\n",
                 ctx.attn_mode == 1 ? "POLY_RING(Z[x]/(x^N+1))"
-                                    : "DOT_PRODUCT");
+                                    : "DOT_PRODUCT",
+                (ctx.attn_mode == 1 && !ctx.k_ntt_cache.empty())
+                    ? " +K_NTT_PERSIST" : "");
 
             // Probe: what does an attn_norm weight actually look like?
             // Helps disambiguate the Gemma "+1.0 offset" convention.

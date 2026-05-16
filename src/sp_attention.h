@@ -10,6 +10,8 @@
 
 #pragma once
 
+#include <cstdint>
+
 #include "sp_ok_tensor.h"
 
 namespace sp::engine {
@@ -84,6 +86,12 @@ void sp_attention_weil_pairing(const sp_ok_tensor& q,
 // inside per (qi, t) pair, with N picked as the smallest power of 2 ≥
 // head_dim (typically N = 2*head_dim).
 // =========================================================================
+// Phase 7 optional: persistent K-NTT slab. When non-null, the caller is
+// asserting that for every (kv_h, t) in [0, T_valid), the slot at offset
+// (kv_h * t_stride + t) * SP_NTT_N already holds the forward NTT of the
+// reversed-encoded K at that position. The attention function then skips
+// the K decode + encode + forward NTT and goes straight to the pointwise
+// multiply. When null (default), Phase 6 in-call build is used.
 void sp_attention_poly_ring(const sp_ok_tensor& q,
                               const sp_ok_tensor& k,
                               const sp_ok_tensor& v,
@@ -93,6 +101,7 @@ void sp_attention_poly_ring(const sp_ok_tensor& q,
                               int   t_stride             = -1,
                               int   pos_offset           = -1,
                               int   swa_window           = 0,
-                              float attn_logit_softcap   = 0.0f);
+                              float attn_logit_softcap   = 0.0f,
+                              const uint64_t* k_ntt_slab = nullptr);
 
 }  // namespace sp::engine
