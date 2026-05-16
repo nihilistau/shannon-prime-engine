@@ -86,3 +86,16 @@ add_test(NAME sp_bridges COMMAND test_sp_bridges)
 add_executable(test_sp_attention_ffn test_sp_attention_ffn.cpp)
 target_link_libraries(test_sp_attention_ffn PRIVATE sp_engine)
 add_test(NAME sp_attention_ffn COMMAND test_sp_attention_ffn)
+
+# ─── SP Phase 2.2b: RoPE, KV cache, multi-token prefill, weights API ──
+add_executable(test_sp_rope_kvcache test_sp_rope_kvcache.cpp)
+target_link_libraries(test_sp_rope_kvcache PRIVATE sp_engine)
+add_test(NAME sp_rope_kvcache COMMAND test_sp_rope_kvcache)
+
+add_executable(test_sp_prefill test_sp_prefill.cpp)
+target_link_libraries(test_sp_prefill PRIVATE sp_engine)
+add_test(NAME sp_prefill COMMAND test_sp_prefill)
+
+add_executable(test_sp_weights test_sp_weights.cpp)
+target_link_libraries(test_sp_weights PRIVATE sp_engine)
+add_test(NAME sp_weights COMMAND test_sp_weights)

@@ -139,10 +139,11 @@ TEST(attention_dot_product_matches_fp32_reference) {
     // Encode q, k, v into sp_ok_tensors.
     sp_ok_arena arena(64 * 1024);
     sp_ok_tensor Q, K, V, OUT;
-    int64_t q_shape[4] = { d_q, 1, 1, 1 };  // shape[0]=d_q inner, shape[1]=1 outer
-    int64_t k_shape[4] = { T, d_q, 1, 1 };  // shape[0]=T inner (token dim), shape[1]=d_q outer
+    // Phase 2.2b convention: shape = { n_tokens, n_features }
+    int64_t q_shape[4] = { 1, d_q, 1, 1 };  // 1 query token, d_q features
+    int64_t k_shape[4] = { T, d_q, 1, 1 };  // T history positions, d_q features
     int64_t v_shape[4] = { T, d_q, 1, 1 };
-    int64_t out_shape[4] = { d_q, 1, 1, 1 };
+    int64_t out_shape[4] = { 1, d_q, 1, 1 };
 
     // But wait — our attention reads k.data[((kv_h*head_dim + d)*T + t]
     // which means K has rows (kv_h*head_dim + d) of length T. That's:
