@@ -443,6 +443,15 @@ bool sp_forward_step(sp_forward_context& ctx,
 
     for (int L = 0; L < ctx.n_layers; ++L) {
         ctx.layer_arena.reset();
+        // Phase 2.3b iter 3 — per-layer SWA dispatch.
+        // Gemma3 pattern: layer L is SWA-local iff (L+1) % period != 0.
+        // If ctx.swa_window <= 0, every layer is global (full attention).
+        const bool layer_is_swa =
+            (ctx.swa_window > 0) &&
+            (((L + 1) % ctx.swa_pattern_period) != 0);
+        const float layer_rope_base = layer_is_swa
+            ? ctx.swa_rope_base : ctx.rope_base;
+        const int   layer_swa_window = layer_is_swa ? ctx.swa_window : 0;
 
         // 2a) Encode x_fp32 → x_ok.
         if (!encode_residual_to_ok(ctx.x_ok, ctx.x_fp32.data(),
@@ -500,11 +509,15 @@ bool sp_forward_step(sp_forward_context& ctx,
             }
         }
 
-        // 2d) RoPE on Q and K (frobenius_scale → 1 after each call).
+        // 2d) RoPE on Q and K (frobenius_scale → 1 after each call). The
+        //     per-layer rope_base is `layer_rope_base` (swa_rope_base for
+        //     local layers, ctx.rope_base for global layers).
         if (!sp_rope_apply_ok(ctx.q_ok, n_head,    head_dim, n_tokens,
-                                rope_pos, ctx.rope_base, 1.0f)) return false;
+                                rope_pos, layer_rope_base, 1.0f,
+                                ctx.rope_mode)) return false;
         if (!sp_rope_apply_ok(ctx.k_ok, n_kv_head, head_dim, n_tokens,
-                                rope_pos, ctx.rope_base, 1.0f)) return false;
+                                rope_pos, layer_rope_base, 1.0f,
+                                ctx.rope_mode)) return false;
         // V keeps its post-matmul frobenius_scale (matches v cache slot).
 
         // Sanity: K/V must match the cache's stored scales for the strict
@@ -552,7 +565,10 @@ bool sp_forward_step(sp_forward_context& ctx,
         ctx.attn_out_ok.scale_recip = S;
         sp_attention_dot_product(ctx.q_ok, K_view, V_view, ctx.attn_out_ok,
                                     n_head, n_kv_head, head_dim,
-                                    t_valid, t_stride, position);
+                                    t_valid, t_stride, position,
+                                    /*swa_window*/ layer_swa_window,
+                                    /*attn_logit_softcap*/
+                                        ctx.attn_logit_softcap);
         // attn_out_ok now has frobenius_scale=1.
 
         // 2g) Wo projection → fp32 (absorbs pi^k via Theorem 4).
@@ -652,6 +668,19 @@ bool sp_forward_step(sp_forward_context& ctx,
                                 logits_out.data(),
                                 weights.vocab, n_tokens)) {
         return false;
+    }
+
+    // 5) Phase 2.3b iter 3 — final-logit softcap (Gemma3).
+    //   logit = tanh(logit / cap) * cap
+    // Bounded outputs prevent any single token's logit from dominating
+    // the softmax denominator, sharpening calibration. No-op when
+    // final_logit_softcap == 0.
+    if (ctx.final_logit_softcap > 0.0f) {
+        const float cap     = ctx.final_logit_softcap;
+        const float inv_cap = 1.0f / cap;
+        for (int i = 0; i < weights.vocab; ++i) {
+            logits_out[i] = std::tanh(logits_out[i] * inv_cap) * cap;
+        }
     }
     return true;
 }

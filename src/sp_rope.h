@@ -28,6 +28,18 @@
 
 namespace sp::engine {
 
+// RoPE rotation layout. Matches the ggml convention:
+//   NORMAL — adjacent pairs (2k, 2k+1) get rotated together. Used by
+//            Llama, Mistral, Granite.
+//   NEOX   — half-pairs (k, k + n_rot/2) get rotated together. Used by
+//            Qwen, Phi, Gemma 1/2/3, Phi-3. Picking the wrong mode
+//            scrambles Q/K relative phase and destroys long-context
+//            attention.
+enum class sp_rope_mode {
+    NORMAL = 0,
+    NEOX   = 1,
+};
+
 // Apply RoPE in place to an O_K-coordinate Q or K tensor.
 //
 // qk:        shape = { n_tokens, n_heads * head_dim }. Modified in place.
@@ -37,6 +49,7 @@ namespace sp::engine {
 // positions: per-token absolute position [n_tokens] (int32).
 // freq_base: RoPE theta base (e.g. 10000 or 1000000 depending on model).
 // freq_scale: RoPE freq scale multiplier (1.0 standard; <1 for extended ctx).
+// mode:      NORMAL (default) or NEOX (Qwen/Phi/Gemma family).
 //
 // Returns false on shape mismatch / null data.
 //
@@ -51,7 +64,8 @@ bool sp_rope_apply_ok(sp_ok_tensor&      qk,
                        int                n_tokens,
                        const int32_t*     positions,
                        float              freq_base,
-                       float              freq_scale);
+                       float              freq_scale,
+                       sp_rope_mode       mode = sp_rope_mode::NORMAL);
 
 // Convenience overload: same positions buffer for a contiguous run
 // [start_pos, start_pos + n_tokens). Common case for prefill.
@@ -61,6 +75,7 @@ bool sp_rope_apply_ok_contig(sp_ok_tensor& qk,
                               int           n_tokens,
                               int           start_pos,
                               float         freq_base,
-                              float         freq_scale);
+                              float         freq_scale,
+                              sp_rope_mode  mode = sp_rope_mode::NORMAL);
 
 }  // namespace sp::engine

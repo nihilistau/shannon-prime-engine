@@ -17,6 +17,7 @@
 #include "sp_ok_tensor.h"
 #include "sp_kv_cache_ok.h"
 #include "sp_ffn.h"
+#include "sp_rope.h"
 #include "engine.h"
 
 #include <cstddef>
@@ -66,10 +67,21 @@ struct sp_forward_context {
     int     n_ctx      = 0;       // max cache len
     int64_t residual_scale = 0;   // scale_recip for x_ok encoding
     float   rms_eps    = 1e-5f;
-    float   rope_base  = 10000.0f;
-    // Phase 2.3b iter 2 — Gemma3 arch knobs:
+    float        rope_base  = 10000.0f;
+    sp_rope_mode rope_mode  = sp_rope_mode::NORMAL;  // NEOX for qwen/phi/gemma family
+    // Phase 2.3b iter 2 — Gemma family arch knobs:
     float       embd_scale = 1.0f;                 // sqrt(n_embd) for gemma
     sp_ffn_act  ffn_act    = sp_ffn_act::SwiGLU;   // GeGLU_tanh for gemma
+    // Phase 2.3b iter 3 — Gemma3 SWA / softcap knobs (0 = disabled).
+    // Gemma3 alternates 5 SWA "local" layers : 1 "global" layer.
+    // A layer is SWA-local iff (L + 1) % swa_pattern_period != 0
+    // AND swa_window > 0. Local layers use `swa_rope_base` (typically
+    // 10000); global layers use `rope_base` (typically 1e6).
+    int    swa_window           = 0;
+    float  swa_rope_base        = 10000.0f;
+    int    swa_pattern_period   = 6;       // gemma3 default
+    float  attn_logit_softcap   = 0.0f;    // > 0 caps QK^T/sqrt(d)
+    float  final_logit_softcap  = 0.0f;    // > 0 caps LM-head output
 
     // Poncelet adaptive depth tracking (Paper A §7, Theorem 5).
     sp_ok_t poncelet_delta = sp_ok_t{ 0, 0 };

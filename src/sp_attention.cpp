@@ -29,6 +29,7 @@
 #include "sp_bridges.h"
 #include "sp_ok_encode.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <limits>
@@ -41,9 +42,11 @@ void sp_attention_dot_product(const sp_ok_tensor& q,
                                 const sp_ok_tensor& v,
                                 sp_ok_tensor&       out,
                                 int n_head, int n_kv_head, int head_dim,
-                                int t_valid_arg,
-                                int t_stride_arg,
-                                int pos_offset_arg) {
+                                int   t_valid_arg,
+                                int   t_stride_arg,
+                                int   pos_offset_arg,
+                                int   swa_window,
+                                float attn_logit_softcap) {
     if (q.data == nullptr || k.data == nullptr || v.data == nullptr ||
         out.data == nullptr) return;
     if (n_head <= 0 || n_kv_head <= 0 || head_dim <= 0) return;
@@ -96,6 +99,13 @@ void sp_attention_dot_product(const sp_ok_tensor& q,
         for (int64_t qi = 0; qi < n_q; ++qi) {
             const int q_pos = pos_offset + (int)qi;
 
+            // SWA range: each query at position q_pos sees positions
+            //   [swa_lo, q_pos]. For a global layer (swa_window=0) this
+            //   degenerates to [0, q_pos], i.e. ordinary causal attention.
+            const int swa_lo = (swa_window > 0)
+                ? std::max(0, q_pos - swa_window + 1)
+                : 0;
+
             // 1) scores[t] = (K_h[t]^T · q_h[qi]) / sqrt(head_dim)
             for (int64_t t = 0; t < T_valid; ++t) {
                 int64_t acc_a = 0;
@@ -111,9 +121,22 @@ void sp_attention_dot_product(const sp_ok_tensor& q,
                                     * (double)inv_sqrt_d);
             }
 
-            // 2) Causal mask: positions t > q_pos are -inf.
+            // 2a) Apply logit softcap BEFORE masking so the masked positions
+            //     stay -inf (tanh(-inf/cap)*cap == -cap which would corrupt
+            //     the softmax denominator). Pre-cap is the same shape as
+            //     ggml_flash_attn_ext's softcap (applied to QK^T/sqrt(d)).
+            if (attn_logit_softcap > 0.0f) {
+                const float cap = attn_logit_softcap;
+                const float inv_cap = 1.0f / cap;
+                for (int64_t t = 0; t < T_valid; ++t) {
+                    scores[t] = std::tanh(scores[t] * inv_cap) * cap;
+                }
+            }
+
+            // 2b) Causal mask + SWA mask: positions t > q_pos OR
+            //     t < swa_lo are -inf.
             for (int64_t t = 0; t < T_valid; ++t) {
-                if ((int)t > q_pos) scores[t] = NEG_INF;
+                if ((int)t > q_pos || (int)t < swa_lo) scores[t] = NEG_INF;
             }
 
             // 3) softmax

@@ -15,7 +15,8 @@ bool sp_rope_apply_ok(sp_ok_tensor&      qk,
                        int                n_tokens,
                        const int32_t*     positions,
                        float              freq_base,
-                       float              freq_scale) {
+                       float              freq_scale,
+                       sp_rope_mode       mode) {
     if (qk.data == nullptr || positions == nullptr) return false;
     if (n_heads <= 0 || head_dim <= 0 || n_tokens <= 0) return false;
     if ((head_dim & 1) != 0) return false;  // pairs of 2
@@ -33,6 +34,8 @@ bool sp_rope_apply_ok(sp_ok_tensor&      qk,
     const int n_pairs = head_dim / 2;
 
     // Pre-compute per-pair frequencies (independent of token).
+    // Per ggml RoPE convention, freq[k] = freq_scale * base^(-2k/head_dim)
+    // for both NORMAL and NEOX modes — only the pair-element layout differs.
     std::vector<float> freqs(n_pairs);
     for (int k = 0; k < n_pairs; ++k) {
         const float exp_arg = -(float)(2 * k) / (float)head_dim;
@@ -48,15 +51,19 @@ bool sp_rope_apply_ok(sp_ok_tensor&      qk,
                 const float c   = std::cos(ang);
                 const float s   = std::sin(ang);
 
-                const int64_t f_even = (int64_t)h * head_dim + 2 * k;
-                const int64_t f_odd  = f_even + 1;
-                // Layout: qk.data[feature * T + token]
-                sp_ok_t& e_even = qk.data[f_even * T_inner + t];
-                sp_ok_t& e_odd  = qk.data[f_odd  * T_inner + t];
+                // NORMAL: pair (2k, 2k+1).
+                // NEOX:   pair (k, k + n_pairs)  i.e. (k, k + head_dim/2).
+                int64_t i_even, i_odd;
+                if (mode == sp_rope_mode::NEOX) {
+                    i_even = (int64_t)h * head_dim + k;
+                    i_odd  = (int64_t)h * head_dim + k + n_pairs;
+                } else {
+                    i_even = (int64_t)h * head_dim + 2 * k;
+                    i_odd  = i_even + 1;
+                }
+                sp_ok_t& e_even = qk.data[i_even * T_inner + t];
+                sp_ok_t& e_odd  = qk.data[i_odd  * T_inner + t];
 
-                // Decode (drop b — values come from a Frobenius-shimmed
-                // matmul where b stays proportional to the input b=0,
-                // i.e. b is "small noise" not signal).
                 const double a = (double)e_even.a / divisor;
                 const double b = (double)e_odd.a  / divisor;
 
@@ -70,8 +77,6 @@ bool sp_rope_apply_ok(sp_ok_tensor&      qk,
             }
         }
     }
-    // Re-encoded post-RoPE values are at scale_recip with Frobenius factor
-    // absorbed.
     qk.frobenius_scale = 1;
     return true;
 }
@@ -82,11 +87,12 @@ bool sp_rope_apply_ok_contig(sp_ok_tensor& qk,
                               int           n_tokens,
                               int           start_pos,
                               float         freq_base,
-                              float         freq_scale) {
+                              float         freq_scale,
+                              sp_rope_mode  mode) {
     std::vector<int32_t> pos(n_tokens);
     for (int t = 0; t < n_tokens; ++t) pos[t] = start_pos + t;
     return sp_rope_apply_ok(qk, n_heads, head_dim, n_tokens,
-                             pos.data(), freq_base, freq_scale);
+                             pos.data(), freq_base, freq_scale, mode);
 }
 
 }  // namespace sp::engine

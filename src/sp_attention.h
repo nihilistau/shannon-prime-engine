@@ -38,14 +38,23 @@ namespace sp::engine {
 // larger than the valid length. If t_stride < 0, uses k.shape[0] as the
 // stride. `t_valid` is the number of valid history positions to attend
 // over; if < 0, uses k.shape[0].
+// Optional Phase 2.3b iter 3 args:
+//   swa_window: > 0 enables sliding-window attention. Query at position
+//               p attends only to history positions in
+//               [max(0, p - swa_window + 1), p].
+//   attn_logit_softcap: > 0 applies tanh(score / cap) * cap to the
+//                       (scaled) scores before softmax — matches Gemma3's
+//                       attention.logit_softcapping.
 void sp_attention_dot_product(const sp_ok_tensor& q,
                                 const sp_ok_tensor& k,
                                 const sp_ok_tensor& v,
                                 sp_ok_tensor&       out,
                                 int n_head, int n_kv_head, int head_dim,
-                                int t_valid   = -1,
-                                int t_stride  = -1,
-                                int pos_offset = -1);
+                                int   t_valid              = -1,
+                                int   t_stride             = -1,
+                                int   pos_offset           = -1,
+                                int   swa_window           = 0,
+                                float attn_logit_softcap   = 0.0f);
 
 // Weil-pairing attention (Paper A §9.2). Phase 4 work.
 //

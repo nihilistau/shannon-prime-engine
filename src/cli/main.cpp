@@ -880,21 +880,76 @@ int main(int argc, char** argv) {
             const sp::engine::sp_ffn_act ffn_act = is_gemma_family
                 ? sp::engine::sp_ffn_act::GeGLU_tanh
                 : sp::engine::sp_ffn_act::SwiGLU;
+            // RoPE rotation mode. Llama/Mistral/Granite use NORMAL
+            // (adjacent pairs); Qwen/Phi/Gemma family use NEOX
+            // (half-pairs). Picking the wrong mode scrambles Q/K
+            // relative phase.
+            const bool arch_is_neox =
+                is_gemma_family ||
+                (native_arch == "qwen2"  || native_arch == "qwen3"  ||
+                 native_arch == "qwen35" || native_arch == "qwen35moe" ||
+                 native_arch == "phi3");
+            const sp::engine::sp_rope_mode rope_mode = arch_is_neox
+                ? sp::engine::sp_rope_mode::NEOX
+                : sp::engine::sp_rope_mode::NORMAL;
+            // RMS-norm epsilon (Llama-3=1e-5, Qwen3=1e-6, etc.).
+            const std::string rms_eps_key =
+                native_arch + ".attention.layer_norm_rms_epsilon";
+            const float rms_eps = (float)m->get_f64(rms_eps_key, 1e-5);
             std::fprintf(stderr,
                 "[sp-engine] perplexity-native: rope_freq_base=%.1f  "
-                "embd_scale=%.3f  ffn_act=%s\n",
-                (double)native_rope_base, (double)embd_scale,
+                "rope_mode=%s  embd_scale=%.3f  ffn_act=%s  rms_eps=%.2e\n",
+                (double)native_rope_base,
+                rope_mode == sp::engine::sp_rope_mode::NEOX ? "NEOX" : "NORMAL",
+                (double)embd_scale,
                 ffn_act == sp::engine::sp_ffn_act::GeGLU_tanh
-                  ? "GeGLU_tanh" : "SwiGLU");
+                  ? "GeGLU_tanh" : "SwiGLU",
+                (double)rms_eps);
             if (!sp::engine::sp_forward_context_init(
                     ctx, spW, /*n_ctx*/ n_ctx,
-                    /*rope_base*/ native_rope_base, /*rms_eps*/ 1e-5f)) {
+                    /*rope_base*/ native_rope_base, /*rms_eps*/ rms_eps)) {
                 std::fprintf(stderr,
                     "[sp-engine] perplexity-native: context init failed\n");
                 return 8;
             }
             ctx.embd_scale = embd_scale;
             ctx.ffn_act    = ffn_act;
+            ctx.rope_mode  = rope_mode;
+
+            // Phase 2.3b iter 3 — Gemma3 SWA + softcap from GGUF metadata.
+            //
+            // SP_ENGINE_NATIVE_NO_SWA=1 disables the per-layer SWA / RoPE
+            // swap for A/B testing — useful when comparing iter-2 vs iter-3
+            // behavior without rebuilding.
+            const bool no_swa = []() {
+                const char* e = std::getenv("SP_ENGINE_NATIVE_NO_SWA");
+                return e && std::atoi(e) != 0;
+            }();
+            if (native_arch == "gemma3" && !no_swa) {
+                const int64_t swa_w =
+                    m->get_i64("gemma3.attention.sliding_window", 0);
+                const double attn_cap =
+                    m->get_f64("gemma3.attention.logit_softcapping", 0.0);
+                const double final_cap =
+                    m->get_f64("gemma3.final_logit_softcapping", 0.0);
+                if (swa_w > 0)    ctx.swa_window           = (int)swa_w;
+                if (attn_cap > 0) ctx.attn_logit_softcap   = (float)attn_cap;
+                if (final_cap > 0) ctx.final_logit_softcap = (float)final_cap;
+                ctx.swa_rope_base      = 10000.0f;   // gemma3 local layers
+                ctx.swa_pattern_period = 6;          // 5 local : 1 global
+                std::fprintf(stderr,
+                    "[sp-engine] perplexity-native: gemma3 SWA window=%d  "
+                    "attn_softcap=%.2f  final_softcap=%.2f  "
+                    "swa_rope_base=%.1f  pattern=5L:1G\n",
+                    ctx.swa_window,
+                    (double)ctx.attn_logit_softcap,
+                    (double)ctx.final_logit_softcap,
+                    (double)ctx.swa_rope_base);
+            } else if (no_swa) {
+                std::fprintf(stderr,
+                    "[sp-engine] perplexity-native: SP_ENGINE_NATIVE_NO_SWA=1 "
+                    "— uniform rope_base, no SWA dispatch\n");
+            }
             std::fprintf(stderr,
                 "[sp-engine] perplexity-native: ctx ready  n_layers=%d "
                 "n_embd=%d n_head=%d n_kv_head=%d head_dim=%d d_ff=%d "
