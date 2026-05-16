@@ -13,6 +13,8 @@
 #include "kv_cache.h"
 #include "llama_weights.h"
 #include "prime_pe.h"
+#include "sp_forward.h"
+#include "sp_weights_loader.h"
 #include "tokenizer.h"
 #include "vocab.h"
 
@@ -813,6 +815,160 @@ int main(int argc, char** argv) {
             W = sp::engine::LlamaWeights::load(*m, bk, ngl);
         }
         if (!tk || !W) return 3;
+
+        // Phase 2.3: SP_ENGINE_NATIVE=1 routes through the native O_K
+        // forward pass (sp_forward_step) instead of forward.cpp + the
+        // in-place fp16 shim. The native path:
+        //   - encodes every shim-list weight as sp_ok_tensor at load
+        //   - applies the Frobenius shim in the O_K coordinate ring
+        //   - runs the entire forward pass on integer (a, b) coordinates
+        //     with fp32 bridges only at the transcendental boundaries
+        //     (RMS sqrt, softmax exp, silu sigmoid)
+        // Theorem 4 cancellation happens INSIDE the matmul reduction —
+        // no decode-back-to-fp16 round trip.
+        const bool native = []() {
+            const char* e = std::getenv("SP_ENGINE_NATIVE");
+            return e && std::atoi(e) != 0;
+        }();
+        if (native) {
+            std::fprintf(stderr,
+                "[sp-engine] perplexity: SP_ENGINE_NATIVE=1 — routing "
+                "through native O_K forward pass.\n");
+
+            // Build sp_weights directly from the loaded LlamaWeights.
+            // sp_weights_load_from_llama internally applies the
+            // Frobenius shim per pc.frobenius_quant / pc.sato_tate_mix,
+            // so we MUST NOT also call W->apply_frobenius_shim above —
+            // doing so would double-shim. (We intentionally skipped the
+            // legacy shim call when native is set.)
+            sp::engine::sp_weights spW;
+            const int64_t native_scale = (int64_t)1 << 14;
+            const int native_n_head    = (int)m->n_head();
+            const int native_n_kv_head = (int)m->n_head_kv();
+            const int native_head_dim  = (int)m->head_dim();
+            std::fprintf(stderr,
+                "[sp-engine] perplexity-native: arch=%s n_head=%d n_kv_head=%d head_dim=%d\n",
+                m->architecture().c_str(),
+                native_n_head, native_n_kv_head, native_head_dim);
+            if (!sp::engine::sp_weights_load_from_llama(
+                    spW, *W, pc,
+                    native_n_head, native_n_kv_head, native_head_dim,
+                    native_scale)) {
+                std::fprintf(stderr,
+                    "[sp-engine] perplexity-native: sp_weights load failed. "
+                    "(Phase 2.3 supports STANDARD-kind layers only; gemma3 "
+                    "sandwich norms / MoE / GDN land in Phase 2.3b.)\n");
+                return 8;
+            }
+
+            sp::engine::sp_forward_context ctx;
+            if (!sp::engine::sp_forward_context_init(
+                    ctx, spW, /*n_ctx*/ n_ctx,
+                    /*rope_base*/ 10000.0f, /*rms_eps*/ 1e-5f)) {
+                std::fprintf(stderr,
+                    "[sp-engine] perplexity-native: context init failed\n");
+                return 8;
+            }
+            std::fprintf(stderr,
+                "[sp-engine] perplexity-native: ctx ready  n_layers=%d "
+                "n_embd=%d n_head=%d n_kv_head=%d head_dim=%d d_ff=%d "
+                "vocab=%d scale_recip=%lld v_frob=%lld\n",
+                spW.n_layers, spW.n_embd, spW.n_head, spW.n_kv_head,
+                spW.head_dim, spW.d_ff, spW.vocab,
+                (long long)spW.scale_recip,
+                (long long)spW.wv[0].frobenius_scale);
+
+            // Read the corpus + tokenise.
+            std::FILE* fpn = std::fopen(textfile.c_str(), "rb");
+            if (!fpn) { std::fprintf(stderr, "cannot open %s\n", textfile.c_str()); return 4; }
+            std::fseek(fpn, 0, SEEK_END);
+            const size_t fsize_n = (size_t)std::ftell(fpn);
+            std::fseek(fpn, 0, SEEK_SET);
+            std::string text_n((size_t)fsize_n, '\0');
+            if (std::fread(text_n.data(), 1, fsize_n, fpn) != fsize_n) {
+                std::fclose(fpn); std::fprintf(stderr, "short read\n"); return 4;
+            }
+            std::fclose(fpn);
+
+            std::vector<int32_t> all_ids_n;
+            tk->encode(text_n, /*add_bos=*/true, all_ids_n);
+            std::fprintf(stderr,
+                "[sp-engine] perplexity-native: tokenised %zu bytes -> %zu tokens\n",
+                fsize_n, all_ids_n.size());
+
+            const int total_chunks_n = (int)(all_ids_n.size() / (size_t)n_ctx);
+            const int eval_chunks_n  = (n_chunks > 0 && n_chunks < total_chunks_n)
+                                         ? n_chunks : total_chunks_n;
+            if (eval_chunks_n <= 0) {
+                std::fprintf(stderr, "text too short for ctx=%d (have %zu tokens)\n",
+                             n_ctx, all_ids_n.size());
+                return 6;
+            }
+            const int first_eval_n = n_ctx / 2;
+            std::fprintf(stderr,
+                "[sp-engine] perplexity-native: n_ctx=%d  total_chunks=%d  eval=%d  vocab=%d\n",
+                n_ctx, total_chunks_n, eval_chunks_n, spW.vocab);
+
+            double total_nll_n        = 0.0;
+            long long total_evalled_n = 0;
+            const int32_t bos_n = v->bos_id();
+            std::vector<int32_t> chunk_n((size_t)n_ctx);
+            std::vector<float>   logits_n;
+
+            const auto t_start = std::chrono::steady_clock::now();
+
+            for (int c = 0; c < eval_chunks_n; ++c) {
+                for (int t = 0; t < n_ctx; ++t) {
+                    chunk_n[(size_t)t] = all_ids_n[(size_t)(c * n_ctx + t)];
+                }
+                if (bos_n >= 0) chunk_n[0] = bos_n;
+
+                // Reset KV cache for the new chunk.
+                sp::engine::sp_ok_kv_cache_clear(ctx.kv_cache);
+
+                // Run the chunk token by token.
+                for (int pos = 0; pos < n_ctx; ++pos) {
+                    if (!sp::engine::sp_forward_step(
+                            ctx, spW, chunk_n[(size_t)pos], pos, logits_n)) {
+                        std::fprintf(stderr,
+                            "[sp-engine] perplexity-native: sp_forward_step "
+                            "failed at chunk=%d pos=%d\n", c, pos);
+                        return 7;
+                    }
+                    // Score predictions for positions [first_eval, n_ctx-2].
+                    // logits at pos give P(. | tokens[0..pos]); compare to
+                    // chunk[pos+1].
+                    if (pos >= first_eval_n && pos < n_ctx - 1) {
+                        const float* row = logits_n.data();
+                        const int32_t target = chunk_n[(size_t)(pos + 1)];
+                        float mx = row[0];
+                        for (int k = 1; k < spW.vocab; ++k)
+                            if (row[k] > mx) mx = row[k];
+                        double s = 0.0;
+                        for (int k = 0; k < spW.vocab; ++k)
+                            s += std::exp((double)(row[k] - mx));
+                        const double lse = (double)mx + std::log(s);
+                        total_nll_n += lse - (double)row[target];
+                        total_evalled_n += 1;
+                    }
+                }
+                const double running_ppl =
+                    std::exp(total_nll_n / (double)total_evalled_n);
+                const auto t_now = std::chrono::steady_clock::now();
+                const double elapsed_s = std::chrono::duration<double>(t_now - t_start).count();
+                std::fprintf(stderr,
+                    "  [native] chunk %3d/%d  PPL_running=%.4f  elapsed=%.1fs\n",
+                    c + 1, eval_chunks_n, running_ppl, elapsed_s);
+            }
+            const double mean_nll_n = total_nll_n / (double)total_evalled_n;
+            const double ppl_n      = std::exp(mean_nll_n);
+            std::printf(
+                "PPL_native = %.4f  (over %lld tokens, %d chunks at ctx=%d, "
+                "frobenius_quant=%d sato_tate=%d)\n",
+                ppl_n, total_evalled_n, eval_chunks_n, n_ctx,
+                pc.frobenius_quant ? 1 : 0, pc.sato_tate_mix ? 1 : 0);
+            return 0;
+        }
 
         // Phase 1.8: apply the Frobenius / Sato-Tate shim if requested.
         // Weights get transformed in-place (in side buffers); the forward

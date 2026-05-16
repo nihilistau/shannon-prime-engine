@@ -111,9 +111,9 @@ static inline size_t tensor_bytes(int64_t numel) {
 size_t sp_weights_required_arena_bytes(int n_layers, int n_embd,
                                          int n_head, int n_kv_head,
                                          int d_ff, int vocab) {
-    (void)n_head;
-    const int64_t d_q  = (int64_t)n_embd;          // n_head * head_dim
-    const int64_t d_kv = (int64_t)n_kv_head * (n_embd / std::max(n_head, 1));
+    const int head_dim_local = (n_head > 0) ? (n_embd / n_head) : 0;
+    const int64_t d_q  = (int64_t)n_head    * head_dim_local;
+    const int64_t d_kv = (int64_t)n_kv_head * head_dim_local;
     // Per layer: wq (n_embd*d_q) + wk (n_embd*d_kv) + wv + wo (d_q*n_embd)
     //          + gate (n_embd*d_ff) + up + down (d_ff*n_embd)
     const size_t per_layer =
@@ -133,11 +133,17 @@ size_t sp_weights_required_arena_bytes(int n_layers, int n_embd,
 
 bool sp_weights_alloc(sp_weights& out, int n_layers, int n_embd,
                        int n_head, int n_kv_head, int d_ff, int vocab,
-                       int64_t scale_recip) {
+                       int64_t scale_recip,
+                       int head_dim_arg) {
     if (n_layers <= 0 || n_embd <= 0 || n_head <= 0 || n_kv_head <= 0 ||
         d_ff <= 0 || vocab <= 0 || scale_recip <= 0) return false;
-    if (n_embd % n_head != 0) return false;
-    const int head_dim = n_embd / n_head;
+    int head_dim;
+    if (head_dim_arg > 0) {
+        head_dim = head_dim_arg;
+    } else {
+        if (n_embd % n_head != 0) return false;
+        head_dim = n_embd / n_head;
+    }
     const int64_t d_q  = (int64_t)n_head    * head_dim;
     const int64_t d_kv = (int64_t)n_kv_head * head_dim;
 
@@ -160,8 +166,20 @@ bool sp_weights_alloc(sp_weights& out, int n_layers, int n_embd,
     out.attn_norm_w.resize(n_layers);
     out.ffn_norm_w.resize(n_layers);
 
-    const size_t arena_bytes = sp_weights_required_arena_bytes(
-        n_layers, n_embd, n_head, n_kv_head, d_ff, vocab);
+    // Compute exact arena requirement using the *actual* head_dim
+    // (NOT n_embd/n_head — those can differ, e.g. Gemma3).
+    const size_t per_layer =
+          tensor_bytes((int64_t)n_embd * d_q)
+        + tensor_bytes((int64_t)n_embd * d_kv)
+        + tensor_bytes((int64_t)n_embd * d_kv)
+        + tensor_bytes(d_q * (int64_t)n_embd)
+        + tensor_bytes((int64_t)n_embd * d_ff)
+        + tensor_bytes((int64_t)n_embd * d_ff)
+        + tensor_bytes((int64_t)d_ff   * n_embd);
+    const size_t top =
+          tensor_bytes((int64_t)n_embd * vocab)
+        + tensor_bytes((int64_t)n_embd * vocab);
+    const size_t arena_bytes = per_layer * (size_t)n_layers + top + 4096;
     out.storage.reserve(arena_bytes);
 
     auto alloc_with_shape = [&](sp_ok_tensor& t, int64_t s0, int64_t s1) -> bool {

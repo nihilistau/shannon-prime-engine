@@ -53,6 +53,10 @@ struct sp_weights_fp16_source {
     int n_kv_head  = 0;
     int d_ff       = 0;
     int vocab      = 0;
+    // If 0: use n_embd / n_head (standard). For Gemma3 etc. pass the
+    // model's actual head_dim — d_q = n_head * head_dim may be larger
+    // than n_embd.
+    int head_dim_override = 0;
 
     const uint16_t* tok_embd     = nullptr;   // [vocab * n_embd]
     const uint16_t* lm_head      = nullptr;   // [vocab * n_embd] (may = tok_embd if tied)
@@ -77,12 +81,16 @@ bool sp_weights_load_from_fp16_source(sp_weights& out,
 // Convenience: build the fp16_source from a loaded LlamaWeights instance.
 // Returns false on missing required tensors or unsupported arch.
 //
+// Dims must be passed explicitly (LlamaWeights doesn't carry them; the
+// caller already has them from the Model).
+//
 // The returned weights remain bound to `weights` for the lifetime of the
 // call only — sp_weights_load_from_fp16_source copies all data into the
 // sp_weights arena, so `out` is self-contained afterwards.
 bool sp_weights_load_from_llama(sp_weights& out,
                                   const LlamaWeights& weights,
                                   const Config& cfg,
+                                  int n_head, int n_kv_head, int head_dim,
                                   int64_t scale_recip);
 
 }  // namespace sp::engine

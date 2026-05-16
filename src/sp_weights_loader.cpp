@@ -67,9 +67,12 @@ bool sp_weights_load_from_fp16_source(sp_weights& out,
     }
     if (scale_recip <= 0) scale_recip = 1 << 14;
 
+    // For Gemma3 et al, head_dim is NOT n_embd / n_head — we pass it
+    // through the source. Default 0 = use n_embd / n_head.
+    const int head_dim_from_src = src.head_dim_override;
     if (!sp_weights_alloc(out, src.n_layers, src.n_embd, src.n_head,
                             src.n_kv_head, src.d_ff, src.vocab,
-                            scale_recip)) {
+                            scale_recip, head_dim_from_src)) {
         std::fprintf(stderr, "[sp-weights-loader] alloc failed\n");
         return false;
     }
@@ -224,6 +227,7 @@ static const float* tensor_fp32_or_dequant(const ggml_tensor* t,
 bool sp_weights_load_from_llama(sp_weights& out,
                                   const LlamaWeights& weights,
                                   const Config& cfg,
+                                  int n_head, int n_kv_head, int head_dim,
                                   int64_t scale_recip) {
     const auto& layers = weights.layers();
     const int n_layers = (int)layers.size();
@@ -236,12 +240,21 @@ bool sp_weights_load_from_llama(sp_weights& out,
         return false;
     }
 
-    // Recover dims from tok_embd: ne = [n_embd, vocab]
+    // Dims from caller; cross-check against tok_embd / layer 0 tensors.
     const ggml_tensor* te = weights.tok_embd;
     const int n_embd = (int)te->ne[0];
     const int vocab  = (int)te->ne[1];
 
-    // Recover n_head / n_kv_head / d_ff from layer 0.
+    if (n_head <= 0 || n_kv_head <= 0 || head_dim <= 0) {
+        std::fprintf(stderr,
+            "[sp-weights-loader] bad caller dims: n_head=%d n_kv_head=%d head_dim=%d\n",
+            n_head, n_kv_head, head_dim);
+        return false;
+    }
+    // NOTE: head_dim is INDEPENDENT of n_embd / n_head for some archs
+    // (e.g. Gemma3 has n_embd=640, n_head=4, head_dim=256 → d_q=1024 > n_embd).
+    // The tensor-shape checks below catch any actual mismatches.
+
     const auto& l0 = layers[0];
     if (l0.wq == nullptr || l0.wk == nullptr || l0.wv == nullptr ||
         l0.wo == nullptr) {
@@ -256,42 +269,18 @@ bool sp_weights_load_from_llama(sp_weights& out,
             "(MoE / packed-FFN models will land in Phase 2.2c2)\n");
         return false;
     }
-    const int d_q     = (int)l0.wq->ne[1];
-    const int d_kv    = (int)l0.wk->ne[1];
-    if (d_q <= 0 || d_kv <= 0 || d_q % d_kv != 0) {
+    const int d_q_check  = (int)l0.wq->ne[1];
+    const int d_kv_check = (int)l0.wk->ne[1];
+    if (d_q_check != n_head * head_dim || d_kv_check != n_kv_head * head_dim) {
         std::fprintf(stderr,
-            "[sp-weights-loader] bad d_q=%d / d_kv=%d\n", d_q, d_kv);
+            "[sp-weights-loader] tensor-shape / dim mismatch: "
+            "wq.ne[1]=%d (expected %d), wk.ne[1]=%d (expected %d)\n",
+            d_q_check, n_head * head_dim, d_kv_check, n_kv_head * head_dim);
         return false;
     }
-    const int n_head    = d_q  / (d_q  / (d_kv / 1));  // need head_dim
-    // Simpler: assume head_dim derived from n_embd / n_head, and n_head
-    // chosen such that d_q = n_head * head_dim. Without GGUF metadata
-    // we can't recover n_head directly. Phase 2.2c assumes head_dim
-    // divides n_embd and equals d_q's row stride / n_head. Use the
-    // conservative fallback head_dim = 64 unless caller overrides via
-    // Config (TODO: expose n_head + head_dim in Config).
-    int head_dim_guess = 64;
-    while (head_dim_guess > 1 &&
-           (n_embd % head_dim_guess != 0 ||
-            d_q    % head_dim_guess != 0 ||
-            d_kv   % head_dim_guess != 0)) {
-        head_dim_guess /= 2;
-    }
-    const int head_dim = head_dim_guess;
-    const int n_head_use   = d_q  / head_dim;
-    const int n_kv_head_use = d_kv / head_dim;
-    const int d_ff         = (int)l0.ffn_gate->ne[1];
-
-    // Cross-check: n_embd % n_head_use must be 0 and == head_dim.
-    if (n_head_use <= 0 || n_kv_head_use <= 0 ||
-        n_embd != n_head_use * head_dim) {
-        std::fprintf(stderr,
-            "[sp-weights-loader] dim derivation failed: "
-            "n_embd=%d n_head=%d head_dim=%d d_q=%d d_kv=%d\n",
-            n_embd, n_head_use, head_dim, d_q, d_kv);
-        return false;
-    }
-    (void)n_head;  // silence unused
+    const int n_head_use    = n_head;
+    const int n_kv_head_use = n_kv_head;
+    const int d_ff          = (int)l0.ffn_gate->ne[1];
 
     // Build the layer sources.
     std::vector<sp_weights_layer_fp16_source> layer_srcs(n_layers);
@@ -331,6 +320,7 @@ bool sp_weights_load_from_llama(sp_weights& out,
     src.n_kv_head = n_kv_head_use;
     src.d_ff      = d_ff;
     src.vocab     = vocab;
+    src.head_dim_override = head_dim;
     src.tok_embd  = tensor_fp16(weights.tok_embd, "tok_embd");
     src.lm_head   = tensor_fp16(weights.output,   "lm_head");
     src.final_norm = tensor_fp32_or_dequant(

@@ -178,9 +178,15 @@ size_t sp_weights_required_arena_bytes(int n_layers, int n_embd,
                                          int d_ff, int vocab);
 
 // Allocate all slots at the given shapes; data is uninitialised.
+//
+// `head_dim` is INDEPENDENT of n_embd / n_head — for Gemma3 (n_embd=640,
+// n_head=4, head_dim=256) we have d_q = n_head*head_dim = 1024 which is
+// strictly larger than n_embd. For most archs head_dim == n_embd/n_head;
+// pass head_dim=0 to use that default.
 bool sp_weights_alloc(sp_weights& out, int n_layers, int n_embd,
                        int n_head, int n_kv_head, int d_ff, int vocab,
-                       int64_t scale_recip);
+                       int64_t scale_recip,
+                       int head_dim = 0);
 
 // Per-slot setters; the slot must have been allocated by sp_weights_alloc.
 // Source layout (matching the slot shape in sp_weights comments):
