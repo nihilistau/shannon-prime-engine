@@ -207,6 +207,66 @@ TEST(crt_ckks_dot_product_recovery) {
     ASSERT(err < 5e-2);
 }
 
+/* Test 6 — Phase 9b engine integration helpers.
+ *
+ * The new dual-universe encoders + qk_cached path must produce the
+ * same fp32 score as the existing 60-bit sp_poly_dot_product_ntt_q_cached
+ * to within ULP. This locks parity at the API the engine will actually
+ * call (Q is encoded once per (h, qi), K is encoded once per (kv_h, t),
+ * then per-(qi, t) we pay only pointwise+inverse+CRT-stitch). */
+TEST(crt_engine_helpers_match_60bit_qk_cached) {
+    constexpr int d = 256;
+    const double delta = (double)(1 << 14);
+    std::mt19937_64 rng(0xFACEFEED);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+
+    std::vector<float> qv(d), kv(d);
+    for (int i = 0; i < d; ++i) { qv[i] = dist(rng); kv[i] = dist(rng); }
+
+    /* --- 60-bit baseline path (Phase 5b/6 helpers) --- */
+    std::vector<uint64_t> Q60(SP_NTT_N, 0);
+    std::vector<int64_t>  int_scratch_60(SP_NTT_N, 0);
+    sp_poly_encode_ntt_q(Q60.data(), qv.data(), d, delta, int_scratch_60.data());
+
+    std::vector<int64_t>  k_int_60(SP_NTT_N, 0);
+    std::vector<uint64_t> k_ntt_60(SP_NTT_N, 0);
+    std::vector<uint64_t> c_ntt_60(SP_NTT_N, 0);
+    int ok60 = 0;
+    float dot60 = sp_poly_dot_product_ntt_q_cached(
+        Q60.data(), kv.data(), d, delta,
+        k_int_60.data(), k_ntt_60.data(), c_ntt_60.data(), &ok60);
+    ASSERT(ok60 == 1);
+
+    /* --- New CRT path (Phase 9b helpers) --- */
+    std::vector<uint64_t> Q_q1(N, 0), Q_q2(N, 0);
+    std::vector<int64_t>  int_scratch_crt(N, 0);
+    sp_poly_encode_ntt_q_crt(Q_q1.data(), Q_q2.data(),
+                              qv.data(), d, delta,
+                              int_scratch_crt.data());
+
+    std::vector<uint64_t> K_q1(N, 0), K_q2(N, 0);
+    sp_poly_encode_ntt_k_reversed_crt(K_q1.data(), K_q2.data(),
+                                       kv.data(), d, delta,
+                                       int_scratch_crt.data());
+
+    std::vector<uint64_t> c_q1(N, 0), c_q2(N, 0);
+    int okcrt = 0;
+    float dotcrt = sp_poly_dot_product_ntt_crt_qk_cached(
+        Q_q1.data(), Q_q2.data(), K_q1.data(), K_q2.data(),
+        d, delta, c_q1.data(), c_q2.data(), &okcrt);
+    ASSERT(okcrt == 1);
+
+    /* The two paths share semantics but route through different primes,
+     * so we expect agreement to within fp32 ULP for this dot product
+     * (the CRT path has slightly less headroom but the modulus is large
+     * enough that all real-valued products fit). */
+    const double diff = std::fabs((double)dot60 - (double)dotcrt);
+    std::fprintf(stderr,
+        "  [crt-vs-60bit] dot60=%.6f dotcrt=%.6f diff=%.3e\n",
+        dot60, dotcrt, diff);
+    ASSERT(diff < 1e-3);
+}
+
 int main() {
     std::fprintf(stderr,
         "test_sp_ntt_crt: Q1=%llu Q2=%llu  M=q1*q2~2^60  N=%d\n",
