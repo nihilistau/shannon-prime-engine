@@ -70,10 +70,60 @@ bool sp_weights_load_from_fp16_source(sp_weights& out,
     // For Gemma3 et al, head_dim is NOT n_embd / n_head — we pass it
     // through the source. Default 0 = use n_embd / n_head.
     const int head_dim_from_src = src.head_dim_override;
-    if (!sp_weights_alloc(out, src.n_layers, src.n_embd, src.n_head,
-                            src.n_kv_head, src.d_ff, src.vocab,
-                            scale_recip, head_dim_from_src)) {
-        std::fprintf(stderr, "[sp-weights-loader] alloc failed\n");
+
+    // Diagnostic — estimate the arena size before requesting it so a
+    // huge model doesn't OOM silently.
+    {
+        const int hd = (head_dim_from_src > 0)
+            ? head_dim_from_src : (src.n_embd / std::max(src.n_head, 1));
+        const int64_t d_q  = (int64_t)src.n_head    * hd;
+        const int64_t d_kv = (int64_t)src.n_kv_head * hd;
+        const int64_t per_layer_elems =
+              (int64_t)src.n_embd * d_q       // wq
+            + (int64_t)src.n_embd * d_kv      // wk
+            + (int64_t)src.n_embd * d_kv      // wv
+            + d_q  * (int64_t)src.n_embd      // wo
+            + (int64_t)src.n_embd * src.d_ff  // ffn_gate
+            + (int64_t)src.n_embd * src.d_ff  // ffn_up
+            + (int64_t)src.d_ff  * src.n_embd;// ffn_down
+        const int64_t top_elems =
+              (int64_t)src.n_embd * src.vocab  // tok_embd
+            + (int64_t)src.n_embd * src.vocab; // lm_head
+        const int64_t total_elems =
+            per_layer_elems * src.n_layers + top_elems;
+        const double bytes_gb =
+            (double)total_elems * 16.0 / (1024.0 * 1024.0 * 1024.0);
+        std::fprintf(stderr,
+            "[sp-weights-loader] dims: n_layers=%d n_embd=%d n_head=%d "
+            "n_kv_head=%d head_dim=%d d_ff=%d vocab=%d  arena_estimate=%.2f GB "
+            "(%lld elems @ 16 B)\n",
+            src.n_layers, src.n_embd, src.n_head, src.n_kv_head,
+            hd, src.d_ff, src.vocab,
+            bytes_gb, (long long)total_elems);
+        if (bytes_gb > 24.0) {
+            std::fprintf(stderr,
+                "[sp-weights-loader] WARN: arena_estimate > 24 GB. "
+                "The O_K AoS layout (16 B per element) makes large models "
+                "expensive; consider running on a smaller variant or "
+                "implementing lazy on-the-fly O_K encoding.\n");
+        }
+    }
+
+    try {
+        if (!sp_weights_alloc(out, src.n_layers, src.n_embd, src.n_head,
+                                src.n_kv_head, src.d_ff, src.vocab,
+                                scale_recip, head_dim_from_src)) {
+            std::fprintf(stderr, "[sp-weights-loader] alloc failed\n");
+            return false;
+        }
+    } catch (const std::bad_alloc& e) {
+        std::fprintf(stderr,
+            "[sp-weights-loader] arena malloc FAILED — out of memory. "
+            "%s\n", e.what());
+        return false;
+    } catch (const std::exception& e) {
+        std::fprintf(stderr,
+            "[sp-weights-loader] alloc threw exception: %s\n", e.what());
         return false;
     }
 
