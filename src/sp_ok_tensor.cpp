@@ -7,6 +7,41 @@
 #include <cstring>
 #include <new>
 
+#ifdef _WIN32
+#  ifndef WIN32_LEAN_AND_MEAN
+#    define WIN32_LEAN_AND_MEAN
+#  endif
+#  include <windows.h>
+#endif
+
+// Phase 2.3b iter 5: sp_ok_arena's backing storage on Windows uses
+// VirtualAlloc directly so multi-GB allocations don't go through the
+// CRT heap. The CRT heap fragments badly after ~10 GB of large allocs
+// and refuses further requests even when total free RAM is sufficient
+// (observed at L=24/26 on Gemma3-1B with 18.8 GB free). VirtualAlloc
+// reserves directly from the OS page allocator, sidestepping the
+// fragmentation. POSIX path keeps std::malloc.
+namespace {
+inline void* sp_ok_arena_alloc_bytes(size_t bytes) {
+#ifdef _WIN32
+    void* p = VirtualAlloc(nullptr, bytes, MEM_COMMIT | MEM_RESERVE,
+                            PAGE_READWRITE);
+    return p;
+#else
+    return std::malloc(bytes);
+#endif
+}
+inline void sp_ok_arena_free_bytes(void* p, size_t bytes) {
+#ifdef _WIN32
+    if (p) VirtualFree(p, 0, MEM_RELEASE);
+    (void)bytes;
+#else
+    (void)bytes;
+    std::free(p);
+#endif
+}
+}  // anon namespace
+
 namespace sp::engine {
 
 // =========================================================================
@@ -45,7 +80,7 @@ bool sp_ok_tensor::is_contiguous() const {
 // =========================================================================
 
 sp_ok_arena::~sp_ok_arena() {
-    std::free(buf_);
+    sp_ok_arena_free_bytes(buf_, capacity_);
     buf_      = nullptr;
     capacity_ = 0;
     used_     = 0;
@@ -73,13 +108,14 @@ sp_ok_arena& sp_ok_arena::operator=(sp_ok_arena&& o) noexcept {
 
 void sp_ok_arena::reserve(size_t bytes) {
     if (bytes <= capacity_) return;
-    // Round up to 64-byte multiple for alignment.
+    // Round up to 64-byte multiple for alignment (VirtualAlloc rounds
+    // further up to page boundary, which is fine).
     bytes = (bytes + 63) & ~(size_t)63;
-    uint8_t* nb = static_cast<uint8_t*>(std::malloc(bytes));
+    uint8_t* nb = static_cast<uint8_t*>(sp_ok_arena_alloc_bytes(bytes));
     if (!nb) throw std::bad_alloc{};
     if (buf_) {
         std::memcpy(nb, buf_, used_);
-        std::free(buf_);
+        sp_ok_arena_free_bytes(buf_, capacity_);
     }
     buf_      = nb;
     capacity_ = bytes;

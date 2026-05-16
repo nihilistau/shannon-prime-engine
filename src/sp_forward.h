@@ -95,8 +95,16 @@ struct sp_forward_context {
 // the scale-reset valve per Phase 1.7 policy).
 // -----------------------------------------------------------------------
 struct sp_weights {
-    // Shim-list weights (matmul operands, shimmed):
-    sp_ok_tensor              tok_embed;       // [n_embd, vocab]
+    // Phase 2.3b iter 5: tok_embed and lm_head are BYPASS-list (Phase 1.7
+    // policy). They have frobenius_scale=1 and b=0 by definition, so the
+    // 16-B-per-element O_K representation is pure waste. Stored as fp32
+    // vectors to save ~9.6 GB on a 1B-parameter model (vocab=262144,
+    // n_embd=1152). The matmul path bridges through fp32 directly.
+    std::vector<float> tok_embed_fp32;         // [vocab * n_embd]
+    std::vector<float> lm_head_fp32;           // [vocab * n_embd]
+
+    // Shim-list matmul operands (per-layer, still in O_K because these
+    // are exactly the tensors where Theorem 4 cancellation runs):
     std::vector<sp_ok_tensor> wq;              // per-layer Q projection [n_embd, d_q]
     std::vector<sp_ok_tensor> wk;              //                        [n_embd, d_kv]
     std::vector<sp_ok_tensor> wv;              //                        [n_embd, d_kv]
@@ -104,7 +112,6 @@ struct sp_weights {
     std::vector<sp_ok_tensor> ffn_gate;        //                        [n_embd, d_ff]
     std::vector<sp_ok_tensor> ffn_up;          //                        [n_embd, d_ff]
     std::vector<sp_ok_tensor> ffn_down;        //                        [d_ff,   n_embd]
-    sp_ok_tensor              lm_head;         // [n_embd, vocab]
 
     // Bypass-list (fp32 norms; scale-reset valve per Phase 1.7 policy):
     std::vector<std::vector<float>> attn_norm_w;       // per-layer [n_embd]
@@ -119,8 +126,13 @@ struct sp_weights {
     std::vector<std::vector<float>> attn_post_norm_w;  // per-layer [n_embd] or empty
     std::vector<std::vector<float>> ffn_post_norm_w;   // per-layer [n_embd] or empty
 
-    // Owning storage for every sp_ok_tensor above.
-    sp_ok_arena               storage;
+    // Owning storage. Phase 2.3b iter 5: one arena per layer (typically
+    // 400 MB - 1 GB each) instead of a single huge contiguous block.
+    // Windows heap fragmentation makes a 10 GB+ malloc unreliable even
+    // when total free RAM is sufficient; per-layer arenas sidestep
+    // that without changing the algebra. layer_arenas[L] owns the
+    // backing memory for wq/wk/wv/wo/ffn_gate/ffn_up/ffn_down on layer L.
+    std::vector<sp_ok_arena>  layer_arenas;
 
     // Model dims (set at alloc time).
     int n_layers  = 0;

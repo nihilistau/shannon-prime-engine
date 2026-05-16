@@ -86,20 +86,24 @@ bool sp_weights_load_from_fp16_source(sp_weights& out,
             + (int64_t)src.n_embd * src.d_ff  // ffn_gate
             + (int64_t)src.n_embd * src.d_ff  // ffn_up
             + (int64_t)src.d_ff  * src.n_embd;// ffn_down
-        const int64_t top_elems =
-              (int64_t)src.n_embd * src.vocab  // tok_embd
-            + (int64_t)src.n_embd * src.vocab; // lm_head
-        const int64_t total_elems =
-            per_layer_elems * src.n_layers + top_elems;
-        const double bytes_gb =
+        const int64_t total_elems = per_layer_elems * src.n_layers;
+        const double ok_bytes_gb =
             (double)total_elems * 16.0 / (1024.0 * 1024.0 * 1024.0);
+        // Phase 2.3b iter 5: tok_embd + lm_head live as fp32 vectors
+        // outside the O_K arena. Compute their footprint separately.
+        const int64_t bypass_fp32_bytes =
+            (int64_t)src.n_embd * src.vocab * 4 * 2;
+        const double bypass_gb =
+            (double)bypass_fp32_bytes / (1024.0 * 1024.0 * 1024.0);
         std::fprintf(stderr,
             "[sp-weights-loader] dims: n_layers=%d n_embd=%d n_head=%d "
-            "n_kv_head=%d head_dim=%d d_ff=%d vocab=%d  arena_estimate=%.2f GB "
-            "(%lld elems @ 16 B)\n",
+            "n_kv_head=%d head_dim=%d d_ff=%d vocab=%d  ok_arena=%.2f GB "
+            "(%lld elems @ 16 B)  bypass_fp32=%.2f GB  total=%.2f GB\n",
             src.n_layers, src.n_embd, src.n_head, src.n_kv_head,
             hd, src.d_ff, src.vocab,
-            bytes_gb, (long long)total_elems);
+            ok_bytes_gb, (long long)total_elems,
+            bypass_gb, ok_bytes_gb + bypass_gb);
+        const double bytes_gb = ok_bytes_gb + bypass_gb;
         if (bytes_gb > 24.0) {
             std::fprintf(stderr,
                 "[sp-weights-loader] WARN: arena_estimate > 24 GB. "

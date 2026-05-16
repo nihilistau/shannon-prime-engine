@@ -171,43 +171,55 @@ bool sp_weights_alloc(sp_weights& out, int n_layers, int n_embd,
     out.attn_post_norm_w.assign(n_layers, std::vector<float>{});
     out.ffn_post_norm_w.assign(n_layers, std::vector<float>{});
 
-    // Compute exact arena requirement using the *actual* head_dim
-    // (NOT n_embd/n_head — those can differ, e.g. Gemma3).
-    const size_t per_layer =
+    // Phase 2.3b iter 5: per-layer arenas. Each layer needs roughly
+    //   n_embd*(2*d_q + 2*d_kv + 2*d_ff) + 2*d_ff*n_embd
+    // sp_ok_t elements (16 B each). For Gemma3-1B that's ~430 MB per
+    // layer — a normal Windows heap can fragment 18 GB of free space
+    // into many ~500 MB chunks, but rarely a single 10 GB chunk.
+    const size_t per_layer_bytes =
           tensor_bytes((int64_t)n_embd * d_q)
         + tensor_bytes((int64_t)n_embd * d_kv)
         + tensor_bytes((int64_t)n_embd * d_kv)
         + tensor_bytes(d_q * (int64_t)n_embd)
         + tensor_bytes((int64_t)n_embd * d_ff)
         + tensor_bytes((int64_t)n_embd * d_ff)
-        + tensor_bytes((int64_t)d_ff   * n_embd);
-    const size_t top =
-          tensor_bytes((int64_t)n_embd * vocab)
-        + tensor_bytes((int64_t)n_embd * vocab);
-    const size_t arena_bytes = per_layer * (size_t)n_layers + top + 4096;
-    out.storage.reserve(arena_bytes);
+        + tensor_bytes((int64_t)d_ff   * n_embd)
+        + 4096;
+    out.layer_arenas.clear();
+    out.layer_arenas.resize(n_layers);
 
-    auto alloc_with_shape = [&](sp_ok_tensor& t, int64_t s0, int64_t s1) -> bool {
+    auto alloc_with_shape = [&](sp_ok_arena& arena,
+                                  sp_ok_tensor& t, int64_t s0, int64_t s1) -> bool {
         int64_t shp[4] = { s0, s1, 1, 1 };
         t.reset(2, shp);
-        if (!out.storage.alloc_tensor(t)) return false;
+        if (!arena.alloc_tensor(t)) return false;
         t.scale_recip = scale_recip;
         t.frobenius_scale = 1;
         return true;
     };
 
-    // Top-level.
-    if (!alloc_with_shape(out.tok_embed, n_embd, vocab)) return false;
-    if (!alloc_with_shape(out.lm_head,   n_embd, vocab)) return false;
+    // Top-level bypass-list: fp32 vectors, not O_K arena.
+    out.tok_embed_fp32.assign((size_t)n_embd * vocab, 0.0f);
+    out.lm_head_fp32.assign((size_t)n_embd * vocab, 0.0f);
 
     for (int L = 0; L < n_layers; ++L) {
-        if (!alloc_with_shape(out.wq[L],       n_embd, d_q))   return false;
-        if (!alloc_with_shape(out.wk[L],       n_embd, d_kv))  return false;
-        if (!alloc_with_shape(out.wv[L],       n_embd, d_kv))  return false;
-        if (!alloc_with_shape(out.wo[L],       d_q,    n_embd)) return false;
-        if (!alloc_with_shape(out.ffn_gate[L], n_embd, d_ff))  return false;
-        if (!alloc_with_shape(out.ffn_up[L],   n_embd, d_ff))  return false;
-        if (!alloc_with_shape(out.ffn_down[L], d_ff,   n_embd)) return false;
+        try {
+            out.layer_arenas[L].reserve(per_layer_bytes);
+        } catch (const std::bad_alloc&) {
+            std::fprintf(stderr,
+                "[sp_weights_alloc] per-layer arena malloc failed at L=%d "
+                "(requested %.2f MB)\n",
+                L, (double)per_layer_bytes / (1024.0 * 1024.0));
+            return false;
+        }
+        sp_ok_arena& A = out.layer_arenas[L];
+        if (!alloc_with_shape(A, out.wq[L],       n_embd, d_q))    return false;
+        if (!alloc_with_shape(A, out.wk[L],       n_embd, d_kv))   return false;
+        if (!alloc_with_shape(A, out.wv[L],       n_embd, d_kv))   return false;
+        if (!alloc_with_shape(A, out.wo[L],       d_q,    n_embd)) return false;
+        if (!alloc_with_shape(A, out.ffn_gate[L], n_embd, d_ff))   return false;
+        if (!alloc_with_shape(A, out.ffn_up[L],   n_embd, d_ff))   return false;
+        if (!alloc_with_shape(A, out.ffn_down[L], d_ff,   n_embd)) return false;
         out.attn_norm_w[L].resize(n_embd, 1.0f);
         out.ffn_norm_w[L].resize(n_embd,  1.0f);
     }
@@ -239,10 +251,16 @@ static bool fill_slot(sp_ok_tensor& slot, const float* src) {
 }
 
 bool sp_weights_set_tok_embed(sp_weights& out, const float* src) {
-    return fill_slot(out.tok_embed, src);
+    if (src == nullptr || out.tok_embed_fp32.empty()) return false;
+    std::memcpy(out.tok_embed_fp32.data(), src,
+                 sizeof(float) * out.tok_embed_fp32.size());
+    return true;
 }
 bool sp_weights_set_lm_head(sp_weights& out, const float* src) {
-    return fill_slot(out.lm_head, src);
+    if (src == nullptr || out.lm_head_fp32.empty()) return false;
+    std::memcpy(out.lm_head_fp32.data(), src,
+                 sizeof(float) * out.lm_head_fp32.size());
+    return true;
 }
 bool sp_weights_set_wq(sp_weights& out, int L, const float* src) {
     if (L < 0 || L >= out.n_layers) return false;
@@ -379,25 +397,21 @@ static bool encode_residual_to_ok(sp_ok_tensor& dst,
     return sp_ok_encode_from_fp32(dst, src, 2, shape, S, arena);
 }
 
-// Helper: embedding lookup. weights.tok_embed is shape {n_embd, vocab},
-// so the token's row starts at data[token_id * n_embd]. Decode to fp32
-// and multiply by embd_scale (Gemma family scales by sqrt(n_embd) before
+// Helper: embedding lookup. tok_embed_fp32 is stored as a flat [vocab *
+// n_embd] fp32 array (Phase 2.3b iter 5 bypass-list policy — no O_K
+// indirection needed for tensors that have frobenius_scale=1 and b=0).
+// Multiply by embd_scale (Gemma family scales by sqrt(n_embd) before
 // the first block; non-gemma archs leave embd_scale=1.0).
 static void embed_lookup_fp32(float* x_fp32,
-                                const sp_ok_tensor& tok_embed,
+                                const std::vector<float>& tok_embed_fp32,
                                 int token_id, int n_embd,
                                 float embd_scale) {
-    const double div = (double)tok_embed.scale_recip *
-                       (double)tok_embed.frobenius_scale;
-    const sp_ok_t* row = tok_embed.data + (int64_t)token_id * n_embd;
+    const float* row = tok_embed_fp32.data() + (int64_t)token_id * n_embd;
     if (embd_scale == 1.0f) {
-        for (int i = 0; i < n_embd; ++i) {
-            x_fp32[i] = (float)((double)row[i].a / div);
-        }
+        std::memcpy(x_fp32, row, sizeof(float) * n_embd);
     } else {
-        const double s = (double)embd_scale;
         for (int i = 0; i < n_embd; ++i) {
-            x_fp32[i] = (float)(((double)row[i].a / div) * s);
+            x_fp32[i] = row[i] * embd_scale;
         }
     }
 }
@@ -436,8 +450,8 @@ bool sp_forward_step(sp_forward_context& ctx,
     const int n_tokens  = 1;  // single-token decode in Phase 2.2d
 
     // 1) Embedding lookup → x_fp32 (× embd_scale for Gemma family).
-    embed_lookup_fp32(ctx.x_fp32.data(), weights.tok_embed, token_id, n_embd,
-                       ctx.embd_scale);
+    embed_lookup_fp32(ctx.x_fp32.data(), weights.tok_embed_fp32, token_id,
+                       n_embd, ctx.embd_scale);
 
     int32_t rope_pos[1] = { position };
 
@@ -662,12 +676,26 @@ bool sp_forward_step(sp_forward_context& ctx,
         return false;
     }
 
-    // 4) LM head (bypass — frobenius_scale = 1).
+    // 4) LM head (bypass, fp32). Decode the final O_K state to fp32,
+    //    then run a plain fp32 matmul against the fp32 lm_head weights.
+    //    This is the inverse of the embedding bridge: just as we read
+    //    fp32 in at the top, we drop back to fp32 at the bottom — no
+    //    O_K indirection for tensors that don't participate in
+    //    Theorem 4 cancellation.
     logits_out.assign(weights.vocab, 0.0f);
-    if (!sp_matmul_ok_to_fp32(weights.lm_head, ctx.x_norm_ok,
-                                logits_out.data(),
-                                weights.vocab, n_tokens)) {
-        return false;
+    std::vector<float> x_final_fp32((size_t)n_embd * n_tokens);
+    sp_ok_decode_to_fp32(x_final_fp32.data(), ctx.x_norm_ok);
+    // logits[v, t] = sum_k lm_head[v, k] * x_final[k, t]
+    //   lm_head: [vocab, n_embd] row-major: lm_head[v*n_embd + k]
+    //   x_final: shape {n_tokens, n_embd} via matmul convention,
+    //            decoded as a flat vector of length n_embd (n_tokens=1).
+    for (int v = 0; v < weights.vocab; ++v) {
+        const float* w_row = weights.lm_head_fp32.data() + (size_t)v * n_embd;
+        double a = 0.0;
+        for (int k = 0; k < n_embd; ++k) {
+            a += (double)w_row[k] * (double)x_final_fp32[k];
+        }
+        logits_out[v] = (float)a;
     }
 
     // 5) Phase 2.3b iter 3 — final-logit softcap (Gemma3).

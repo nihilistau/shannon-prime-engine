@@ -798,9 +798,25 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "perplexity requires a UTF-8 text file path\n"); return 1;
         }
 
+        // Phase 2.3b iter 5: for native-O_K runs, force the zero-copy
+        // mmap path on LlamaWeights so the model data stays in shared
+        // file-backed pages instead of getting copied into a CPU backend
+        // buffer (~ +1.9 GB on Gemma3-1B). The sp_weights loader reads
+        // each fp16 tensor once during dequant-encode, then sp_weights
+        // owns its own O_K arena — LlamaWeights doesn't need to keep
+        // its own ggml-backend copy alive afterwards.
+        const bool native_path = []() {
+            const char* e = std::getenv("SP_ENGINE_NATIVE");
+            return e && std::atoi(e) != 0;
+        }();
+
         SpMultiGpuGuard mgpu_ppl;
-        mgpu_ppl.backends = sp_enumerate_gpus(pc.n_gpus);
-        SpBackendGuard bk(mgpu_ppl.backends.empty() ? sp_select_backend() : nullptr);
+        if (!native_path) {
+            mgpu_ppl.backends = sp_enumerate_gpus(pc.n_gpus);
+        }
+        SpBackendGuard bk(
+            (!native_path && mgpu_ppl.backends.empty())
+                ? sp_select_backend() : nullptr);
 
         auto m  = sp::engine::Model::load(pc.model_path);
         if (!m) return 2;
@@ -850,10 +866,16 @@ int main(int argc, char** argv) {
                 "[sp-engine] perplexity-native: arch=%s n_head=%d n_kv_head=%d head_dim=%d\n",
                 m->architecture().c_str(),
                 native_n_head, native_n_kv_head, native_head_dim);
-            if (!sp::engine::sp_weights_load_from_llama(
+            const bool load_ok = sp::engine::sp_weights_load_from_llama(
                     spW, *W, pc,
                     native_n_head, native_n_kv_head, native_head_dim,
-                    native_scale)) {
+                    native_scale);
+            // sp_weights has its own copies — we don't need LlamaWeights
+            // (which holds the mmap + ~4 GB of fp16/fp32 backing) past
+            // this point. Free it now so we have headroom for the KV
+            // cache + per-step scratch.
+            W.reset();
+            if (!load_ok) {
                 std::fprintf(stderr,
                     "[sp-engine] perplexity-native: sp_weights load failed. "
                     "(Phase 2.3 supports STANDARD-kind layers only; gemma3 "

@@ -44,13 +44,10 @@ TEST(sp_weights_alloc_shapes) {
                               vocab, /*scale*/ 1 << 14));
     ASSERT(W.n_layers == n_layers);
     ASSERT(W.head_dim == head_dim);
-    // tok_embed: [n_embd, vocab]
-    ASSERT(W.tok_embed.shape[0] == n_embd);
-    ASSERT(W.tok_embed.shape[1] == vocab);
-    ASSERT(W.tok_embed.scale_recip == 1 << 14);
-    // lm_head: [n_embd, vocab]
-    ASSERT(W.lm_head.shape[0] == n_embd);
-    ASSERT(W.lm_head.shape[1] == vocab);
+    // Phase 2.3b iter 5 — tok_embed and lm_head are now fp32 vectors
+    // sized [vocab * n_embd], not sp_ok_tensors.
+    ASSERT((int)W.tok_embed_fp32.size() == n_embd * vocab);
+    ASSERT((int)W.lm_head_fp32.size()   == n_embd * vocab);
     // Layer 0 attn projections.
     ASSERT(W.wq[0].shape[0] == n_embd);
     ASSERT(W.wq[0].shape[1] == d_q);

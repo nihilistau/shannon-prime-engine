@@ -306,10 +306,12 @@ TEST(forward_step_pos0_frobenius_shim_matches_fp32_reference) {
     cfg.frobenius_k     = 8;
     sp_weights W;
     ASSERT(build_sp_weights_from_fp_model(W, m, cfg, 1 << 14));
-    // Bypass policy verification.
-    ASSERT(W.tok_embed.frobenius_scale == 1);
-    ASSERT(W.lm_head.frobenius_scale   == 1);
-    ASSERT(W.wq[0].frobenius_scale     != 1);
+    // Bypass policy verification. Phase 2.3b iter 5: tok_embed and
+    // lm_head are fp32 vectors (no frobenius_scale field). Bypass now
+    // means "stored as fp32, never enters the O_K shim path."
+    ASSERT(!W.tok_embed_fp32.empty());
+    ASSERT(!W.lm_head_fp32.empty());
+    ASSERT(W.wq[0].frobenius_scale != 1);  // shim-list, was shimmed
 
     sp_forward_context ctx;
     ASSERT(sp_forward_context_init(ctx, W, 8, rope_base, rms_eps));

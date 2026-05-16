@@ -228,11 +228,13 @@ TEST(loader_with_frobenius_shim_preserves_matmul) {
     sp_weights W;
     ASSERT(sp_weights_load_from_fp16_source(W, src, cfg, 1 << 14));
 
-    // Verify the shim hit wq (a SHIM-list tensor) and SKIPPED tok_embed
-    // (a BYPASS-list tensor).
+    // Verify the shim hit wq (a SHIM-list tensor). Phase 2.3b iter 5:
+    // tok_embed and lm_head are fp32 vectors (no frobenius_scale field),
+    // so the bypass verification reduces to "they aren't in the
+    // sp_ok_tensor arena at all."
     ASSERT(W.wq[0].frobenius_scale != 1);     // shimmed
-    ASSERT(W.tok_embed.frobenius_scale == 1); // bypass
-    ASSERT(W.lm_head.frobenius_scale   == 1); // bypass
+    ASSERT(!W.tok_embed_fp32.empty());        // populated as fp32
+    ASSERT(!W.lm_head_fp32.empty());          // populated as fp32
 
     // Theorem 4 round-trip: compute fp32 W·x reference using the source
     // fp32 weights; compute the same via sp_matmul_ok_to_fp32 on the
