@@ -32,6 +32,7 @@
 extern "C" {
 #include "../lib/shannon-prime/core/sp_poly_ring.h"
 #include "../lib/shannon-prime/core/sp_ntt.h"
+#include "../lib/shannon-prime/core/sp_ntt_crt.h"
 }
 
 #include <algorithm>
@@ -234,7 +235,9 @@ void sp_attention_poly_ring(const sp_ok_tensor& q,
                               int   pos_offset_arg,
                               int   swa_window,
                               float attn_logit_softcap,
-                              const uint64_t* k_ntt_slab) {
+                              const uint64_t* k_ntt_slab,
+                              const uint64_t* k_ntt_slab_q1,
+                              const uint64_t* k_ntt_slab_q2) {
     if (q.data == nullptr || k.data == nullptr || v.data == nullptr ||
         out.data == nullptr) return;
     if (n_head <= 0 || n_kv_head <= 0 || head_dim <= 0) return;
@@ -308,6 +311,13 @@ void sp_attention_poly_ring(const sp_ok_tensor& q,
         return enabled;
     }();
     const bool use_ntt_here = g_use_ntt && (N == SP_NTT_N);
+    // Phase 9b: route through the CRT NTT path when both dual slabs are
+    // supplied AND the ring size matches. The CRT path is preferred over
+    // the 60-bit single-prime path when active because it has no
+    // __int128 dependency.
+    const bool use_crt_here =
+        g_use_ntt && (head_dim <= SP_NTT_CRT_N)
+        && (k_ntt_slab_q1 != nullptr) && (k_ntt_slab_q2 != nullptr);
     // Phase 5b: hoist NTT(Q) out of the per-t inner loop. Phase 6: also
     // pre-NTT every K once per call into K_ntt_cache so the (qi, t) inner
     // loop is just pointwise multiply + inverse + extract. K's NTT only
@@ -319,7 +329,20 @@ void sp_attention_poly_ring(const sp_ok_tensor& q,
     std::vector<uint64_t> ntt_C_buf;               // [SP_NTT_N]
     std::vector<uint64_t> K_ntt_cache;             // [n_kv_head * T_valid * SP_NTT_N]
     std::vector<float>    k_decode_buf;            // [head_dim]
-    if (use_ntt_here) {
+    // Phase 9b CRT scratch (dual-universe Q + per-call inverse buffers).
+    std::vector<int64_t>  crt_int_scratch;         // [SP_NTT_CRT_N] shared encoder workspace
+    std::vector<uint64_t> crt_Q_q1;                // [SP_NTT_CRT_N]
+    std::vector<uint64_t> crt_Q_q2;                // [SP_NTT_CRT_N]
+    std::vector<uint64_t> crt_c_q1;                // [SP_NTT_CRT_N]
+    std::vector<uint64_t> crt_c_q2;                // [SP_NTT_CRT_N]
+    if (use_crt_here) {
+        crt_int_scratch.assign(SP_NTT_CRT_N, 0);
+        crt_Q_q1.assign(SP_NTT_CRT_N, 0);
+        crt_Q_q2.assign(SP_NTT_CRT_N, 0);
+        crt_c_q1.assign(SP_NTT_CRT_N, 0);
+        crt_c_q2.assign(SP_NTT_CRT_N, 0);
+    }
+    if (use_ntt_here && !use_crt_here) {
         ntt_Q_int_scratch.assign(SP_NTT_N, 0);
         ntt_Q_buf.assign(SP_NTT_N, 0);
         ntt_K_int_scratch.assign(SP_NTT_N, 0);
@@ -361,10 +384,16 @@ void sp_attention_poly_ring(const sp_ok_tensor& q,
             }
 
             // Phase 5b: hoist NTT(Q) once per (h, qi).
-            if (use_ntt_here) {
+            if (use_ntt_here && !use_crt_here) {
                 sp_poly_encode_ntt_q(ntt_Q_buf.data(),
                                      q_vec.data(), head_dim, delta,
                                      ntt_Q_int_scratch.data());
+            }
+            // Phase 9b: dual-universe Q-encode + forward NTT once per (h, qi).
+            if (use_crt_here) {
+                sp_poly_encode_ntt_q_crt(crt_Q_q1.data(), crt_Q_q2.data(),
+                                          q_vec.data(), head_dim, delta,
+                                          crt_int_scratch.data());
             }
 
             const int swa_lo = (swa_window > 0)
@@ -374,7 +403,28 @@ void sp_attention_poly_ring(const sp_ok_tensor& q,
             // Per-t scores via polynomial-ring dot product.
             for (int64_t t = 0; t < T_valid; ++t) {
                 float dot;
-                if (use_ntt_here) {
+                if (use_crt_here) {
+                    // Phase 9b: dual-prime cached K slabs, pure
+                    // pointwise + inverse + CRT stitch inner loop.
+                    const size_t k_off =
+                        ((size_t)kv_h * (size_t)T_stride + (size_t)t)
+                            * (size_t)SP_NTT_CRT_N;
+                    int ok = 0;
+                    dot = sp_poly_dot_product_ntt_crt_qk_cached(
+                        crt_Q_q1.data(), crt_Q_q2.data(),
+                        k_ntt_slab_q1 + k_off,
+                        k_ntt_slab_q2 + k_off,
+                        head_dim, delta,
+                        crt_c_q1.data(), crt_c_q2.data(),
+                        &ok);
+                    if (!ok) {
+                        // Defensive fall-back, should never fire (head_dim
+                        // <= SP_NTT_CRT_N is checked at use_crt_here).
+                        dot = sp_poly_dot_product(
+                            q_vec.data(), k_vec.data(), head_dim, N, delta,
+                            poly_scratch.data());
+                    }
+                } else if (use_ntt_here) {
                     const uint64_t* K_ntt = (k_ntt_slab != nullptr)
                         // Phase 7: persistent slab, indexed by t_stride.
                         ? (k_ntt_slab +

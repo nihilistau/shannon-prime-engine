@@ -96,6 +96,15 @@ struct sp_forward_context {
     std::vector<uint64_t> k_ntt_cache;
     bool                  k_ntt_persist = false;
 
+    // Phase 9b: dual-prime CRT NTT-domain K cache (SoA layout). When
+    // SP_ENGINE_POLY_NTT_CRT=1, the engine routes attention through the
+    // CRT path; both slabs are populated at K-append time and read
+    // together at attention time. Each slab is sized identically to the
+    // 60-bit k_ntt_cache. Empty means "off".
+    std::vector<uint64_t> k_ntt_cache_q1;
+    std::vector<uint64_t> k_ntt_cache_q2;
+    bool                  k_ntt_crt = false;
+
     // Poncelet adaptive depth tracking (Paper A §7, Theorem 5).
     sp_ok_t poncelet_delta = sp_ok_t{ 0, 0 };
 };

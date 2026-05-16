@@ -19,6 +19,7 @@ extern "C" {
 #include "../lib/shannon-prime/core/sp_frobenius.h"
 extern "C" {
 #include "../lib/shannon-prime/core/sp_ntt.h"
+#include "../lib/shannon-prime/core/sp_ntt_crt.h"
 }
 }
 
@@ -619,6 +620,49 @@ bool sp_forward_step(sp_forward_context& ctx,
             }
         }
 
+        // Phase 9b: dual-prime CRT slabs populated identically. Same delta,
+        // same per-position iteration, but each new K writes into BOTH
+        // q1 and q2 slabs via sp_poly_encode_ntt_k_reversed_crt.
+        if (ctx.attn_mode == 1 && !ctx.k_ntt_cache_q1.empty()
+            && !ctx.k_ntt_cache_q2.empty()
+            && ctx.head_dim <= SP_NTT_CRT_N) {
+            int log2_d = 0; while ((1 << log2_d) < ctx.head_dim) ++log2_d;
+            int delta_bits = 14;
+            if (22 - log2_d - 1 < delta_bits) delta_bits = 22 - log2_d - 1;
+            if (delta_bits < 8) delta_bits = 8;
+            const double delta = (double)(1LL << delta_bits);
+            const double k_div_persist = (double)K_view.scale_recip
+                                       * (double)K_view.frobenius_scale;
+            if (k_div_persist != 0.0) {
+                std::vector<float>    k_vec_persist(ctx.head_dim);
+                std::vector<int64_t>  crt_int_scratch(SP_NTT_CRT_N, 0);
+                const int new_lo = ctx.kv_cache.cur_len;
+                const int new_hi = new_lo + n_tokens;
+                const size_t layer_off =
+                    (size_t)L * (size_t)ctx.n_kv_head *
+                    (size_t)ctx.n_ctx * (size_t)SP_NTT_CRT_N;
+                for (int kvh = 0; kvh < ctx.n_kv_head; ++kvh) {
+                    for (int t = new_lo; t < new_hi; ++t) {
+                        for (int d = 0; d < ctx.head_dim; ++d) {
+                            const sp_ok_t& k_dt = K_view.data[
+                                ((int64_t)kvh * ctx.head_dim + d)
+                                  * t_stride + t];
+                            k_vec_persist[d] =
+                                (float)((double)k_dt.a / k_div_persist);
+                        }
+                        const size_t slot_off = layer_off
+                            + ((size_t)kvh * (size_t)ctx.n_ctx + (size_t)t)
+                                * (size_t)SP_NTT_CRT_N;
+                        uint64_t* slot_q1 = ctx.k_ntt_cache_q1.data() + slot_off;
+                        uint64_t* slot_q2 = ctx.k_ntt_cache_q2.data() + slot_off;
+                        sp_poly_encode_ntt_k_reversed_crt(
+                            slot_q1, slot_q2, k_vec_persist.data(),
+                            ctx.head_dim, delta, crt_int_scratch.data());
+                    }
+                }
+            }
+        }
+
         ctx.attn_out_ok.reset(2, q_shape);
         if (!ctx.layer_arena.alloc_tensor(ctx.attn_out_ok)) return false;
         // attn_out re-encodes the post-softmax V sum (which is in original
@@ -629,9 +673,8 @@ bool sp_forward_step(sp_forward_context& ctx,
         // Wo's pi^k Frobenius factor and lose precision.
         ctx.attn_out_ok.scale_recip = S;
         if (ctx.attn_mode == 1) {
-            // Phase 7: pass the per-layer K-NTT slab when the persistent
-            // cache is allocated. Falls back to Phase 6 in-call build
-            // otherwise.
+            // Phase 7: per-layer K-NTT slab when the 60-bit persistent
+            // cache is allocated.
             const uint64_t* k_ntt_slab = nullptr;
             if (!ctx.k_ntt_cache.empty() && ctx.head_dim <= SP_NTT_N) {
                 const size_t layer_off =
@@ -639,12 +682,24 @@ bool sp_forward_step(sp_forward_context& ctx,
                     (size_t)ctx.n_ctx * (size_t)SP_NTT_N;
                 k_ntt_slab = ctx.k_ntt_cache.data() + layer_off;
             }
+            // Phase 9b: per-layer dual-prime CRT slabs.
+            const uint64_t* k_ntt_slab_q1 = nullptr;
+            const uint64_t* k_ntt_slab_q2 = nullptr;
+            if (!ctx.k_ntt_cache_q1.empty() && !ctx.k_ntt_cache_q2.empty()
+                && ctx.head_dim <= SP_NTT_CRT_N) {
+                const size_t layer_off =
+                    (size_t)L * (size_t)ctx.n_kv_head *
+                    (size_t)ctx.n_ctx * (size_t)SP_NTT_CRT_N;
+                k_ntt_slab_q1 = ctx.k_ntt_cache_q1.data() + layer_off;
+                k_ntt_slab_q2 = ctx.k_ntt_cache_q2.data() + layer_off;
+            }
             sp_attention_poly_ring(ctx.q_ok, K_view, V_view, ctx.attn_out_ok,
                                       n_head, n_kv_head, head_dim,
                                       t_valid, t_stride, position,
                                       layer_swa_window,
                                       ctx.attn_logit_softcap,
-                                      k_ntt_slab);
+                                      k_ntt_slab,
+                                      k_ntt_slab_q1, k_ntt_slab_q2);
         } else {
             sp_attention_dot_product(ctx.q_ok, K_view, V_view, ctx.attn_out_ok,
                                         n_head, n_kv_head, head_dim,
