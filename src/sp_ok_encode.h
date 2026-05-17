@@ -141,4 +141,30 @@ double sp_ok_apply_sato_tate_mix_inplace_fp16(uint16_t* fp16_buf,
                                                 int64_t p2, int64_t k2,
                                                 int64_t scale);
 
+// -----------------------------------------------------------------------
+// Phase 12 Step B: packed-int8 encoder.
+//
+// Combined fp16 -> sp_ok_t -> phi_p^k -> pack-to-int8 pipeline. Allocates
+// the packed storage from `arena` (numel * 2 bytes), populates the
+// descriptor with the chosen q8_shift + carry-over metadata (scale_recip,
+// frobenius_scale, p, k), and returns true on success.
+//
+// The encoder operates on a temporary sp_ok_t scratch buffer (numel * 16
+// bytes -- sized for ONE tensor at a time, NOT the whole model). This
+// scratch can be supplied by the caller for reuse across tensors, or
+// nullptr to allocate internally.
+//
+// The output sp_ok_q8_tensor stores the post-Frobenius coordinates packed
+// to 2 bytes per element, with a single per-tensor q8_shift derived from
+// the post-Frobenius absmax. Decoding via sp_ok_q8_decode_one() recovers
+// the post-Frobenius int64 coordinates up to rounding error <= 2^(shift-1).
+// -----------------------------------------------------------------------
+bool sp_ok_encode_q8_from_fp16_with_frobenius(sp_ok_q8_tensor& out,
+                                              const uint16_t* w_fp16,
+                                              size_t numel,
+                                              int64_t scale,
+                                              int64_t p, int64_t k,
+                                              sp_ok_arena& arena,
+                                              sp_ok_t* scratch = nullptr);
+
 }  // namespace sp::engine

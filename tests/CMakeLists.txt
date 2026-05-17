@@ -224,3 +224,14 @@ set_target_properties(test_sp_ok_q8 PROPERTIES
     CXX_STANDARD 17
 )
 add_test(NAME sp_ok_q8 COMMAND test_sp_ok_q8)
+
+# Phase 12 Step B-1: combined load-path encoder. Verifies the
+# sp_ok_encode_q8_from_fp16_with_frobenius() helper matches the manual
+# (encode -> Frobenius -> pack) pipeline byte-for-byte, that the arena
+# extension correctly sizes packed storage, and that decode recovers the
+# post-Frobenius coordinates within the rounding budget.
+add_executable(test_sp_ok_q8_load_path
+    test_sp_ok_q8_load_path.cpp
+)
+target_link_libraries(test_sp_ok_q8_load_path PRIVATE sp_engine)
+add_test(NAME sp_ok_q8_load_path COMMAND test_sp_ok_q8_load_path)

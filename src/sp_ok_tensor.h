@@ -25,6 +25,7 @@
 
 extern "C" {
 #include "../lib/shannon-prime/core/sp_ok_arith.h"
+#include "../lib/shannon-prime/core/sp_ok_q8.h"
 }
 
 namespace sp::engine {
@@ -100,6 +101,15 @@ public:
     // false if the arena doesn't have room.
     bool alloc_tensor(sp_ok_tensor& t);
 
+    // Phase 12 Step B: packed-int8 ring elements. The descriptor's numel
+    // and shape come from the matching sp_ok_tensor; this call sizes the
+    // backing storage at numel * sizeof(sp_ok_q8_t) = 2 * numel bytes and
+    // returns the descriptor with `data` pointing into the arena. Per-tensor
+    // metadata (q8_shift, scale_recip, frobenius_scale, p, k) is the
+    // caller's responsibility — typically set by the encoder. Returns
+    // false on arena exhaustion. */
+    bool alloc_tensor_q8(sp_ok_q8_tensor& t, size_t numel);
+
     void   reset()              { used_ = 0; }
     size_t capacity() const     { return capacity_; }
     size_t used()     const     { return used_; }
@@ -128,14 +138,14 @@ void sp_ok_tensor_scalar_mul(sp_ok_tensor& t, sp_ok_t scalar);
 //
 // For residual stream + (Wo @ attn_out) where the projections produce
 // pi^k-scaled outputs, the caller must first decode to fp32 (via
-// sp_matmul_ok_to_fp32) and add in fp32 — DO NOT use this function
+// sp_matmul_ok_to_fp32) and add in fp32 -- DO NOT use this function
 // across mismatched scales.
 bool sp_ok_tensor_add_inplace(sp_ok_tensor& t, const sp_ok_tensor& other);
 
 // In-place negation.
 void sp_ok_tensor_negate(sp_ok_tensor& t);
 
-// Sum of norms — useful as a sanity-check invariant (norm scales
+// Sum of norms -- useful as a sanity-check invariant (norm scales
 // predictably under Frobenius, see test_sp_frobenius.cpp).
 int64_t sp_ok_tensor_sum_norms(const sp_ok_tensor& t);
 

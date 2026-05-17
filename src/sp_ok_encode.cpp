@@ -234,4 +234,79 @@ double sp_ok_apply_sato_tate_mix_inplace_fp16(uint16_t* fp16_buf,
     return (double)t.frobenius_scale;
 }
 
+
+// =========================================================================
+// Phase 12 Step B: packed-int8 encoder
+// =========================================================================
+
+bool sp_ok_encode_q8_from_fp16_with_frobenius(sp_ok_q8_tensor& out,
+                                              const uint16_t* w_fp16,
+                                              size_t numel,
+                                              int64_t scale,
+                                              int64_t p, int64_t k,
+                                              sp_ok_arena& arena,
+                                              sp_ok_t* scratch) {
+    if (numel == 0 || !w_fp16) return false;
+
+    /* Allocate packed output from arena (2 * numel bytes). */
+    if (!arena.alloc_tensor_q8(out, numel)) return false;
+
+    /* Acquire scratch buffer. If caller didn't supply one, use a local
+     * vector; this matches the existing in-place-fp16 path which also
+     * allocates a temporary arena per call. */
+    std::vector<sp_ok_t> local_scratch;
+    sp_ok_t* sok = scratch;
+    if (!sok) {
+        local_scratch.resize(numel);
+        sok = local_scratch.data();
+    }
+
+    /* Step 1: fp16 -> sp_ok_t (a = round(fp16 * scale), b = 0). */
+    for (size_t i = 0; i < numel; ++i) {
+        float v = fp16_to_fp32(w_fp16[i]) * (float)scale;
+        sok[i].a = (int64_t)std::llrint(v);
+        sok[i].b = 0;
+    }
+
+    /* Step 2: apply Frobenius phi_p^k in place on the int64 buffer. */
+    int64_t frob_scale = 1;
+    if (k != 0) {
+        sp_frobenius_quant_tensor(sok, numel, p, k);
+        /* Replicate the frobenius_scale tracking from
+         * sp_ok_encode_apply_frobenius_quant: split prime uses pi^k.a as
+         * the signed scale, inert uses (-p)^(k/2). */
+        if (sp_is_inert(p)) {
+            int64_t m = k / 2;
+            int64_t ss = 1;
+            for (int64_t i = 0; i < m; ++i) ss *= (-p);
+            frob_scale = ss;
+        } else if (sp_is_split(p)) {
+            sp_ok_t pi;
+            if (sp_find_element_of_norm(p, &pi)) {
+                sp_ok_t pi_pow = sp_ok_pow(pi, k);
+                if (pi_pow.a != 0) {
+                    frob_scale = pi_pow.a;
+                } else {
+                    int64_t ss = 1;
+                    for (int64_t i = 0; i < k; ++i) ss *= p;
+                    frob_scale = ss;
+                }
+            }
+        }
+    }
+
+    /* Step 3: pack post-Frobenius (a, b) -> packed int8 pair with per-tensor
+     * shift. sp_ok_q8_encode_array computes absmax internally and returns
+     * the chosen shift. */
+    int8_t shift = sp_ok_q8_encode_array(out.data, sok, numel);
+
+    /* Step 4: populate metadata. */
+    out.q8_shift        = shift;
+    out.scale_recip     = scale;
+    out.frobenius_scale = frob_scale;
+    out.frobenius_p     = (int16_t)p;
+    out.frobenius_k     = (int16_t)k;
+    return true;
+}
+
 }  // namespace sp::engine
