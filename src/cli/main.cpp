@@ -17,6 +17,7 @@ extern "C" {
 #include "llama_weights.h"
 #include "prime_pe.h"
 #include "sp_forward.h"
+#include "sp_lt_memory.h"
 #include "sp_threadpool.h"
 #include "sp_weights_loader.h"
 #include "tokenizer.h"
@@ -1151,11 +1152,45 @@ int main(int argc, char** argv) {
                 prefill_env ? prefill_env : "(unset)",
                 use_prefill ? "TRUE (batched N=n_ctx)" : "false (per-token loop)");
 
+            // Phase 13.B: optional long-term Algebraic Resonance Memory.
+            // When SP_ENGINE_MEMORY=1, every chunk's KV cache is bound
+            // into the bank before being cleared. Phase 13.B is the
+            // WRITE-only side: the forward path doesn't read the bank
+            // yet, so PPL is bit-identical to the no-memory path. We
+            // characterize write overhead here; recall + inject lands
+            // in Phase 13.C.
+            const char* mem_env = std::getenv("SP_ENGINE_MEMORY");
+            const bool use_lt_memory =
+                (mem_env != nullptr) && (mem_env[0] && mem_env[0] != '0');
+            sp::engine::sp_lt_memory lt_mem{};
+            if (use_lt_memory) {
+                if (!sp::engine::sp_lt_memory_init(
+                        lt_mem, ctx.n_layers, ctx.n_kv_head, ctx.head_dim,
+                        /*delta=*/256.0)) {
+                    std::fprintf(stderr,
+                        "[sp-engine] perplexity-native: sp_lt_memory_init "
+                        "failed — disabling memory\n");
+                }
+            }
+            std::fprintf(stderr,
+                "[sp-engine] perplexity-native: SP_ENGINE_MEMORY=%s "
+                "-> use_lt_memory=%s\n",
+                mem_env ? mem_env : "(unset)",
+                use_lt_memory ? "TRUE (ARM write hook at chunk boundary)"
+                              : "false (no long-term memory)");
+
             for (int c = 0; c < eval_chunks_n; ++c) {
                 for (int t = 0; t < n_ctx; ++t) {
                     chunk_n[(size_t)t] = all_ids_n[(size_t)(c * n_ctx + t)];
                 }
                 if (bos_n >= 0) chunk_n[0] = bos_n;
+
+                // Phase 13.B: bind every (K_t, V_t) in the active cache
+                // into the long-term memory bank BEFORE the cache_clear
+                // drops cur_len. Writes only — no impact on forward.
+                if (use_lt_memory && ctx.kv_cache.cur_len > 0) {
+                    sp::engine::sp_lt_memory_write_evict(lt_mem, ctx.kv_cache);
+                }
 
                 // Reset KV cache for the new chunk.
                 sp::engine::sp_ok_kv_cache_clear(ctx.kv_cache);
@@ -1224,6 +1259,34 @@ int main(int argc, char** argv) {
                     "  [native] chunk %3d/%d  PPL_running=%.4f  elapsed=%.1fs\n",
                     c + 1, eval_chunks_n, running_ppl, elapsed_s);
             }
+
+            // Phase 13.B diagnostic: dump bank stats so we can verify
+            // writes actually accumulated. Slab norm > 0 means the
+            // resonance memory got real signal; norm = 0 means no
+            // writes (or perfect destructive interference, vanishingly
+            // unlikely with random Q/K).
+            if (use_lt_memory) {
+                std::fprintf(stderr,
+                    "[sp-engine] sp_lt_memory: total_writes=%llu  "
+                    "total_evictions=%llu  n_slabs=%d\n",
+                    (unsigned long long)lt_mem.total_writes,
+                    (unsigned long long)lt_mem.total_evictions,
+                    lt_mem.n_slabs);
+                /* Sample a handful of slab norms across layers. */
+                const int sample_layers[] = { 0, ctx.n_layers / 4,
+                                                ctx.n_layers / 2,
+                                                (3 * ctx.n_layers) / 4,
+                                                ctx.n_layers - 1 };
+                for (int idx = 0; idx < (int)(sizeof(sample_layers)/sizeof(int)); ++idx) {
+                    const int L = sample_layers[idx];
+                    const double n0 =
+                        sp::engine::sp_lt_memory_slab_norm(lt_mem, L, 0);
+                    std::fprintf(stderr,
+                        "[sp-engine] sp_lt_memory: slab L=%2d h=0 norm = %.3e\n",
+                        L, n0);
+                }
+            }
+
             const double mean_nll_n = total_nll_n / (double)total_evalled_n;
             const double ppl_n      = std::exp(mean_nll_n);
             std::printf(
