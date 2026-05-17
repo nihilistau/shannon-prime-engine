@@ -355,12 +355,48 @@ int sp_weights_convert_to_q8(sp_weights& weights);
 //   5. logits_fp32 = sp_matmul_ok_to_fp32(lm_head, x_final_ok)
 //   6. write logits_fp32 ? logits_out
 //
-// Single-token mode (n_tokens=1). Multi-token prefill lands in 2.2d2.
+// Single-token mode (n_tokens=1). Thin wrapper that calls
+// sp_forward_step_prefill with n_tokens=1; the two are mathematically
+// equivalent and bit-identical (at n_tokens=1 every layout formula
+// collapses to its single-token form).
 bool sp_forward_step(sp_forward_context& ctx,
                      const sp_weights&   weights,
                      int                 token_id,
                      int                 position,
                      std::vector<float>& logits_out);
+
+// Phase 12 Step E: multi-token prefill. Processes n_tokens tokens
+// (token_ids[0..n_tokens-1]) at sequential positions [position_base,
+// position_base + n_tokens - 1] through the same forward pass as
+// sp_forward_step, but each layer's weight reads (W_q/W_k/W_v/W_o/
+// W_gate/W_up/W_down) are amortized across all n_tokens query tokens.
+// That is the production win for 8B+ models at ctx 4K+: the 1.3 GB
+// Q8 weight band streams through DRAM ONCE per layer per chunk,
+// not once per token.
+//
+// Output:
+//   logits_out is resized to n_tokens * vocab. The logit row for token
+//   t (the t-th token in this prefill call) is at
+//     logits_out.data() + t * vocab
+//   For perplexity bench's needs, this is the row at position
+//   (position_base + t) in the model's output stream.
+//
+// Constraints:
+//   - ctx.x_fp32 / ctx.proj_out_fp32 must be sized at least
+//     n_ctx * n_embd at context-init time. sp_forward_context_init
+//     allocates n_ctx-sized buffers; the single-token path uses only
+//     the first n_embd elements, the prefill path uses n_tokens *
+//     n_embd contiguous floats.
+//   - KV cache must have room: kv_cache.cur_len + n_tokens <= n_ctx.
+//   - 1 <= n_tokens <= n_ctx.
+//
+// At n_tokens=1 this function is bit-identical to sp_forward_step.
+bool sp_forward_step_prefill(sp_forward_context& ctx,
+                              const sp_weights&   weights,
+                              const int*          token_ids,
+                              int                 n_tokens,
+                              int                 position_base,
+                              std::vector<float>& logits_out);
 
 // Initialize a forward context for a given model. Allocates KV cache,
 // scratch arenas, and the residual-stream buffers. Reads V's expected

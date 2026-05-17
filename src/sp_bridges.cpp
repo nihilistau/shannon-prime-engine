@@ -188,14 +188,18 @@ bool sp_per_head_rmsnorm_native(sp_ok_tensor& qk,
     const int64_t S = qk.scale_recip;
     const double  S_d = (double)S;
 
-    // Layout: qk.data[(h * head_dim + d) * T + t]
+    // Layout (Step E row-major-by-token): qk.data[t * F + (h*head_dim + d)]
+    // At n_tokens=1 this collapses to qk.data[h*head_dim + d] — bit-identical
+    // to the pre-Step-E column-major-by-token formula qk.data[f * T + t].
+    const int64_t d_total = F;  // n_heads * head_dim
     for (int t = 0; t < n_tokens; ++t) {
+        sp_ok_t* row = qk.data + (int64_t)t * d_total;
         for (int h = 0; h < n_heads; ++h) {
+            sp_ok_t* head_ptr = row + (int64_t)h * head_dim;
             // Pass 1: sum of squares over head_dim for (h, t).
             double sum_sq = 0.0;
             for (int d = 0; d < head_dim; ++d) {
-                const int64_t f = (int64_t)h * head_dim + d;
-                double v = (double)qk.data[f * T + t].a / in_divisor;
+                double v = (double)head_ptr[d].a / in_divisor;
                 sum_sq += v * v;
             }
             const double inv_rms =
@@ -203,11 +207,10 @@ bool sp_per_head_rmsnorm_native(sp_ok_tensor& qk,
 
             // Pass 2: normalize, multiply by per-feature scale, re-encode.
             for (int d = 0; d < head_dim; ++d) {
-                const int64_t f = (int64_t)h * head_dim + d;
-                double v   = (double)qk.data[f * T + t].a / in_divisor;
+                double v   = (double)head_ptr[d].a / in_divisor;
                 double y   = v * inv_rms * (double)scale_fp32[d];
                 int64_t a  = (int64_t)std::llrint(y * S_d);
-                qk.data[f * T + t] = sp_ok_t{ a, 0 };
+                head_ptr[d] = sp_ok_t{ a, 0 };
             }
         }
     }

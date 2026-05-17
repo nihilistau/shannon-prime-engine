@@ -40,9 +40,22 @@ namespace sp::engine {
 // O_K @ O_K → O_K matmul (the workhorse).
 // -----------------------------------------------------------------------
 //
-// W: weight matrix, shape [out_rows, in_cols], row-major
-// X: input matrix,  shape [in_cols, n_cols],   row-major
-// Y: output matrix, shape [out_rows, n_cols],  row-major (caller-allocated)
+// Layout convention (Step E — token-as-row, matches the rest of the engine):
+//   W: weight matrix [out_rows M × in_cols K], row-major,  W.data[i*K + k]
+//   X: input  matrix [n_cols  N × in_cols K], row-major,  X.data[j*K + k]
+//   Y: output matrix [n_cols  N × out_rows M], row-major, Y.data[j*M + i]
+//
+//   Computes Y[j,i] = sum_k W[i,k] * X[j,k]
+//
+// This matches the natural token-as-row layout used by embed_lookup,
+// rmsnorm, RoPE, KV-cache append, and FFN — every kernel writes/reads X
+// as "token j's features start at j*K". The inner k loop is contiguous
+// in both W (i*K + k) and X (j*K + k), which is friendly to the hardware
+// prefetcher and SIMD.
+//
+// At N=1 (single-token decode), Y.data[j*M + i] collapses to Y.data[i]
+// and X.data[j*K + k] collapses to X.data[k] — bit-identical to the
+// pre-Step-E convention. All N=1 PPL numbers remain valid.
 //
 // All three tensors hold sp_ok_t elements. Y's data is overwritten.
 // Y.scale_recip is set to W.scale_recip * X.scale_recip;

@@ -94,17 +94,23 @@ void sp_attention_dot_product(const sp_ok_tensor& q,
     std::vector<float> scores(T_valid);
     std::vector<float> weights(T_valid);
 
-    // Layout reminders (matches sp_matmul output shape = {N, M}):
-    //   q.data[(h*head_dim + d) * n_q + qi]   for qi in [0,n_q), d in [0,head_dim)
+    // Layout reminders (Step E — Q/out row-major-by-token, K/V cache-strided):
+    //   q.data[qi * d_q   + (h*head_dim    + d)]   d_q   = n_head    * head_dim
     //   k.data[(kv_h*head_dim + d) * T_stride + t]
     //   v.data[(kv_h*head_dim + d) * T_stride + t]
-    //   out.data[(h*head_dim + d) * n_q + qi]
+    //   out.data[qi * d_q + (h*head_dim    + d)]
+    //
+    // At n_q=1 the qi*d_q offset is 0 and these collapse to the previous
+    // single-token formulas — bit-identical to pre-Step-E semantics.
+    const int64_t d_q_total = (int64_t)n_head * head_dim;
 
     for (int h = 0; h < n_head; ++h) {
         const int kv_h = (h * n_kv_head) / n_head;
 
         for (int64_t qi = 0; qi < n_q; ++qi) {
             const int q_pos = pos_offset + (int)qi;
+            const int64_t q_row_off   = qi * d_q_total + (int64_t)h * head_dim;
+            const int64_t out_row_off = q_row_off;
 
             // SWA range: each query at position q_pos sees positions
             //   [swa_lo, q_pos]. For a global layer (swa_window=0) this
@@ -124,17 +130,32 @@ void sp_attention_dot_product(const sp_ok_tensor& q,
             // integer domain — just decode to fp64 per element and
             // accumulate. Matches what sp_attention_poly_ring does
             // and what the unit test always assumed.
+            //
+            // Step E-3 causal/SWA shortcut: only compute scores in the
+            // valid range [t_lo, t_hi). Positions outside this window
+            // are masked to -inf for softmax (zero contribution) and
+            // contribute 0 to the V sum. At single-token decode (n_q=1,
+            // q_pos = T_valid - 1, swa_lo = 0 globally) this is the
+            // full [0, T_valid) range — bit-identical to the unshortened
+            // version. At N-token prefill the saved work is ~N/2.
             const double q_div_inner = (double)q.scale_recip *
                                           (double)q.frobenius_scale;
             const double k_div_inner = (double)k.scale_recip *
                                           (double)k.frobenius_scale;
-            for (int64_t t = 0; t < T_valid; ++t) {
+            const int64_t t_lo = swa_lo;
+            const int64_t t_hi = std::min<int64_t>((int64_t)q_pos + 1, T_valid);
+
+            // Initialize out-of-range scores to -inf so softmax treats
+            // them as zero contribution. No need for a separate mask pass.
+            for (int64_t t = 0; t < t_lo; ++t)      scores[t] = NEG_INF;
+            for (int64_t t = t_hi; t < T_valid; ++t) scores[t] = NEG_INF;
+
+            for (int64_t t = t_lo; t < t_hi; ++t) {
                 double acc = 0.0;
                 for (int d = 0; d < head_dim; ++d) {
                     const sp_ok_t& k_dt =
                         k.data[((int64_t)kv_h * head_dim + d) * T_stride + t];
-                    const sp_ok_t& q_d  =
-                        q.data[((int64_t)h    * head_dim + d) * n_q + qi];
+                    const sp_ok_t& q_d  = q.data[q_row_off + d];
                     double k_val = (double)k_dt.a / k_div_inner;
                     double q_val = (double)q_d.a  / q_div_inner;
                     acc += q_val * k_val;
@@ -150,39 +171,34 @@ void sp_attention_dot_product(const sp_ok_tensor& q,
                 scores[t] = (float)(acc * (double)inv_sqrt_d);
             }
 
-            // 2a) Apply logit softcap BEFORE masking so the masked positions
-            //     stay -inf (tanh(-inf/cap)*cap == -cap which would corrupt
-            //     the softmax denominator). Pre-cap is the same shape as
-            //     ggml_flash_attn_ext's softcap (applied to QK^T/sqrt(d)).
+            // 2) Apply logit softcap to the valid range only (the masked
+            //    tails stay at NEG_INF — tanh(-inf/cap)*cap = -cap would
+            //    corrupt the softmax denominator).
             if (attn_logit_softcap > 0.0f) {
                 const float cap = attn_logit_softcap;
                 const float inv_cap = 1.0f / cap;
-                for (int64_t t = 0; t < T_valid; ++t) {
+                for (int64_t t = t_lo; t < t_hi; ++t) {
                     scores[t] = std::tanh(scores[t] * inv_cap) * cap;
                 }
             }
 
-            // 2b) Causal mask + SWA mask: positions t > q_pos OR
-            //     t < swa_lo are -inf.
-            for (int64_t t = 0; t < T_valid; ++t) {
-                if ((int)t > q_pos || (int)t < swa_lo) scores[t] = NEG_INF;
-            }
-
-            // 3) softmax
+            // 3) softmax over the full T_valid window — the NEG_INF tails
+            //    softmax to 0 and contribute nothing to the normalization.
             sp_softmax_bridge(scores.data(), (int)T_valid, weights.data());
 
             // 4) attn[d] = sum_t V_h,d,t * weights[t]; re-encode at S_out.
+            //    Sum is restricted to t in [t_lo, t_hi); outside positions
+            //    have weights[t] = 0 and contribute nothing.
             for (int d = 0; d < head_dim; ++d) {
                 double acc = 0.0;
-                for (int64_t t = 0; t < T_valid; ++t) {
+                for (int64_t t = t_lo; t < t_hi; ++t) {
                     const sp_ok_t& v_dt =
                         v.data[((int64_t)kv_h * head_dim + d) * T_stride + t];
                     double v_val = (double)v_dt.a / v_divisor;
                     acc += v_val * (double)weights[t];
                 }
                 int64_t a_out = (int64_t)std::llrint(acc * (double)S_out);
-                out.data[((int64_t)h * head_dim + d) * n_q + qi] =
-                    sp_ok_t{ a_out, 0 };
+                out.data[out_row_off + d] = sp_ok_t{ a_out, 0 };
             }
         }
     }
@@ -331,16 +347,25 @@ void sp_attention_poly_ring(const sp_ok_tensor& q,
         crt_c_q2.assign(SP_NTT_CRT_N, 0);
     }
 
+    // Step E layout (row-major-by-token for Q and out, K/V keep their
+    // cache-strided layout):
+    //   q.data[qi * d_q_total + (h*head_dim + d)]
+    //   out.data[qi * d_q_total + (h*head_dim + d)]
+    // At n_q=1 the qi*d_q_total offset is zero and these reduce to the
+    // previous single-token formulas (bit-identical).
+    const int64_t d_q_total = (int64_t)n_head * head_dim;
+
     for (int h = 0; h < n_head; ++h) {
         const int kv_h = (h * n_kv_head) / n_head;
 
         for (int64_t qi = 0; qi < n_q; ++qi) {
             const int q_pos = pos_offset + (int)qi;
+            const int64_t q_row_off   = qi * d_q_total + (int64_t)h * head_dim;
+            const int64_t out_row_off = q_row_off;
 
             // Decode Q for this (h, qi) into fp32.
             for (int d = 0; d < head_dim; ++d) {
-                const sp_ok_t& q_d =
-                    q.data[((int64_t)h * head_dim + d) * n_q + qi];
+                const sp_ok_t& q_d = q.data[q_row_off + d];
                 q_vec[d] = (float)((double)q_d.a / q_div);
             }
 
@@ -356,8 +381,19 @@ void sp_attention_poly_ring(const sp_ok_tensor& q,
                 ? std::max(0, q_pos - swa_window + 1)
                 : 0;
 
-            // Per-t scores via polynomial-ring dot product.
-            for (int64_t t = 0; t < T_valid; ++t) {
+            // Step E-3 causal/SWA shortcut: only do the NTT-pointwise
+            // dot product for t in [t_lo, t_hi). Outside positions stay
+            // at NEG_INF -> 0 softmax weight, contribute nothing to V sum.
+            // Bit-identical to the unshortened version (which masked the
+            // same positions post-hoc).
+            const int64_t t_lo = swa_lo;
+            const int64_t t_hi = std::min<int64_t>((int64_t)q_pos + 1, T_valid);
+
+            for (int64_t t = 0; t < t_lo; ++t)       scores[t] = NEG_INF;
+            for (int64_t t = t_hi; t < T_valid; ++t) scores[t] = NEG_INF;
+
+            // Per-t scores via polynomial-ring dot product, valid range only.
+            for (int64_t t = t_lo; t < t_hi; ++t) {
                 float dot;
                 if (use_crt_here) {
                     // Phase 9b: dual-prime cached K slabs, pure
@@ -394,35 +430,29 @@ void sp_attention_poly_ring(const sp_ok_tensor& q,
                 scores[t] = dot * inv_sqrt_d;
             }
 
-            // Softcap before masking.
+            // Softcap on the valid range only (NEG_INF tails preserved).
             if (attn_logit_softcap > 0.0f) {
                 const float cap = attn_logit_softcap;
                 const float inv_cap = 1.0f / cap;
-                for (int64_t t = 0; t < T_valid; ++t) {
+                for (int64_t t = t_lo; t < t_hi; ++t) {
                     scores[t] = std::tanh(scores[t] * inv_cap) * cap;
                 }
             }
 
-            // Causal + SWA mask.
-            for (int64_t t = 0; t < T_valid; ++t) {
-                if ((int)t > q_pos || (int)t < swa_lo) scores[t] = NEG_INF;
-            }
-
-            // Softmax.
+            // Softmax over the full window (NEG_INF tails softmax to 0).
             sp_softmax_bridge(scores.data(), (int)T_valid, weights.data());
 
-            // Weighted V sum, re-encode at S_out.
+            // Weighted V sum over the valid range only.
             for (int d = 0; d < head_dim; ++d) {
                 double acc = 0.0;
-                for (int64_t t = 0; t < T_valid; ++t) {
+                for (int64_t t = t_lo; t < t_hi; ++t) {
                     const sp_ok_t& v_dt =
                         v.data[((int64_t)kv_h * head_dim + d) * T_stride + t];
                     double v_val = (double)v_dt.a / v_divisor;
                     acc += v_val * (double)weights[t];
                 }
                 int64_t a_out = (int64_t)std::llrint(acc * (double)S_out);
-                out.data[((int64_t)h * head_dim + d) * n_q + qi] =
-                    sp_ok_t{ a_out, 0 };
+                out.data[out_row_off + d] = sp_ok_t{ a_out, 0 };
             }
         }
     }

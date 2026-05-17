@@ -68,12 +68,30 @@ static bool kv_append_one(sp_ok_tensor&       dst,
     if (dst.scale_recip != src.scale_recip) return false;
     if (dst.frobenius_scale != src.frobenius_scale) return false;
 
-    // Copy per-feature row from src[feature * T_src + t] to
-    //                          dst[feature * T_dst + (dst_offset_inner + t)]
-    for (int64_t f = 0; f < F_dst; ++f) {
-        sp_ok_t* d_row = dst.data + f * T_dst + dst_offset_inner;
-        const sp_ok_t* s_row = src.data + f * T_src;
-        std::memcpy(d_row, s_row, (size_t)n_new_tokens * sizeof(sp_ok_t));
+    // Step E: src now ships in row-major-by-token (matmul output layout):
+    //   src.data[t * F + f]   for t in [0, n_new_tokens), f in [0, F).
+    // Destination cache slabs keep their column-major-by-token layout to
+    // preserve the t-innermost-stride access pattern that attention's
+    // t-scan requires:
+    //   dst.data[f * T_dst + (dst_offset_inner + t)].
+    // We transpose during the copy. At n_new_tokens=1 the inner write
+    // stride is 0 and this reduces to the previous one-shot memcpy
+    // semantics — bit-identical to the pre-Step-E path.
+    if (n_new_tokens == 1) {
+        // Fast-path: at N=1 the src is just a flat F-length vector,
+        // identical under either convention. Scatter into dst at slot
+        // dst_offset_inner without going through the transpose loop.
+        for (int64_t f = 0; f < F_dst; ++f) {
+            dst.data[f * T_dst + dst_offset_inner] = src.data[f];
+        }
+    } else {
+        for (int64_t t = 0; t < (int64_t)n_new_tokens; ++t) {
+            const sp_ok_t* s_row = src.data + t * F_src;
+            const int64_t  dst_t = (int64_t)dst_offset_inner + t;
+            for (int64_t f = 0; f < F_dst; ++f) {
+                dst.data[f * T_dst + dst_t] = s_row[f];
+            }
+        }
     }
     return true;
 }

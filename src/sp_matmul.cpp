@@ -37,10 +37,21 @@ static inline void split_rows(int64_t M, int n_threads, int thread_id,
 bool sp_matmul_ok(const sp_ok_tensor& W,
                    const sp_ok_tensor& X,
                    sp_ok_tensor&       Y) {
-    // Shape contract (sp_ok_tensor convention: shape[0] is innermost):
-    //   W: shape[0]=K (in_cols, inner), shape[1]=M (out_rows)
-    //   X: shape[0]=N (n_cols, inner),  shape[1]=K (in_cols)
-    //   Y: shape[0]=N (inner),          shape[1]=M
+    // Shape contract (Step E layout flip — matches the rest of the engine's
+    // token-as-row physical layout used by rmsnorm/embed/RoPE/KV-append):
+    //   W: out_rows M × in_cols K, row-major as W.data[i*K + k]
+    //   X: n_cols N × in_cols K,   row-major as X.data[j*K + k]
+    //              (token j's features are contiguous; embed_lookup writes
+    //              this layout, rmsnorm reads/writes this layout)
+    //   Y: n_cols N × out_rows M,  row-major as Y.data[j*M + i]
+    //
+    // At N=1 this collapses to flat[k] / flat[i] — bit-identical to the
+    // pre-Step-E column-major-by-token convention, so all N=1 PPL
+    // measurements remain valid.
+    //
+    // shape[] validation kept as {N, K}/{K, M}/{N, M} for numel/error
+    // checking; the "shape[0] is innermost" sp_ok_tensor convention is a
+    // soft convention not enforced by the kernel.
     if (W.data == nullptr || X.data == nullptr) return false;
     if (W.n_dims < 2 || X.n_dims < 2) return false;
     const int64_t M = W.shape[1];
@@ -151,19 +162,24 @@ bool sp_matmul_ok(const sp_ok_tensor& W,
                 Y.data[i] = sp_ok_t{ acc_a, acc_b };
             } else {
                 // ----- General GEMM path (N > 1, prefill) -----
+                // Row-major-by-token: both W row (W.data[i*K..]) and X row
+                // (X.data[j*K..]) are contiguous in the inner k loop —
+                // friendly to the hardware prefetcher and SIMD.
                 for (int64_t j = 0; j < N; ++j) {
                     int64_t acc_a = 0;
                     int64_t acc_b = 0;
+                    const sp_ok_t* w_row = W.data + i * K;
+                    const sp_ok_t* x_row = X.data + j * K;
                     for (int64_t k = 0; k < K; ++k) {
-                        const sp_ok_t& w_ik = W.data[i * K + k];
-                        const sp_ok_t& x_kj = X.data[k * N + j];
-                        acc_a += w_ik.a * x_kj.a
-                               - (int64_t)SP_OK_OMEGA_NORM * w_ik.b * x_kj.b;
-                        acc_b += w_ik.a * x_kj.b
-                               + x_kj.a * w_ik.b
-                               + w_ik.b * x_kj.b;
+                        const sp_ok_t& w_ik = w_row[k];
+                        const sp_ok_t& x_jk = x_row[k];
+                        acc_a += w_ik.a * x_jk.a
+                               - (int64_t)SP_OK_OMEGA_NORM * w_ik.b * x_jk.b;
+                        acc_b += w_ik.a * x_jk.b
+                               + x_jk.a * w_ik.b
+                               + w_ik.b * x_jk.b;
                     }
-                    Y.data[i * N + j] = sp_ok_t{ acc_a, acc_b };
+                    Y.data[j * M + i] = sp_ok_t{ acc_a, acc_b };
                 }
             }
         }
@@ -199,14 +215,16 @@ bool sp_matmul_ok_to_fp32(const sp_ok_tensor& W,
         int64_t i0, i1;
         split_rows(M, nt, thread_id, i0, i1);
         for (int64_t i = i0; i < i1; ++i) {
+            const sp_ok_t* w_row = W.data + i * K;
             for (int64_t j = 0; j < N; ++j) {
                 int64_t acc_a = 0;
+                const sp_ok_t* x_row = X.data + j * K;
                 for (int64_t k = 0; k < K; ++k) {
-                    const sp_ok_t& w_ik = W.data[i * K + k];
-                    const sp_ok_t& x_kj = X.data[k * N + j];
-                    acc_a += w_ik.a * x_kj.a - SP_OK_OMEGA_NORM * w_ik.b * x_kj.b;
+                    const sp_ok_t& w_ik = w_row[k];
+                    const sp_ok_t& x_jk = x_row[k];
+                    acc_a += w_ik.a * x_jk.a - SP_OK_OMEGA_NORM * w_ik.b * x_jk.b;
                 }
-                Y_fp32[i * N + j] = (float)((double)acc_a / divisor);
+                Y_fp32[j * M + i] = (float)((double)acc_a / divisor);
             }
         }
     });
@@ -236,17 +254,19 @@ bool sp_matmul_fp32_input_to_ok(const sp_ok_tensor& W,
         int64_t i0, i1;
         split_rows(M, nt, thread_id, i0, i1);
         for (int64_t i = i0; i < i1; ++i) {
+            const sp_ok_t* w_row = W.data + i * K;
             for (int64_t j = 0; j < N; ++j) {
                 int64_t acc_a = 0;
                 int64_t acc_b = 0;
+                const float* x_row = X_fp32 + j * K;
                 for (int64_t k = 0; k < K; ++k) {
-                    const sp_ok_t& w_ik = W.data[i * K + k];
+                    const sp_ok_t& w_ik = w_row[k];
                     int64_t x_a =
-                        (int64_t)std::llrint((double)X_fp32[k * N + j] * (double)S);
+                        (int64_t)std::llrint((double)x_row[k] * (double)S);
                     acc_a += w_ik.a * x_a;
                     acc_b += w_ik.b * x_a;
                 }
-                Y.data[i * N + j] = sp_ok_t{ acc_a, acc_b };
+                Y.data[j * M + i] = sp_ok_t{ acc_a, acc_b };
             }
         }
     });
@@ -291,24 +311,25 @@ bool sp_matmul_ok_q8(const sp_ok_tensor&    W_shape,
         int64_t i0, i1;
         split_rows(M, nt, thread_id, i0, i1);
         for (int64_t i = i0; i < i1; ++i) {
+            const sp_ok_q8_t* w_row = W_q8.data + i * K;
             for (int64_t j = 0; j < N; ++j) {
                 int64_t acc_a = 0;
                 int64_t acc_b = 0;
-                const sp_ok_q8_t* w_row = W_q8.data + i * K;
+                const sp_ok_t* x_row = X.data + j * K;
                 for (int64_t k = 0; k < K; ++k) {
                     /* Decode-and-multiply, fused. The shift inlines as
                      * two sll's; the ring multiply matches sp_matmul_ok. */
                     const sp_ok_q8_t& w_q = w_row[k];
                     const int64_t w_a = ((int64_t)w_q.a) << shift;
                     const int64_t w_b = ((int64_t)w_q.b) << shift;
-                    const sp_ok_t& x_kj = X.data[k * N + j];
-                    acc_a += w_a * x_kj.a
-                           - (int64_t)SP_OK_OMEGA_NORM * w_b * x_kj.b;
-                    acc_b += w_a * x_kj.b
-                           + x_kj.a * w_b
-                           + w_b * x_kj.b;
+                    const sp_ok_t& x_jk = x_row[k];
+                    acc_a += w_a * x_jk.a
+                           - (int64_t)SP_OK_OMEGA_NORM * w_b * x_jk.b;
+                    acc_b += w_a * x_jk.b
+                           + x_jk.a * w_b
+                           + w_b * x_jk.b;
                 }
-                Y.data[i * N + j] = sp_ok_t{ acc_a, acc_b };
+                Y.data[j * M + i] = sp_ok_t{ acc_a, acc_b };
             }
         }
     });
@@ -355,15 +376,16 @@ bool sp_matmul_ok_q8_to_fp32(const sp_ok_tensor&    W_shape,
             const sp_ok_q8_t* w_row = W_q8.data + i * K;
             for (int64_t j = 0; j < N; ++j) {
                 int64_t acc_a = 0;
+                const sp_ok_t* x_row = X.data + j * K;
                 for (int64_t k = 0; k < K; ++k) {
                     const sp_ok_q8_t& w_q = w_row[k];
                     const int64_t w_a = ((int64_t)w_q.a) << shift;
                     const int64_t w_b = ((int64_t)w_q.b) << shift;
-                    const sp_ok_t& x_kj = X.data[k * N + j];
-                    acc_a += w_a * x_kj.a
-                           - (int64_t)SP_OK_OMEGA_NORM * w_b * x_kj.b;
+                    const sp_ok_t& x_jk = x_row[k];
+                    acc_a += w_a * x_jk.a
+                           - (int64_t)SP_OK_OMEGA_NORM * w_b * x_jk.b;
                 }
-                Y_fp32[i * N + j] = (float)((double)acc_a / divisor);
+                Y_fp32[j * M + i] = (float)((double)acc_a / divisor);
             }
         }
     });

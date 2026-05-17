@@ -42,9 +42,15 @@ bool sp_rope_apply_ok(sp_ok_tensor&      qk,
         freqs[k] = freq_scale * std::pow(freq_base, exp_arg);
     }
 
+    // Step E row-major-by-token layout: qk.data[t * F_outer + i].
+    // At n_tokens=1 this collapses to qk.data[i] — bit-identical to the
+    // pre-Step-E column-major-by-token formula qk.data[i * T_inner + t].
+    (void)T_inner;  // shape array still says {n_tokens, F}; numel matches.
+
     // Iterate tokens, heads, pairs.
     for (int t = 0; t < n_tokens; ++t) {
         const float pp = (float)positions[t];
+        sp_ok_t* row = qk.data + (int64_t)t * F_outer;
         for (int h = 0; h < n_heads; ++h) {
             for (int k = 0; k < n_pairs; ++k) {
                 const float ang = pp * freqs[k];
@@ -61,8 +67,8 @@ bool sp_rope_apply_ok(sp_ok_tensor&      qk,
                     i_even = (int64_t)h * head_dim + 2 * k;
                     i_odd  = i_even + 1;
                 }
-                sp_ok_t& e_even = qk.data[i_even * T_inner + t];
-                sp_ok_t& e_odd  = qk.data[i_odd  * T_inner + t];
+                sp_ok_t& e_even = row[i_even];
+                sp_ok_t& e_odd  = row[i_odd];
 
                 const double a = (double)e_even.a / divisor;
                 const double b = (double)e_odd.a  / divisor;

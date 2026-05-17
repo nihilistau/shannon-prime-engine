@@ -56,15 +56,23 @@ bool sp_forward_context_init(sp_forward_context& ctx,
     ctx.rms_eps       = rms_eps;
     ctx.poncelet_delta = sp_ok_t{ 0, 0 };
 
-    ctx.x_fp32.assign(ctx.n_embd, 0.0f);
-    ctx.proj_out_fp32.assign(ctx.n_embd, 0.0f);
+    // Phase 12 Step E: size residual buffers for worst-case prefill
+    // (full n_ctx tokens). Per-token decode uses only the first n_embd
+    // entries; prefill uses n_tokens * n_embd contiguous floats.
+    ctx.x_fp32.assign((size_t)ctx.n_ctx * (size_t)ctx.n_embd, 0.0f);
+    ctx.proj_out_fp32.assign((size_t)ctx.n_ctx * (size_t)ctx.n_embd, 0.0f);
     ctx.logits_fp32.assign(weights.vocab, 0.0f);
 
     // Layer scratch arena — enough for x_ok + x_norm_ok + q + k + v + attn_out
     // plus an FFN scratch arena's worth (d_ff buffer + matmul scratches).
+    //
+    // Phase 12 Step E: every per-token buffer scales linearly with n_tokens
+    // when sp_forward_step_prefill batches a chunk. Size for the worst
+    // case (n_ctx tokens) so the prefill path never needs to grow the
+    // arena mid-call.
     const int64_t d_q  = (int64_t)ctx.n_head    * ctx.head_dim;
     const int64_t d_kv = (int64_t)ctx.n_kv_head * ctx.head_dim;
-    const size_t per_layer_bytes =
+    const size_t per_token_bytes =
           (size_t)(  /*x_ok*/      ctx.n_embd
                    + /*x_norm_ok*/ ctx.n_embd
                    + /*q_ok*/      d_q
@@ -72,8 +80,9 @@ bool sp_forward_context_init(sp_forward_context& ctx,
                    + /*v_ok*/      d_kv
                    + /*attn_out*/  d_q
                    + /*ffn act*/   weights.d_ff
-                  ) * sizeof(sp_ok_t)
-        + 4096;
+                  ) * sizeof(sp_ok_t);
+    const size_t per_layer_bytes =
+        per_token_bytes * (size_t)ctx.n_ctx + 4096;
     ctx.layer_arena.reserve(per_layer_bytes);
 
     // Phase 12 Step D: matmul kernels now consume packed Q8 directly
@@ -741,26 +750,53 @@ static void embed_lookup_fp32(float* x_fp32,
     }
 }
 
-bool sp_forward_step(sp_forward_context& ctx,
-                     const sp_weights&   weights,
-                     int                 token_id,
-                     int                 position,
-                     std::vector<float>& logits_out) {
-    if (token_id < 0 || token_id >= weights.vocab) {
-        std::fprintf(stderr, "[sp_forward] bad token_id=%d\n", token_id);
-        return false;
+// Phase 12 Step E batch embed: gather n_tokens rows from tok_embed_fp32
+// into x_fp32 [n_tokens * n_embd] row-major-by-token, scaling each by
+// embd_scale. The output layout matches what rmsnorm / matmul / RoPE
+// (post-Step-E) consume natively.
+static void embed_lookup_fp32_batch(float* x_fp32,
+                                      const std::vector<float>& tok_embed_fp32,
+                                      const int* token_ids, int n_tokens,
+                                      int n_embd, float embd_scale) {
+    for (int t = 0; t < n_tokens; ++t) {
+        embed_lookup_fp32(x_fp32 + (size_t)t * n_embd,
+                          tok_embed_fp32, token_ids[t],
+                          n_embd, embd_scale);
     }
-    if (position < 0 || position >= ctx.n_ctx) {
-        std::fprintf(stderr, "[sp_forward] position %d out of n_ctx=%d\n",
-                     position, ctx.n_ctx);
-        return false;
-    }
-    if (ctx.kv_cache.cur_len != position) {
+}
+
+bool sp_forward_step_prefill(sp_forward_context& ctx,
+                              const sp_weights&   weights,
+                              const int*          token_ids,
+                              int                 n_tokens,
+                              int                 position_base,
+                              std::vector<float>& logits_out) {
+    if (token_ids == nullptr || n_tokens <= 0) {
         std::fprintf(stderr,
-            "[sp_forward] kv_cache.cur_len=%d but position=%d — caller "
-            "must call sp_forward_step in sequential order, or reset the "
-            "cache before non-sequential reads.\n",
-            ctx.kv_cache.cur_len, position);
+            "[sp_forward] bad token_ids=%p n_tokens=%d\n",
+            (const void*)token_ids, n_tokens);
+        return false;
+    }
+    for (int t = 0; t < n_tokens; ++t) {
+        if (token_ids[t] < 0 || token_ids[t] >= weights.vocab) {
+            std::fprintf(stderr, "[sp_forward] bad token_ids[%d]=%d\n",
+                         t, token_ids[t]);
+            return false;
+        }
+    }
+    if (position_base < 0 || position_base + n_tokens > ctx.n_ctx) {
+        std::fprintf(stderr,
+            "[sp_forward] position_base %d + n_tokens %d > n_ctx=%d\n",
+            position_base, n_tokens, ctx.n_ctx);
+        return false;
+    }
+    if (ctx.kv_cache.cur_len != position_base) {
+        std::fprintf(stderr,
+            "[sp_forward] kv_cache.cur_len=%d but position_base=%d — caller "
+            "must call sp_forward_step / sp_forward_step_prefill in "
+            "sequential order, or reset the cache before non-sequential "
+            "reads.\n",
+            ctx.kv_cache.cur_len, position_base);
         return false;
     }
 
@@ -772,13 +808,23 @@ bool sp_forward_step(sp_forward_context& ctx,
     const int d_kv      = n_kv_head * head_dim;
     const int64_t S     = ctx.residual_scale;
     const int64_t matmul_out_scale = S * S;
-    const int n_tokens  = 1;  // single-token decode in Phase 2.2d
 
-    // 1) Embedding lookup → x_fp32 (× embd_scale for Gemma family).
-    embed_lookup_fp32(ctx.x_fp32.data(), weights.tok_embed_fp32, token_id,
-                       n_embd, ctx.embd_scale);
+    // Ensure residual-stream buffers can hold all n_tokens rows. The
+    // single-token decode path sized them to n_embd only; for prefill
+    // we may need n_tokens * n_embd. Grow without shrinking — repeated
+    // prefill calls of the same size will hit the no-op fast path.
+    const size_t needed = (size_t)n_tokens * (size_t)n_embd;
+    if (ctx.x_fp32.size()       < needed) ctx.x_fp32.resize(needed, 0.0f);
+    if (ctx.proj_out_fp32.size() < needed) ctx.proj_out_fp32.resize(needed, 0.0f);
 
-    int32_t rope_pos[1] = { position };
+    // 1) Embedding lookup → x_fp32 (× embd_scale for Gemma family), batched.
+    embed_lookup_fp32_batch(ctx.x_fp32.data(), weights.tok_embed_fp32,
+                             token_ids, n_tokens, n_embd, ctx.embd_scale);
+
+    // RoPE positions: [position_base, position_base+1, ..., +n_tokens-1].
+    std::vector<int32_t> rope_pos_buf((size_t)n_tokens);
+    for (int t = 0; t < n_tokens; ++t) rope_pos_buf[t] = position_base + t;
+    const int32_t* rope_pos = rope_pos_buf.data();
 
     for (int L = 0; L < ctx.n_layers; ++L) {
         ctx.layer_arena.reset();
@@ -986,14 +1032,14 @@ bool sp_forward_step(sp_forward_context& ctx,
             }
             sp_attention_poly_ring(ctx.q_ok, K_view, V_view, ctx.attn_out_ok,
                                       n_head, n_kv_head, head_dim,
-                                      t_valid, t_stride, position,
+                                      t_valid, t_stride, position_base,
                                       layer_swa_window,
                                       ctx.attn_logit_softcap,
                                       k_ntt_slab_q1, k_ntt_slab_q2);
         } else {
             sp_attention_dot_product(ctx.q_ok, K_view, V_view, ctx.attn_out_ok,
                                         n_head, n_kv_head, head_dim,
-                                        t_valid, t_stride, position,
+                                        t_valid, t_stride, position_base,
                                         layer_swa_window,
                                         ctx.attn_logit_softcap);
         }
@@ -1026,9 +1072,13 @@ bool sp_forward_step(sp_forward_context& ctx,
                 n_embd, n_tokens, ctx.rms_eps);
         }
 
-        // 2h) Residual: x_fp32 += wo_out_fp32 (both fp32).
-        for (int i = 0; i < n_embd; ++i) {
-            ctx.x_fp32[i] += ctx.proj_out_fp32[i];
+        // 2h) Residual: x_fp32 += wo_out_fp32 (both fp32). Iterates all
+        // n_tokens rows under row-major-by-token layout.
+        {
+            const size_t n_residual = (size_t)n_tokens * (size_t)n_embd;
+            for (size_t i = 0; i < n_residual; ++i) {
+                ctx.x_fp32[i] += ctx.proj_out_fp32[i];
+            }
         }
 
         // ------- FFN block -------
@@ -1088,9 +1138,12 @@ bool sp_forward_step(sp_forward_context& ctx,
                 n_embd, n_tokens, ctx.rms_eps);
         }
 
-        // 2l) Residual: x_fp32 += ffn_out_fp32
-        for (int i = 0; i < n_embd; ++i) {
-            ctx.x_fp32[i] += ctx.proj_out_fp32[i];
+        // 2l) Residual: x_fp32 += ffn_out_fp32 (all n_tokens rows).
+        {
+            const size_t n_residual = (size_t)n_tokens * (size_t)n_embd;
+            for (size_t i = 0; i < n_residual; ++i) {
+                ctx.x_fp32[i] += ctx.proj_out_fp32[i];
+            }
         }
         // Phase 12 Step D: no prefetcher slot to release -- the fused
         // matmul reads packed Q8 directly.
@@ -1122,20 +1175,27 @@ bool sp_forward_step(sp_forward_context& ctx,
     //    fp32 in at the top, we drop back to fp32 at the bottom — no
     //    O_K indirection for tensors that don't participate in
     //    Theorem 4 cancellation.
-    logits_out.assign(weights.vocab, 0.0f);
-    std::vector<float> x_final_fp32((size_t)n_embd * n_tokens);
+    //
+    //   x_final (Step E layout): row-major-by-token, x_final[t * n_embd + k]
+    //   lm_head: [vocab, n_embd] row-major,           lm_head[v * n_embd + k]
+    //   logits_out: [n_tokens, vocab] row-major,      logits_out[t * vocab + v]
+    logits_out.assign((size_t)n_tokens * (size_t)weights.vocab, 0.0f);
+    std::vector<float> x_final_fp32((size_t)n_embd * (size_t)n_tokens);
     sp_ok_decode_to_fp32(x_final_fp32.data(), ctx.x_norm_ok);
-    // logits[v, t] = sum_k lm_head[v, k] * x_final[k, t]
-    //   lm_head: [vocab, n_embd] row-major: lm_head[v*n_embd + k]
-    //   x_final: shape {n_tokens, n_embd} via matmul convention,
-    //            decoded as a flat vector of length n_embd (n_tokens=1).
-    for (int v = 0; v < weights.vocab; ++v) {
-        const float* w_row = weights.lm_head_fp32.data() + (size_t)v * n_embd;
-        double a = 0.0;
-        for (int k = 0; k < n_embd; ++k) {
-            a += (double)w_row[k] * (double)x_final_fp32[k];
+    for (int t = 0; t < n_tokens; ++t) {
+        const float* x_row =
+            x_final_fp32.data() + (size_t)t * (size_t)n_embd;
+        float* logit_row =
+            logits_out.data()  + (size_t)t * (size_t)weights.vocab;
+        for (int v = 0; v < weights.vocab; ++v) {
+            const float* w_row =
+                weights.lm_head_fp32.data() + (size_t)v * (size_t)n_embd;
+            double a = 0.0;
+            for (int k = 0; k < n_embd; ++k) {
+                a += (double)w_row[k] * (double)x_row[k];
+            }
+            logit_row[v] = (float)a;
         }
-        logits_out[v] = (float)a;
     }
 
     // 5) Phase 2.3b iter 3 — final-logit softcap (Gemma3).
@@ -1146,11 +1206,25 @@ bool sp_forward_step(sp_forward_context& ctx,
     if (ctx.final_logit_softcap > 0.0f) {
         const float cap     = ctx.final_logit_softcap;
         const float inv_cap = 1.0f / cap;
-        for (int i = 0; i < weights.vocab; ++i) {
+        const size_t n_logits = (size_t)n_tokens * (size_t)weights.vocab;
+        for (size_t i = 0; i < n_logits; ++i) {
             logits_out[i] = std::tanh(logits_out[i] * inv_cap) * cap;
         }
     }
     return true;
+}
+
+// -----------------------------------------------------------------------
+// Single-token wrapper: dispatches to prefill with n_tokens=1. The two
+// are bit-identical at n_tokens=1.
+// -----------------------------------------------------------------------
+bool sp_forward_step(sp_forward_context& ctx,
+                     const sp_weights&   weights,
+                     int                 token_id,
+                     int                 position,
+                     std::vector<float>& logits_out) {
+    return sp_forward_step_prefill(ctx, weights, &token_id, 1,
+                                    position, logits_out);
 }
 
 }  // namespace sp::engine

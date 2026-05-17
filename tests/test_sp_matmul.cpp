@@ -27,17 +27,21 @@ static int g_fail = 0;
 
 using namespace sp::engine;
 
-// fp32 reference matmul: Y[i,j] = sum_k W[i,k] * X[k,j]
+// fp32 reference matmul (Step E layout — token-as-row):
+//   W: [M, K] row-major, W[i*K + k]
+//   X: [N, K] row-major, X[j*K + k]   (token j's features contiguous)
+//   Y: [N, M] row-major, Y[j*M + i]
+// Computes Y[j,i] = sum_k W[i,k] * X[j,k].
 static void fp32_matmul(const float* W, int M, int K,
                          const float* X, int N,
                          float* Y) {
-    for (int i = 0; i < M; ++i) {
-        for (int j = 0; j < N; ++j) {
+    for (int j = 0; j < N; ++j) {
+        for (int i = 0; i < M; ++i) {
             double s = 0.0;
             for (int k = 0; k < K; ++k) {
-                s += (double)W[i * K + k] * (double)X[k * N + j];
+                s += (double)W[i * K + k] * (double)X[j * K + k];
             }
-            Y[i * N + j] = (float)s;
+            Y[j * M + i] = (float)s;
         }
     }
 }
@@ -237,19 +241,24 @@ TEST(matmul_ok_omega_cross_terms_compose_correctly) {
     X.scale_recip = 1; X.frobenius_scale = 1;
 
     // Hand-pick W[2x3] and X[3x2] elements with nontrivial (a, b).
-    // W row 0: (1, 2), (3, -1), (0, 4)
-    // W row 1: (-2, 1), (5, 0), (1, 1)
-    // (note our shape[0] is innermost=K, so W[i*K+k] gives row i col k)
+    // W is row-major [M=2, K=3]: W.data[i*K + k] = W[i,k]
+    //   W row 0: (1, 2), (3, -1), (0, 4)
+    //   W row 1: (-2, 1), (5, 0), (1, 1)
     W.data[0*K + 0] = sp_ok_t{ 1, 2}; W.data[0*K + 1] = sp_ok_t{ 3, -1}; W.data[0*K + 2] = sp_ok_t{0, 4};
     W.data[1*K + 0] = sp_ok_t{-2, 1}; W.data[1*K + 1] = sp_ok_t{ 5,  0}; W.data[1*K + 2] = sp_ok_t{1, 1};
 
-    // X[3x2] (shape[0]=N=2 innermost, shape[1]=K=3 outer)
-    // X row 0: ( 2,  1), ( 0, -3)
-    // X row 1: ( 1,  0), (-1,  2)
-    // X row 2: ( 4, -1), ( 2,  1)
-    X.data[0*N + 0] = sp_ok_t{ 2,  1}; X.data[0*N + 1] = sp_ok_t{ 0, -3};
-    X.data[1*N + 0] = sp_ok_t{ 1,  0}; X.data[1*N + 1] = sp_ok_t{-1,  2};
-    X.data[2*N + 0] = sp_ok_t{ 4, -1}; X.data[2*N + 1] = sp_ok_t{ 2,  1};
+    // Step E layout: X is row-major [N=2, K=3], X.data[j*K + k] = X[k,j].
+    // Token j=0 holds the column (X[0,0], X[1,0], X[2,0]).
+    // Token j=1 holds (X[0,1], X[1,1], X[2,1]).
+    //   X[0,0]=(2,1)   X[0,1]=(0,-3)
+    //   X[1,0]=(1,0)   X[1,1]=(-1,2)
+    //   X[2,0]=(4,-1)  X[2,1]=(2,1)
+    X.data[0*K + 0] = sp_ok_t{ 2,  1};
+    X.data[0*K + 1] = sp_ok_t{ 1,  0};
+    X.data[0*K + 2] = sp_ok_t{ 4, -1};
+    X.data[1*K + 0] = sp_ok_t{ 0, -3};
+    X.data[1*K + 1] = sp_ok_t{-1,  2};
+    X.data[1*K + 2] = sp_ok_t{ 2,  1};
 
     ASSERT(sp_matmul_ok(W, X, Y));
 
@@ -265,13 +274,15 @@ TEST(matmul_ok_omega_cross_terms_compose_correctly) {
         return sp_ok_t{ u.a+v.a, u.b+v.b };
     };
 
-    for (int i = 0; i < M; ++i) {
-        for (int j = 0; j < N; ++j) {
+    // Y is row-major [N, M]: Y.data[j*M + i] = Y[i,j].
+    for (int j = 0; j < N; ++j) {
+        for (int i = 0; i < M; ++i) {
             sp_ok_t expected = sp_ok_t{0, 0};
             for (int k = 0; k < K; ++k) {
-                expected = ok_add(expected, ok_mul(W.data[i*K + k], X.data[k*N + j]));
+                expected = ok_add(expected,
+                    ok_mul(W.data[i*K + k], X.data[j*K + k]));
             }
-            sp_ok_t got = Y.data[i*N + j];
+            sp_ok_t got = Y.data[j*M + i];
             if (got.a != expected.a || got.b != expected.b) {
                 std::fprintf(stderr,
                     "  Y[%d,%d]: got (%lld, %lld) expected (%lld, %lld)\n",

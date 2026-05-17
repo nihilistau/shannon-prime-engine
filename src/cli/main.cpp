@@ -1134,6 +1134,23 @@ int main(int argc, char** argv) {
 
             const auto t_start = std::chrono::steady_clock::now();
 
+            // Phase 12 Step E: optional batched prefill path. Replaces the
+            // per-position sp_forward_step loop with a single
+            // sp_forward_step_prefill call per chunk so the weights stream
+            // through DRAM once per chunk instead of n_ctx times. Gate on
+            // SP_ENGINE_PREFILL=1 so we can A/B compare against the
+            // single-token path (which itself now wraps through prefill
+            // at N=1 internally — bit-identical math, same KV cache
+            // sequencing).
+            const char* prefill_env = std::getenv("SP_ENGINE_PREFILL");
+            const bool use_prefill =
+                (prefill_env != nullptr) && (prefill_env[0] && prefill_env[0] != '0');
+            std::fprintf(stderr,
+                "[sp-engine] perplexity-native: SP_ENGINE_PREFILL=%s "
+                "-> use_prefill=%s\n",
+                prefill_env ? prefill_env : "(unset)",
+                use_prefill ? "TRUE (batched N=n_ctx)" : "false (per-token loop)");
+
             for (int c = 0; c < eval_chunks_n; ++c) {
                 for (int t = 0; t < n_ctx; ++t) {
                     chunk_n[(size_t)t] = all_ids_n[(size_t)(c * n_ctx + t)];
@@ -1143,20 +1160,25 @@ int main(int argc, char** argv) {
                 // Reset KV cache for the new chunk.
                 sp::engine::sp_ok_kv_cache_clear(ctx.kv_cache);
 
-                // Run the chunk token by token.
-                for (int pos = 0; pos < n_ctx; ++pos) {
-                    if (!sp::engine::sp_forward_step(
-                            ctx, spW, chunk_n[(size_t)pos], pos, logits_n)) {
+                if (use_prefill) {
+                    // Batched prefill: one call processes the whole chunk.
+                    std::vector<int> tokens_for_prefill((size_t)n_ctx);
+                    for (int t = 0; t < n_ctx; ++t) {
+                        tokens_for_prefill[(size_t)t] = (int)chunk_n[(size_t)t];
+                    }
+                    if (!sp::engine::sp_forward_step_prefill(
+                            ctx, spW, tokens_for_prefill.data(), n_ctx,
+                            0, logits_n)) {
                         std::fprintf(stderr,
-                            "[sp-engine] perplexity-native: sp_forward_step "
-                            "failed at chunk=%d pos=%d\n", c, pos);
+                            "[sp-engine] perplexity-native: prefill failed "
+                            "at chunk=%d\n", c);
                         return 7;
                     }
+                    // logits_n is now [n_ctx, vocab] row-major.
                     // Score predictions for positions [first_eval, n_ctx-2].
-                    // logits at pos give P(. | tokens[0..pos]); compare to
-                    // chunk[pos+1].
-                    if (pos >= first_eval_n && pos < n_ctx - 1) {
-                        const float* row = logits_n.data();
+                    for (int pos = first_eval_n; pos < n_ctx - 1; ++pos) {
+                        const float* row =
+                            logits_n.data() + (size_t)pos * (size_t)spW.vocab;
                         const int32_t target = chunk_n[(size_t)(pos + 1)];
                         float mx = row[0];
                         for (int k = 1; k < spW.vocab; ++k)
@@ -1167,6 +1189,31 @@ int main(int argc, char** argv) {
                         const double lse = (double)mx + std::log(s);
                         total_nll_n += lse - (double)row[target];
                         total_evalled_n += 1;
+                    }
+                } else {
+                    // Per-token decode path (still goes through prefill at
+                    // n_tokens=1 via the sp_forward_step wrapper).
+                    for (int pos = 0; pos < n_ctx; ++pos) {
+                        if (!sp::engine::sp_forward_step(
+                                ctx, spW, chunk_n[(size_t)pos], pos, logits_n)) {
+                            std::fprintf(stderr,
+                                "[sp-engine] perplexity-native: sp_forward_step "
+                                "failed at chunk=%d pos=%d\n", c, pos);
+                            return 7;
+                        }
+                        if (pos >= first_eval_n && pos < n_ctx - 1) {
+                            const float* row = logits_n.data();
+                            const int32_t target = chunk_n[(size_t)(pos + 1)];
+                            float mx = row[0];
+                            for (int k = 1; k < spW.vocab; ++k)
+                                if (row[k] > mx) mx = row[k];
+                            double s = 0.0;
+                            for (int k = 0; k < spW.vocab; ++k)
+                                s += std::exp((double)(row[k] - mx));
+                            const double lse = (double)mx + std::log(s);
+                            total_nll_n += lse - (double)row[target];
+                            total_evalled_n += 1;
+                        }
                     }
                 }
                 const double running_ppl =
