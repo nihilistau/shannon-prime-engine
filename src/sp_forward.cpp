@@ -92,10 +92,14 @@ bool sp_forward_context_init(sp_forward_context& ctx,
     // under use_q8. The non-Q8 path still uses the FFN scratch arena
     // sized for one layer's worth of decoded buffer (used by the
     // existing weight_decoded() helper if anyone calls it).
-    if (!weights.use_q8) {
+    if (!weights.use_q8 && !weights.use_q4) {
         const int64_t ffn_elems = (int64_t)weights.d_ff * (int64_t)weights.n_embd;
         const size_t  ffn_bytes_one = (size_t)ffn_elems * sizeof(sp_ok_t) + 4096;
         ctx.q8_decode_arena.reserve(3 * ffn_bytes_one);
+    } else if (weights.use_q4) {
+        std::fprintf(stderr,
+            "[sp_forward] Q4 mode: fused matmul path "
+            "(1 B/elem packed weights, no decode workspace)\n");
     } else {
         std::fprintf(stderr,
             "[sp_forward] Q8 mode: fused matmul path "
@@ -525,6 +529,139 @@ int sp_weights_convert_to_q8(sp_weights& weights) {
 }
 
 // =========================================================================
+// Phase 14: convert resident weights to packed-int4 (1 B/element) storage
+// =========================================================================
+//
+// Mirrors sp_weights_convert_to_q8 exactly. Each shim-list tensor's post-
+// Frobenius (a, b) coordinates are packed into a single byte (low nybble
+// = a, high nybble = b) with a per-tensor power-of-2 shift chosen by
+// sp_ok_q4_pick_shift. Net storage: 1/16 of raw sp_ok_t.
+//
+// q4 and q8 are mutually exclusive at the weights level. If the caller
+// already set use_q8 we refuse and return -1 — they'd have to clear that
+// first. In practice the CLI gates make this configuration unreachable.
+
+int sp_weights_convert_to_q4(sp_weights& weights, uint64_t prune_threshold) {
+    if (weights.use_q4) {
+        std::fprintf(stderr,
+            "[sp-weights-q4] convert_to_q4: already converted; no-op.\n");
+        return 0;
+    }
+    if (weights.use_q8) {
+        std::fprintf(stderr,
+            "[sp-weights-q4] convert_to_q4: weights already in Q8 storage; "
+            "convert from raw or restart with --frobenius-q4.\n");
+        return -1;
+    }
+    if (weights.n_layers <= 0) return 0;
+
+    weights.q4_wq.resize(weights.n_layers);
+    weights.q4_wk.resize(weights.n_layers);
+    weights.q4_wv.resize(weights.n_layers);
+    weights.q4_wo.resize(weights.n_layers);
+    weights.q4_ffn_gate.resize(weights.n_layers);
+    weights.q4_ffn_up.resize(weights.n_layers);
+    weights.q4_ffn_down.resize(weights.n_layers);
+    weights.q4_layer_arenas.resize(weights.n_layers);
+
+    int n_packed = 0;
+    size_t total_freed_bytes = 0;
+    size_t total_q4_bytes    = 0;
+    size_t total_pruned      = 0;
+    size_t total_numel       = 0;
+    int    shift_min = 127, shift_max = -1;
+    long long sum_shift = 0;
+
+    for (int L = 0; L < weights.n_layers; ++L) {
+        const sp_ok_tensor* slots[7] = {
+            &weights.wq[L], &weights.wk[L], &weights.wv[L], &weights.wo[L],
+            &weights.ffn_gate[L], &weights.ffn_up[L], &weights.ffn_down[L]
+        };
+        sp_ok_q4_tensor* q4_slots[7] = {
+            &weights.q4_wq[L], &weights.q4_wk[L], &weights.q4_wv[L],
+            &weights.q4_wo[L], &weights.q4_ffn_gate[L],
+            &weights.q4_ffn_up[L], &weights.q4_ffn_down[L]
+        };
+
+        size_t bytes_needed = 0;
+        for (int s = 0; s < 7; ++s) {
+            const size_t n = (size_t)slots[s]->numel();
+            bytes_needed += n * sizeof(sp_ok_q4_t) + 64;
+        }
+        bytes_needed += 4096;
+
+        weights.q4_layer_arenas[L].reserve(bytes_needed);
+
+        for (int s = 0; s < 7; ++s) {
+            sp_ok_tensor&    src = const_cast<sp_ok_tensor&>(*slots[s]);
+            sp_ok_q4_tensor& dst = *q4_slots[s];
+
+            const size_t n = (size_t)src.numel();
+            if (n == 0 || src.data == nullptr) continue;
+
+            if (!weights.q4_layer_arenas[L].alloc_tensor_q4(dst, n)) {
+                std::fprintf(stderr,
+                    "[sp-weights-q4] L%d slot=%d alloc_tensor_q4 failed "
+                    "(n=%zu, bytes=%zu, arena_remaining=%zu)\n",
+                    L, s, n, n * sizeof(sp_ok_q4_t),
+                    weights.q4_layer_arenas[L].remaining());
+                return -1;
+            }
+            int8_t shift;
+            if (prune_threshold > 0) {
+                shift = sp_ok_q4_encode_array_pruned(
+                    dst.data, src.data, n, prune_threshold);
+                total_pruned += sp_ok_q4_last_pruned_count;
+            } else {
+                shift = sp_ok_q4_encode_array(dst.data, src.data, n);
+            }
+            total_numel += n;
+            dst.q4_shift        = shift;
+            dst.scale_recip     = src.scale_recip;
+            dst.frobenius_scale = src.frobenius_scale;
+            dst.frobenius_p     = 41;
+            dst.frobenius_k     = 8;
+
+            src.data = nullptr;
+
+            ++n_packed;
+            if ((int)shift < shift_min) shift_min = (int)shift;
+            if ((int)shift > shift_max) shift_max = (int)shift;
+            sum_shift += (long long)shift;
+            total_q4_bytes += n * sizeof(sp_ok_q4_t);
+        }
+
+        total_freed_bytes += weights.layer_arenas[L].capacity();
+        {
+            sp_ok_arena released = std::move(weights.layer_arenas[L]);
+        }
+    }
+
+    weights.use_q4 = true;
+    std::fprintf(stderr,
+        "[sp-weights-q4] convert_to_q4: packed %d tensors  "
+        "shift=[%d..%d] mean=%.1f\n",
+        n_packed, shift_min, shift_max,
+        n_packed ? ((double)sum_shift / (double)n_packed) : 0.0);
+    if (prune_threshold > 0) {
+        std::fprintf(stderr,
+            "[sp-weights-q4] pruning: threshold=%llu  pruned=%zu / %zu coords  "
+            "(%.2f%% zeroed)\n",
+            (unsigned long long)prune_threshold, total_pruned, total_numel,
+            total_numel ? 100.0 * (double)total_pruned / (double)total_numel : 0.0);
+    }
+    std::fprintf(stderr,
+        "[sp-weights-q4] memory: released %.2f GB original sp_ok_t arena,  "
+        "allocated %.2f GB packed q4 storage,  ratio=%.2fx\n",
+        (double)total_freed_bytes / (1024.0 * 1024.0 * 1024.0),
+        (double)total_q4_bytes    / (1024.0 * 1024.0 * 1024.0),
+        total_q4_bytes
+            ? (double)total_freed_bytes / (double)total_q4_bytes
+            : 0.0);
+    return n_packed;
+}
+
+// =========================================================================
 // Phase 12 Step C: background Q8 prefetch worker
 // =========================================================================
 
@@ -884,9 +1021,15 @@ bool sp_forward_step_prefill(sp_forward_context& ctx,
         if (!ctx.layer_arena.alloc_tensor(ctx.q_ok)) return false;
         if (!ctx.layer_arena.alloc_tensor(ctx.k_ok)) return false;
         if (!ctx.layer_arena.alloc_tensor(ctx.v_ok)) return false;
-        /* Phase 12 Step D: Q/K/V matmul. Under use_q8, fuse the decode
-         * into the multiply inner loop -- no 430 MB decoded scratch. */
-        if (weights.use_q8) {
+        /* Phase 12 Step D / Phase 14: Q/K/V matmul. Under use_q4/use_q8,
+         * fuse the decode into the multiply inner loop -- no decoded
+         * scratch. q4 takes priority since the storage is mutually
+         * exclusive. */
+        if (weights.use_q4) {
+            if (!sp_matmul_ok_q4(W_q, weights.q4_wq[L], ctx.x_norm_ok, ctx.q_ok)) return false;
+            if (!sp_matmul_ok_q4(W_k, weights.q4_wk[L], ctx.x_norm_ok, ctx.k_ok)) return false;
+            if (!sp_matmul_ok_q4(W_v, weights.q4_wv[L], ctx.x_norm_ok, ctx.v_ok)) return false;
+        } else if (weights.use_q8) {
             if (!sp_matmul_ok_q8(W_q, weights.q8_wq[L], ctx.x_norm_ok, ctx.q_ok)) return false;
             if (!sp_matmul_ok_q8(W_k, weights.q8_wk[L], ctx.x_norm_ok, ctx.k_ok)) return false;
             if (!sp_matmul_ok_q8(W_v, weights.q8_wv[L], ctx.x_norm_ok, ctx.v_ok)) return false;
@@ -1126,8 +1269,15 @@ bool sp_forward_step_prefill(sp_forward_context& ctx,
         // ---- end Phase 13.C recall + inject ----
 
         // 2g) Wo projection → fp32 (absorbs pi^k via Theorem 4).
-        // Phase 12 Step D: under use_q8, fused-Q8 path.
-        if (weights.use_q8) {
+        // Phase 12 Step D / Phase 14: under use_q4/use_q8, fused path.
+        if (weights.use_q4) {
+            if (!sp_matmul_ok_q4_to_fp32(W_o, weights.q4_wo[L], ctx.attn_out_ok,
+                                          ctx.proj_out_fp32.data(),
+                                          n_embd, n_tokens)) {
+                std::fprintf(stderr, "[sp_forward] L%d Wo matmul (q4) failed\n", L);
+                return false;
+            }
+        } else if (weights.use_q8) {
             if (!sp_matmul_ok_q8_to_fp32(W_o, weights.q8_wo[L], ctx.attn_out_ok,
                                           ctx.proj_out_fp32.data(),
                                           n_embd, n_tokens)) {
@@ -1183,9 +1333,22 @@ bool sp_forward_step_prefill(sp_forward_context& ctx,
         // 2k) FFN → fp32 (absorbs ffn_down's frobenius_scale). Activation
         //     selected by ctx.ffn_act: SwiGLU (silu) for Llama / Qwen,
         //     GeGLU_tanh (gelu) for Gemma family.
-        /* Phase 12 Step D: fused-Q8 FFN under use_q8, otherwise the
-         * original sp_ffn_swiglu_to_fp32 path on resident sp_ok_tensors. */
-        if (weights.use_q8) {
+        /* Phase 12 Step D / Phase 14: fused FFN. Q4 takes priority over
+         * Q8 (mutually exclusive). Falls through to the resident sp_ok_t
+         * path when no packed storage is live. */
+        if (weights.use_q4) {
+            if (!sp_ffn_swiglu_to_fp32_q4(ctx.x_norm_ok,
+                                            W_gate, weights.q4_ffn_gate[L],
+                                            W_up,   weights.q4_ffn_up[L],
+                                            W_down, weights.q4_ffn_down[L],
+                                            ctx.proj_out_fp32.data(),
+                                            n_tokens,
+                                            ctx.layer_arena,
+                                            ctx.ffn_act)) {
+                std::fprintf(stderr, "[sp_forward] L%d FFN (q4) failed\n", L);
+                return false;
+            }
+        } else if (weights.use_q8) {
             if (!sp_ffn_swiglu_to_fp32_q8(ctx.x_norm_ok,
                                             W_gate, weights.q8_ffn_gate[L],
                                             W_up,   weights.q8_ffn_up[L],

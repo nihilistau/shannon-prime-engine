@@ -295,6 +295,21 @@ struct sp_weights {
     std::vector<sp_ok_q8_tensor>      q8_ffn_down;
     std::vector<sp_ok_arena>          q8_layer_arenas;  // ~1/8 of layer_arenas
 
+    // Phase 14: same idea as q8 but with 4-bit packed nybble pairs (1 byte
+    // per ring element, 16x compression vs raw sp_ok_t). use_q4 implies the
+    // sp_ok_tensor data pointers above are nullptr and the fused
+    // sp_matmul_ok_q4 dispatch is used in forward. Mutually exclusive with
+    // use_q8 — at most one of {use_q8, use_q4} is true at any time.
+    bool                              use_q4 = false;
+    std::vector<sp_ok_q4_tensor>      q4_wq;
+    std::vector<sp_ok_q4_tensor>      q4_wk;
+    std::vector<sp_ok_q4_tensor>      q4_wv;
+    std::vector<sp_ok_q4_tensor>      q4_wo;
+    std::vector<sp_ok_q4_tensor>      q4_ffn_gate;
+    std::vector<sp_ok_q4_tensor>      q4_ffn_up;
+    std::vector<sp_ok_q4_tensor>      q4_ffn_down;
+    std::vector<sp_ok_arena>          q4_layer_arenas;  // ~1/16 of layer_arenas
+
     // Bypass-list (fp32 norms; scale-reset valve per Phase 1.7 policy):
     std::vector<std::vector<float>> attn_norm_w;       // per-layer [n_embd]
     std::vector<std::vector<float>> ffn_norm_w;        // per-layer [n_embd]
@@ -348,6 +363,17 @@ struct sp_weights {
 // lm_head, norms) are NOT affected. Idempotent: calling on an already-
 // converted sp_weights is a no-op.
 int sp_weights_convert_to_q8(sp_weights& weights);
+
+// Phase 14: same as sp_weights_convert_to_q8, but packs each shim-list
+// tensor's post-Frobenius coordinates into 4-bit nybble pairs (1 byte per
+// ring element). After this runs:
+//   - weights.wq[L].data == nullptr (etc.)
+//   - weights.use_q4 == true, use_q8 == false (mutually exclusive)
+//   - weights.q4_wq[L].numel == old wq[L].numel
+//   - weights.q4_wq[L] carries q4_shift + scale_recip + frobenius_scale + p + k.
+// Returns the count of tensors packed. Idempotent.
+int sp_weights_convert_to_q4(sp_weights& weights,
+                              uint64_t    prune_threshold = 0);
 
 // Run a single forward step: given a token id, produce logits[vocab].
 //

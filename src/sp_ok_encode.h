@@ -167,4 +167,28 @@ bool sp_ok_encode_q8_from_fp16_with_frobenius(sp_ok_q8_tensor& out,
                                               sp_ok_arena& arena,
                                               sp_ok_t* scratch = nullptr);
 
+// -----------------------------------------------------------------------
+// Phase 14: packed-4-bit encoder.
+//
+// Combined fp16 -> sp_ok_t -> phi_p^k -> pack-to-int4 pipeline. Allocates
+// the packed storage from `arena` (numel * 1 byte), populates the
+// descriptor with the chosen q4_shift + carry-over metadata, and returns
+// true on success. Mirrors sp_ok_encode_q8_from_fp16_with_frobenius
+// exactly with the codebook halved.
+//
+// At Phi-3 / Qwen weight scales the 4-bit codebook has 16 levels vs 256
+// for int8, so the same input absmax produces a q4_shift that is roughly
+// 4 bits larger than q8_shift on the same tensor — and proportionally
+// larger quantization noise per coordinate. Whether the downstream
+// theorem-2 cancellation absorbs that noise is a forward-pass question;
+// the storage contract here is well-defined either way.
+// -----------------------------------------------------------------------
+bool sp_ok_encode_q4_from_fp16_with_frobenius(sp_ok_q4_tensor& out,
+                                              const uint16_t* w_fp16,
+                                              size_t numel,
+                                              int64_t scale,
+                                              int64_t p, int64_t k,
+                                              sp_ok_arena& arena,
+                                              sp_ok_t* scratch = nullptr);
+
 }  // namespace sp::engine

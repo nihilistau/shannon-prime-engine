@@ -141,4 +141,30 @@ bool sp_matmul_ok_q8_to_fp32(const sp_ok_tensor&    W_shape,
                              int                    out_rows,
                              int                    n_cols);
 
+// -----------------------------------------------------------------------
+// Phase 14: fused packed-Q4 weight matmul.
+//
+// Same semantics as sp_matmul_ok_q8 with the W codebook halved to 1
+// byte/element. Sign-extends each 4-bit nybble pair to int64 (via the
+// arithmetic-shift idiom in sp_ok_q4_decode_one) and applies q4_shift
+// inline in the inner loop, then performs the sp_ok ring multiply.
+//
+// At Phi-3 / Qwen weight scales the q4_shift is ~4 bits larger than
+// q8_shift on the same tensor, so absolute quantization noise per
+// coordinate is ~16x larger. Whether Theorem 2's projective cancellation
+// absorbs that noise is a forward-pass question; the storage + dispatch
+// contract is well-defined either way.
+// -----------------------------------------------------------------------
+bool sp_matmul_ok_q4(const sp_ok_tensor&    W_shape,
+                     const sp_ok_q4_tensor& W_q4,
+                     const sp_ok_tensor&    X,
+                     sp_ok_tensor&          Y);
+
+bool sp_matmul_ok_q4_to_fp32(const sp_ok_tensor&    W_shape,
+                             const sp_ok_q4_tensor& W_q4,
+                             const sp_ok_tensor&    X,
+                             float*                 Y_fp32,
+                             int                    out_rows,
+                             int                    n_cols);
+
 }  // namespace sp::engine

@@ -246,6 +246,24 @@ set_target_properties(test_sp_ok_q8 PROPERTIES
 )
 add_test(NAME sp_ok_q8 COMMAND test_sp_ok_q8)
 
+# Phase 14: 4-bit packed O_K storage. Mirrors test_sp_ok_q8 with the
+# codebook halved. Verifies shift picker boundary cases, encode/decode
+# round-trip per-coord bound, nybble pack layout, lattice-norm pruning,
+# 16x compression ratio, and zero-shift identity.
+add_executable(test_sp_ok_q4
+    test_sp_ok_q4.cpp
+    ../lib/shannon-prime/core/sp_ok_q4.c
+    ../lib/shannon-prime/core/sp_ok_arith.c
+)
+target_include_directories(test_sp_ok_q4 PRIVATE
+    ../lib/shannon-prime/core
+)
+set_target_properties(test_sp_ok_q4 PROPERTIES
+    C_STANDARD 11
+    CXX_STANDARD 17
+)
+add_test(NAME sp_ok_q4 COMMAND test_sp_ok_q4)
+
 # Phase 12 Step B-1: combined load-path encoder. Verifies the
 # sp_ok_encode_q8_from_fp16_with_frobenius() helper matches the manual
 # (encode -> Frobenius -> pack) pipeline byte-for-byte, that the arena
@@ -256,3 +274,17 @@ add_executable(test_sp_ok_q8_load_path
 )
 target_link_libraries(test_sp_ok_q8_load_path PRIVATE sp_engine)
 add_test(NAME sp_ok_q8_load_path COMMAND test_sp_ok_q8_load_path)
+
+# Phase 14 Q4 load-path: mirrors the Q8 test with 4-bit packing.
+add_executable(test_sp_ok_q4_load_path
+    test_sp_ok_q4_load_path.cpp
+)
+target_link_libraries(test_sp_ok_q4_load_path PRIVATE sp_engine)
+add_test(NAME sp_ok_q4_load_path COMMAND test_sp_ok_q4_load_path)
+
+# Phase 14 Q4 fused matmul parity (Q4 vs Q8 vs raw).
+add_executable(test_sp_matmul_q4
+    test_sp_matmul_q4.cpp
+)
+target_link_libraries(test_sp_matmul_q4 PRIVATE sp_engine)
+add_test(NAME sp_matmul_q4 COMMAND test_sp_matmul_q4)

@@ -70,4 +70,20 @@ bool sp_ffn_swiglu_to_fp32_q8(const sp_ok_tensor&    x,
                               sp_ok_arena&           scratch_arena,
                               sp_ffn_act             act = sp_ffn_act::SwiGLU);
 
+// -----------------------------------------------------------------------
+// Phase 14: fused-Q4 variant. Same as the Q8 helper above with the
+// packed weight tensors swapped for 4-bit nybble-pair storage.
+// -----------------------------------------------------------------------
+bool sp_ffn_swiglu_to_fp32_q4(const sp_ok_tensor&    x,
+                              const sp_ok_tensor&    gate_w_shape,
+                              const sp_ok_q4_tensor& gate_w_q4,
+                              const sp_ok_tensor&    up_w_shape,
+                              const sp_ok_q4_tensor& up_w_q4,
+                              const sp_ok_tensor&    down_w_shape,
+                              const sp_ok_q4_tensor& down_w_q4,
+                              float*                 out_fp32,
+                              int                    n_tokens,
+                              sp_ok_arena&           scratch_arena,
+                              sp_ffn_act             act = sp_ffn_act::SwiGLU);
+
 }  // namespace sp::engine

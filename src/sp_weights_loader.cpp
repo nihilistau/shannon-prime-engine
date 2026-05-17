@@ -243,7 +243,21 @@ bool sp_weights_load_from_fp16_source(sp_weights& out,
     // Runs AFTER the Frobenius shim so we pack the post-phi^k coordinates.
     // Releases the original layer arenas back to the OS (memory win
     // appears in the next process metric, not just inside this function).
-    if (cfg.frobenius_q8) {
+    if (cfg.frobenius_q4) {
+        if (!(cfg.frobenius_quant || cfg.sato_tate_mix)) {
+            std::fprintf(stderr,
+                "[sp-weights-loader] WARNING: --frobenius-q4 set without "
+                "--frobenius-quant or --sato-tate-mix; packing raw "
+                "(a, 0) weights -- compression still works but the "
+                "Theorem 4 cancellation hasn't been applied.\n");
+        }
+        int n_packed = sp_weights_convert_to_q4(out, cfg.frobenius_q4_prune);
+        std::fprintf(stderr,
+            "[sp-weights-loader] mode=%s + Q4  packed=%d tensors  "
+            "(use_q4=%d, prune=%llu)\n",
+            mode, n_packed, out.use_q4 ? 1 : 0,
+            (unsigned long long)cfg.frobenius_q4_prune);
+    } else if (cfg.frobenius_q8) {
         if (!(cfg.frobenius_quant || cfg.sato_tate_mix)) {
             std::fprintf(stderr,
                 "[sp-weights-loader] WARNING: --frobenius-q8 set without "

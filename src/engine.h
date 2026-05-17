@@ -174,6 +174,25 @@ struct Config {
     // quantization error. Used to measure end-to-end PPL drift from Q8
     // before committing to resident packed storage in Step C.
     bool        frobenius_q8       = false;
+
+    // Phase 14: --frobenius-q4.
+    // Same semantics as frobenius_q8 but with the codebook halved:
+    // packed 4-bit nybble pair per coordinate (1 byte per ring element).
+    // 16x memory compression vs raw sp_ok_t, 2x vs Q8. Quantization noise
+    // per coordinate is ~16x larger than Q8 (16-level codebook vs 256);
+    // whether Theorem 2's projective cancellation absorbs that noise is
+    // a forward-pass empirical question.
+    //
+    // q4 and q8 are mutually exclusive — q4 wins if both are set.
+    bool        frobenius_q4       = false;
+
+    // Phase 14b: lattice-norm pruning threshold for --frobenius-q4.
+    // For every coordinate pair (a, b), compute N(a + b*omega) = a^2 + ab + 41 b^2
+    // and zero the pair if N < threshold. Produces runs of 0x00 packed bytes
+    // that compress aggressively under downstream entropy coding (zstd/Huffman).
+    //
+    // 0 disables pruning (encode every value).
+    uint64_t    frobenius_q4_prune = 0;
 };
 
 // Seed Config fields from environment variables. Called by each CLI verb

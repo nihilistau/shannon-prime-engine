@@ -392,4 +392,116 @@ bool sp_matmul_ok_q8_to_fp32(const sp_ok_tensor&    W_shape,
     return true;
 }
 
+// ---------- Phase 14: fused packed-Q4 matmul -----------------------------
+
+/* Decode one packed nybble-pair to a pair of int64 coordinates with the
+ * per-tensor shift inlined. Mirrors sp_ok_q4_decode_one but expands inline
+ * here so the compiler can keep the shifts in registers across the inner
+ * loop. The arithmetic-shift idiom sign-extends each 4-bit field into
+ * 32 bits without a mask table. */
+static inline void sp_q4_decode_pair(uint8_t packed, int8_t shift,
+                                      int64_t& w_a, int64_t& w_b) {
+    int32_t a4 = ((int32_t)((uint32_t)packed << 28)) >> 28;
+    int32_t b4 = ((int32_t)((uint32_t)packed << 24)) >> 28;
+    w_a = ((int64_t)a4) << shift;
+    w_b = ((int64_t)b4) << shift;
+}
+
+bool sp_matmul_ok_q4(const sp_ok_tensor&    W_shape,
+                     const sp_ok_q4_tensor& W_q4,
+                     const sp_ok_tensor&    X,
+                     sp_ok_tensor&          Y) {
+    if (X.data == nullptr || Y.data == nullptr) return false;
+    if (W_shape.n_dims < 2 || X.n_dims < 2) return false;
+    if (W_q4.data == nullptr || W_q4.numel == 0) return false;
+    const int64_t M  = W_shape.shape[1];
+    const int64_t K  = W_shape.shape[0];
+    const int64_t K2 = X.shape[1];
+    const int64_t N  = X.shape[0];
+    if (K != K2) return false;
+    if (Y.n_dims < 2 || Y.shape[0] != N || Y.shape[1] != M) return false;
+    if ((size_t)(M * K) != W_q4.numel) return false;
+
+    const int8_t shift = W_q4.q4_shift;
+    const int nt = std::max(1, sp_threadpool_n_threads());
+
+    /* Output row i is independent -- partition M across threads. At
+     * 1 B/elem the entire weight ROW for K=6912 fits in 6.75 KB (well
+     * under L1). For Gemma3-1B's ffn_down (M=1152, K=6912) the full
+     * matrix is 8 MB packed, comfortably in L2 on most workstations. */
+    sp_parallel_for([&](int thread_id) {
+        int64_t i0, i1;
+        split_rows(M, nt, thread_id, i0, i1);
+        for (int64_t i = i0; i < i1; ++i) {
+            const sp_ok_q4_t* w_row = W_q4.data + i * K;
+            for (int64_t j = 0; j < N; ++j) {
+                int64_t acc_a = 0;
+                int64_t acc_b = 0;
+                const sp_ok_t* x_row = X.data + j * K;
+                for (int64_t k = 0; k < K; ++k) {
+                    int64_t w_a, w_b;
+                    sp_q4_decode_pair(w_row[k].packed, shift, w_a, w_b);
+                    const sp_ok_t& x_jk = x_row[k];
+                    acc_a += w_a * x_jk.a
+                           - (int64_t)SP_OK_OMEGA_NORM * w_b * x_jk.b;
+                    acc_b += w_a * x_jk.b
+                           + x_jk.a * w_b
+                           + w_b * x_jk.b;
+                }
+                Y.data[j * M + i] = sp_ok_t{ acc_a, acc_b };
+            }
+        }
+    });
+
+    Y.scale_recip     = W_shape.scale_recip     * X.scale_recip;
+    Y.frobenius_scale = W_shape.frobenius_scale * X.frobenius_scale;
+    return true;
+}
+
+bool sp_matmul_ok_q4_to_fp32(const sp_ok_tensor&    W_shape,
+                             const sp_ok_q4_tensor& W_q4,
+                             const sp_ok_tensor&    X,
+                             float*                 Y_fp32,
+                             int                    out_rows,
+                             int                    n_cols) {
+    if (X.data == nullptr || Y_fp32 == nullptr) return false;
+    if (W_shape.n_dims < 2 || X.n_dims < 2) return false;
+    if (W_q4.data == nullptr || W_q4.numel == 0) return false;
+    const int64_t M  = W_shape.shape[1];
+    const int64_t K  = W_shape.shape[0];
+    const int64_t K2 = X.shape[1];
+    const int64_t N  = X.shape[0];
+    if (K != K2 || (int64_t)out_rows != M || (int64_t)n_cols != N) return false;
+    if ((size_t)(M * K) != W_q4.numel) return false;
+
+    const double divisor =
+        (double)W_shape.scale_recip * (double)X.scale_recip *
+        (double)W_shape.frobenius_scale * (double)X.frobenius_scale;
+    if (divisor == 0.0) return false;
+
+    const int8_t shift = W_q4.q4_shift;
+    const int nt = std::max(1, sp_threadpool_n_threads());
+
+    sp_parallel_for([&](int thread_id) {
+        int64_t i0, i1;
+        split_rows(M, nt, thread_id, i0, i1);
+        for (int64_t i = i0; i < i1; ++i) {
+            const sp_ok_q4_t* w_row = W_q4.data + i * K;
+            for (int64_t j = 0; j < N; ++j) {
+                int64_t acc_a = 0;
+                const sp_ok_t* x_row = X.data + j * K;
+                for (int64_t k = 0; k < K; ++k) {
+                    int64_t w_a, w_b;
+                    sp_q4_decode_pair(w_row[k].packed, shift, w_a, w_b);
+                    const sp_ok_t& x_jk = x_row[k];
+                    acc_a += w_a * x_jk.a
+                           - (int64_t)SP_OK_OMEGA_NORM * w_b * x_jk.b;
+                }
+                Y_fp32[j * M + i] = (float)((double)acc_a / divisor);
+            }
+        }
+    });
+    return true;
+}
+
 }  // namespace sp::engine

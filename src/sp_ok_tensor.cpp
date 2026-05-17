@@ -160,6 +160,25 @@ bool sp_ok_arena::alloc_tensor_q8(sp_ok_q8_tensor& t, size_t numel) {
     return true;
 }
 
+bool sp_ok_arena::alloc_tensor_q4(sp_ok_q4_tensor& t, size_t numel) {
+    if (numel == 0) {
+        t.data  = nullptr;
+        t.numel = 0;
+        return true;
+    }
+    size_t bytes = numel * sizeof(sp_ok_q4_t);
+    void* p = alloc(bytes, 64);
+    if (!p) return false;
+    t.data           = static_cast<sp_ok_q4_t*>(p);
+    t.numel          = numel;
+    t.q4_shift       = 0;
+    t.scale_recip    = 1;
+    t.frobenius_scale = 1;
+    t.frobenius_p    = 0;
+    t.frobenius_k    = 0;
+    return true;
+}
+
 // =========================================================================
 // Helper functions
 // =========================================================================

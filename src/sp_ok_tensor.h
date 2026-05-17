@@ -26,6 +26,7 @@
 extern "C" {
 #include "../lib/shannon-prime/core/sp_ok_arith.h"
 #include "../lib/shannon-prime/core/sp_ok_q8.h"
+#include "../lib/shannon-prime/core/sp_ok_q4.h"
 }
 
 namespace sp::engine {
@@ -109,6 +110,15 @@ public:
     // caller's responsibility — typically set by the encoder. Returns
     // false on arena exhaustion. */
     bool alloc_tensor_q8(sp_ok_q8_tensor& t, size_t numel);
+
+    // Phase 14: packed-4-bit ring elements. Single byte per element (low
+    // nybble = a coordinate, high nybble = b coordinate, both signed).
+    // Sizes the backing storage at numel * sizeof(sp_ok_q4_t) = 1 byte
+    // per element, returns the descriptor with `data` pointing into the
+    // arena. Per-tensor metadata (q4_shift, scale_recip, frobenius_scale,
+    // p, k) is the caller's responsibility — typically set by the
+    // encoder. Returns false on arena exhaustion.
+    bool alloc_tensor_q4(sp_ok_q4_tensor& t, size_t numel);
 
     void   reset()              { used_ = 0; }
     size_t capacity() const     { return capacity_; }

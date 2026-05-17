@@ -225,6 +225,16 @@ static void usage(const char* prog) {
         "                               (~8x ok_arena compression). Stacks on\n"
         "                               --frobenius-quant; the int8 lattice is\n"
         "                               applied AFTER phi_p^k.\n"
+        "  --frobenius-q4               Resident packed-int4 weight storage\n"
+        "                               (~16x ok_arena compression). Same as Q8\n"
+        "                               but with the codebook halved (16 levels\n"
+        "                               per coord vs 256). Mutually exclusive\n"
+        "                               with --frobenius-q8 (q4 wins if both).\n"
+        "  --frobenius-q4-prune <thr>   Zero (a,b) pairs whose lattice norm\n"
+        "                               a^2 + ab + 41 b^2 < threshold before\n"
+        "                               packing. Produces runs of 0x00 bytes\n"
+        "                               for downstream entropy coding.\n"
+        "                               Implies --frobenius-q4.\n"
         "\n"
         "  --sato-tate-mix p1,k1,p2,k2  Asymmetric mixed-precision (Config E):\n"
         "                               inert prime p1 (zero-drift channel) +\n"
@@ -321,6 +331,8 @@ static int parse_config_flag(sp::engine::Config& cfg, const char* a, const char*
     if (a_eq("--frobenius-quant-p") && has_next)    { cfg.frobenius_p = std::atoll(next); return 2; }
     if (a_eq("--frobenius-quant-k") && has_next)    { cfg.frobenius_k = std::atoll(next); return 2; }
     if (a_eq("--frobenius-q8"))                     { cfg.frobenius_q8 = true; return 1; }
+    if (a_eq("--frobenius-q4"))                     { cfg.frobenius_q4 = true; return 1; }
+    if (a_eq("--frobenius-q4-prune") && has_next)   { cfg.frobenius_q4_prune = (uint64_t)std::atoll(next); cfg.frobenius_q4 = true; return 2; }
     if (a_eq("--sato-tate-mix") && has_next) {
         // Format: "p1,k1,p2,k2". Defaults stay if parse fails.
         long long a, b, c, d;
