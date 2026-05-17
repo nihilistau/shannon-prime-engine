@@ -124,6 +124,7 @@ set(SP_CORE_SRC
     ${SP_CORE_DIR}/core/sp_poly_ring.c
     ${SP_CORE_DIR}/core/sp_ntt.c
     ${SP_CORE_DIR}/core/sp_ntt_crt.c
+    ${SP_CORE_DIR}/core/sp_arm.c
     ${SP_CORE_DIR}/backends/crt/sp_crt.c
     ${SP_CORE_DIR}/backends/crt/sp_crt_dispatch.c
     ${SP_CORE_DIR}/backends/crt/sp_theoretical.c)

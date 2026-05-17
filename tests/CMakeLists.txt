@@ -206,6 +206,27 @@ set_target_properties(test_sp_ntt_crt PROPERTIES
 )
 add_test(NAME sp_ntt_crt COMMAND test_sp_ntt_crt)
 
+# Phase 13.A: Algebraic Resonance Memory — HRR-style associative memory
+# native to the dual-prime CRT cyclotomic ring. Storage = pointwise
+# accumulation of K*V products in NTT domain; recall = inverse NTT of
+# M * Q_REV. Test characterizes recall SNR as a function of memories
+# per slab (capacity sweep K=1..64).
+add_executable(test_sp_arm
+    test_sp_arm.cpp
+    ../lib/shannon-prime/core/sp_poly_ring.c
+    ../lib/shannon-prime/core/sp_ntt.c
+    ../lib/shannon-prime/core/sp_ntt_crt.c
+    ../lib/shannon-prime/core/sp_arm.c
+)
+target_include_directories(test_sp_arm PRIVATE
+    ../lib/shannon-prime/core
+)
+set_target_properties(test_sp_arm PROPERTIES
+    C_STANDARD 11
+    CXX_STANDARD 17
+)
+add_test(NAME sp_arm COMMAND test_sp_arm)
+
 # Phase 12 Step A: packed-int8 O_K storage. Standalone — depends only on
 # sp_ok_arith, sp_frobenius, and the new sp_ok_q8 module. Verifies that
 # Frobenius-transformed coordinates round-trip through 2-byte packing with
