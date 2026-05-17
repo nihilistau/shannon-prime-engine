@@ -60,6 +60,39 @@ q1, q2 = candidates[0], candidates[1]
 psi1, psi2 = find_psi(q1), find_psi(q2)
 psi_inv1, psi_inv2 = pow(psi1, -1, q1), pow(psi2, -1, q2)
 N_inv1, N_inv2 = pow(N, -1, q1), pow(N, -1, q2)
+barrett_mu1 = (1 << 61) // q1
+barrett_mu2 = (1 << 61) // q2
+omega1 = pow(psi1, 2, q1)
+omega2 = pow(psi2, 2, q2)
+omega_inv1 = pow(omega1, -1, q1)
+omega_inv2 = pow(omega2, -1, q2)
+
+# Layer-flat twiddle tables for CT-DIT-with-bitrev-first algorithm.
+# For each layer length L = 2, 4, ..., N:
+#   emit half = L/2 entries omega^(k * N/L) for k = 0..half-1
+# Total N-1 entries, but we pad to N for clean alignment (last slot=0, unused).
+# Layer length=L's vector starts at offset (L/2 - 1) wait actually...
+# Cumulative offsets:  layer 2 -> offset 0, layer 4 -> 1, layer 8 -> 3,
+#                      layer L -> L/2 - 1, ..., layer N -> N/2 - 1.
+def build_layer_flat(om, q):
+    flat = []
+    L = 2
+    while L <= N:
+        half = L >> 1
+        w_step = pow(om, N // L, q)
+        w = 1
+        for _ in range(half):
+            flat.append(w)
+            w = (w * w_step) % q
+        L <<= 1
+    # Pad to N so the table is exactly N elements (last slot = 0, never read).
+    while len(flat) < N:
+        flat.append(0)
+    return flat
+omega_pow1     = build_layer_flat(omega1,     q1)
+omega_pow2     = build_layer_flat(omega2,     q2)
+omega_inv_pow1 = build_layer_flat(omega_inv1, q1)
+omega_inv_pow2 = build_layer_flat(omega_inv2, q2)
 crt_q1_inv_q2 = pow(q1 % q2, -1, q2)
 M = q1 * q2
 
@@ -147,6 +180,8 @@ header = f"""/* sp_ntt_crt_consts.h — Auto-generated dual-prime CRT NTT consta
 #define SP_NTT_CRT_N_INV1       {N_inv1}ULL
 #define SP_NTT_CRT_N_INV2       {N_inv2}ULL
 #define SP_NTT_CRT_Q1_INV_Q2    {crt_q1_inv_q2}ULL
+#define SP_NTT_CRT_BARRETT_MU1  {barrett_mu1}ULL
+#define SP_NTT_CRT_BARRETT_MU2  {barrett_mu2}ULL
 
 """
 def fmt_u64(name, vals, c):
@@ -159,7 +194,11 @@ header += fmt_u64("sp_ntt_crt_psi_pow1",     psi_pow1,     "psi1^i mod q1 (negac
 header += fmt_u64("sp_ntt_crt_psi_inv_pow1", psi_inv_pow1, "psi1^-i mod q1 (post-twist, prime 1)")
 header += fmt_u64("sp_ntt_crt_psi_pow2",     psi_pow2,     "psi2^i mod q2 (pre-twist, prime 2)")
 header += fmt_u64("sp_ntt_crt_psi_inv_pow2", psi_inv_pow2, "psi2^-i mod q2 (post-twist, prime 2)")
-header += fmt_u32_array("sp_ntt_crt_bitrev", bitrev_perm, "bitrev(i, log2 N) — shared, depends only on N")
+header += fmt_u64("sp_ntt_crt_omega_pow1",     omega_pow1,     "layer-flat fwd twiddles mod q1: layer L starts at offset L/2-1, half=L/2 entries omega1^(k*N/L)")
+header += fmt_u64("sp_ntt_crt_omega_pow2",     omega_pow2,     "layer-flat fwd twiddles mod q2")
+header += fmt_u64("sp_ntt_crt_omega_inv_pow1", omega_inv_pow1, "layer-flat inv twiddles mod q1 (omega_inv powers)")
+header += fmt_u64("sp_ntt_crt_omega_inv_pow2", omega_inv_pow2, "layer-flat inv twiddles mod q2")
+header += fmt_u32_array("sp_ntt_crt_bitrev", bitrev_perm, "bitrev(i, log2 N) - shared, depends only on N")
 header += "\n#endif /* SP_NTT_CRT_CONSTS_H */\n"
 
 OUT = "/sessions/dazzling-ecstatic-ritchie/mnt/shannon-prime-repos/shannon-prime-engine/lib/shannon-prime/core/sp_ntt_crt_consts.h"
