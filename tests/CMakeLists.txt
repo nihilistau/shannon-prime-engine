@@ -205,3 +205,22 @@ set_target_properties(test_sp_ntt_crt PROPERTIES
     CXX_STANDARD 17
 )
 add_test(NAME sp_ntt_crt COMMAND test_sp_ntt_crt)
+
+# Phase 12 Step A: packed-int8 O_K storage. Standalone — depends only on
+# sp_ok_arith, sp_frobenius, and the new sp_ok_q8 module. Verifies that
+# Frobenius-transformed coordinates round-trip through 2-byte packing with
+# bounded relative error (Theorem 2 / CM Sato-Tate variance budget).
+add_executable(test_sp_ok_q8
+    test_sp_ok_q8.cpp
+    ../lib/shannon-prime/core/sp_ok_q8.c
+    ../lib/shannon-prime/core/sp_frobenius.c
+    ../lib/shannon-prime/core/sp_ok_arith.c
+)
+target_include_directories(test_sp_ok_q8 PRIVATE
+    ../lib/shannon-prime/core
+)
+set_target_properties(test_sp_ok_q8 PROPERTIES
+    C_STANDARD 11
+    CXX_STANDARD 17
+)
+add_test(NAME sp_ok_q8 COMMAND test_sp_ok_q8)
