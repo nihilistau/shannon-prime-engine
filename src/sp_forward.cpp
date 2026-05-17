@@ -23,6 +23,8 @@ extern "C" {
 }
 
 #include <algorithm>
+#include <cassert>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -74,12 +76,28 @@ bool sp_forward_context_init(sp_forward_context& ctx,
         + 4096;
     ctx.layer_arena.reserve(per_layer_bytes);
 
-    // Phase 12 Step B-2: decode workspace for resident Q8 weights. The
-    // FFN matmul needs all three of (gate, up, down) decoded
-    // simultaneously, so the arena must fit their SUM. Q/K/V/O reuse a
-    // single scratch with arena reset between calls. Worst case is
-    // 3 * ffn_gate elements at 16 B each.
-    {
+    // Phase 12 Step C: start the background prefetch worker when weights
+    // are in resident Q8 form. The worker races ahead of the forward
+    // path, double-buffering one layer's decoded weights per slot.
+    if (weights.use_q8) {
+        if (!ctx.q8_prefetcher.start(weights)) {
+            std::fprintf(stderr,
+                "[sp_forward] q8_prefetcher.start failed; falling back "
+                "to inline decode\n");
+            /* Keep the inline-decode arena around as a safety fallback. */
+            const int64_t ffn_elems = (int64_t)weights.d_ff * (int64_t)weights.n_embd;
+            const size_t  ffn_bytes_one = (size_t)ffn_elems * sizeof(sp_ok_t) + 4096;
+            ctx.q8_decode_arena.reserve(3 * ffn_bytes_one);
+        } else {
+            std::fprintf(stderr,
+                "[sp_forward] q8_prefetcher: dedicated worker thread launched, "
+                "2 slots * %.0f MB each\n",
+                (double)((size_t)weights.d_ff * (size_t)weights.n_embd *
+                         sizeof(sp_ok_t) * 7) / (1024.0 * 1024.0) / 7.0);
+        }
+    } else {
+        /* Step B-2 inline-decode arena: kept for the no-Q8 path so any
+         * future code that calls weight_decoded() inline still works. */
         const int64_t ffn_elems = (int64_t)weights.d_ff * (int64_t)weights.n_embd;
         const size_t  ffn_bytes_one = (size_t)ffn_elems * sizeof(sp_ok_t) + 4096;
         ctx.q8_decode_arena.reserve(3 * ffn_bytes_one);
@@ -508,6 +526,150 @@ int sp_weights_convert_to_q8(sp_weights& weights) {
 }
 
 // =========================================================================
+// Phase 12 Step C: background Q8 prefetch worker
+// =========================================================================
+
+bool sp_q8_prefetcher::start(const sp_weights& w) {
+    if (!w.use_q8 || w.n_layers <= 0) return false;
+    weights_ = &w;
+
+    /* Size each slot's arena for one layer's worth of decoded weights. */
+    size_t per_layer_bytes = 0;
+    {
+        const sp_ok_tensor* slots[7] = {
+            &w.wq[0], &w.wk[0], &w.wv[0], &w.wo[0],
+            &w.ffn_gate[0], &w.ffn_up[0], &w.ffn_down[0]
+        };
+        for (int s = 0; s < 7; ++s) {
+            per_layer_bytes += (size_t)slots[s]->numel() * sizeof(sp_ok_t) + 64;
+        }
+        per_layer_bytes += 4096;
+    }
+    for (int i = 0; i < N_SLOTS; ++i) {
+        slots_[i].arena.reserve(per_layer_bytes);
+        slots_[i].layer_id = -1;
+        slots_[i].ready    = false;
+    }
+    next_layer_to_decode_ = 0;
+    shutdown_.store(false);
+    decode_us_total_.store(0);
+    acquire_wait_us_total_.store(0);
+    worker_ = std::thread([this] { this->worker_loop(); });
+    return true;
+}
+
+void sp_q8_prefetcher::stop() {
+    if (!worker_.joinable()) return;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        shutdown_.store(true);
+    }
+    cv_consumed_.notify_all();
+    cv_decoded_.notify_all();
+    worker_.join();
+}
+
+int sp_q8_prefetcher::acquire(int layer) {
+    auto t0 = std::chrono::steady_clock::now();
+    std::unique_lock<std::mutex> lk(mu_);
+    cv_decoded_.wait(lk, [&] {
+        if (shutdown_.load()) return true;
+        for (int s = 0; s < N_SLOTS; ++s) {
+            if (slots_[s].layer_id == layer && slots_[s].ready) return true;
+        }
+        return false;
+    });
+    int found = -1;
+    for (int s = 0; s < N_SLOTS; ++s) {
+        if (slots_[s].layer_id == layer && slots_[s].ready) { found = s; break; }
+    }
+    lk.unlock();
+    auto t1 = std::chrono::steady_clock::now();
+    acquire_wait_us_total_.fetch_add(
+        (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count());
+    return found;
+}
+
+void sp_q8_prefetcher::release(int slot) {
+    if (slot < 0 || slot >= N_SLOTS) return;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        slots_[slot].layer_id = -1;
+        slots_[slot].ready    = false;
+    }
+    cv_consumed_.notify_one();
+}
+
+void sp_q8_prefetcher::decode_layer_into(int slot_idx, int layer) {
+    slot_t& s = slots_[slot_idx];
+    s.arena.reset();
+
+    auto decode_one = [&](const sp_ok_q8_tensor& src,
+                          const sp_ok_tensor&    shape_src,
+                          sp_ok_tensor&          dst) {
+        dst.reset(shape_src.n_dims, shape_src.shape);
+        if (!s.arena.alloc_tensor(dst)) {
+            dst.data = nullptr;
+            return;
+        }
+        sp_ok_q8_decode_array(dst.data, src.data, src.numel, src.q8_shift);
+        dst.scale_recip     = src.scale_recip;
+        dst.frobenius_scale = src.frobenius_scale;
+    };
+
+    decode_one(weights_->q8_wq[layer],       weights_->wq[layer],       s.wq);
+    decode_one(weights_->q8_wk[layer],       weights_->wk[layer],       s.wk);
+    decode_one(weights_->q8_wv[layer],       weights_->wv[layer],       s.wv);
+    decode_one(weights_->q8_wo[layer],       weights_->wo[layer],       s.wo);
+    decode_one(weights_->q8_ffn_gate[layer], weights_->ffn_gate[layer], s.ffn_gate);
+    decode_one(weights_->q8_ffn_up[layer],   weights_->ffn_up[layer],   s.ffn_up);
+    decode_one(weights_->q8_ffn_down[layer], weights_->ffn_down[layer], s.ffn_down);
+}
+
+void sp_q8_prefetcher::worker_loop() {
+    while (true) {
+        int slot_idx = -1;
+        int layer    = -1;
+        {
+            std::unique_lock<std::mutex> lk(mu_);
+            cv_consumed_.wait(lk, [&] {
+                if (shutdown_.load()) return true;
+                for (int s = 0; s < N_SLOTS; ++s) {
+                    if (slots_[s].layer_id == -1) return true;
+                }
+                return false;
+            });
+            if (shutdown_.load()) return;
+            /* Find an empty slot. */
+            for (int s = 0; s < N_SLOTS; ++s) {
+                if (slots_[s].layer_id == -1) { slot_idx = s; break; }
+            }
+            assert(slot_idx >= 0);
+            layer = next_layer_to_decode_;
+            next_layer_to_decode_ =
+                (next_layer_to_decode_ + 1) % weights_->n_layers;
+            /* Reserve slot: layer_id set but ready=false so acquire() won't pick it. */
+            slots_[slot_idx].layer_id = layer;
+            slots_[slot_idx].ready    = false;
+        }
+
+        /* Decode outside the lock. */
+        auto t0 = std::chrono::steady_clock::now();
+        decode_layer_into(slot_idx, layer);
+        auto t1 = std::chrono::steady_clock::now();
+        decode_us_total_.fetch_add(
+            (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count());
+
+        /* Mark ready, wake any consumer waiting on this layer. */
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            slots_[slot_idx].ready = true;
+        }
+        cv_decoded_.notify_all();
+    }
+}
+
+// =========================================================================
 // Phase 12 Step B-2: decode helper for the forward path
 // =========================================================================
 //
@@ -631,6 +793,25 @@ bool sp_forward_step(sp_forward_context& ctx,
 
     for (int L = 0; L < ctx.n_layers; ++L) {
         ctx.layer_arena.reset();
+
+        /* Phase 12 Step C: acquire layer L's decoded weights from the
+         * prefetcher. The worker thread has (hopefully) raced ahead and
+         * already decoded this layer into a slot; if not, this blocks
+         * until ready. References below into ctx.q8_prefetcher.wq(slot)
+         * etc. are stable until release(slot) is called at end of layer.
+         * When weights.use_q8 is false we read directly from weights.wq[L]. */
+        int q8_slot = -1;
+        if (weights.use_q8) {
+            q8_slot = ctx.q8_prefetcher.acquire(L);
+        }
+        const sp_ok_tensor& W_q  = weights.use_q8 ? ctx.q8_prefetcher.wq(q8_slot)       : weights.wq[L];
+        const sp_ok_tensor& W_k  = weights.use_q8 ? ctx.q8_prefetcher.wk(q8_slot)       : weights.wk[L];
+        const sp_ok_tensor& W_v  = weights.use_q8 ? ctx.q8_prefetcher.wv(q8_slot)       : weights.wv[L];
+        const sp_ok_tensor& W_o  = weights.use_q8 ? ctx.q8_prefetcher.wo(q8_slot)       : weights.wo[L];
+        const sp_ok_tensor& W_gate = weights.use_q8 ? ctx.q8_prefetcher.ffn_gate(q8_slot) : weights.ffn_gate[L];
+        const sp_ok_tensor& W_up   = weights.use_q8 ? ctx.q8_prefetcher.ffn_up(q8_slot)   : weights.ffn_up[L];
+        const sp_ok_tensor& W_down = weights.use_q8 ? ctx.q8_prefetcher.ffn_down(q8_slot) : weights.ffn_down[L];
+
         // Phase 2.3b iter 3 — per-layer SWA dispatch.
         // Gemma3 pattern: layer L is SWA-local iff (L+1) % period != 0.
         // If ctx.swa_window <= 0, every layer is global (full attention).
@@ -671,31 +852,12 @@ bool sp_forward_step(sp_forward_context& ctx,
         if (!ctx.layer_arena.alloc_tensor(ctx.q_ok)) return false;
         if (!ctx.layer_arena.alloc_tensor(ctx.k_ok)) return false;
         if (!ctx.layer_arena.alloc_tensor(ctx.v_ok)) return false;
-        /* Phase 12 Step B-2: Q/K/V matmul. When weights.use_q8 is true,
-         * each weight is decoded from the packed Q8 storage into
-         * ctx.q8_decode_scratch (arena reset between decodes since these
-         * three calls don't need the prior decoded buffer past the call). */
-        {
-            ctx.q8_decode_arena.reset();
-            const sp_ok_tensor& W_q = weight_decoded(
-                ctx.q8_decode_arena, ctx.q8_decode_scratch,
-                weights.wq[L], weights.q8_wq[L], weights.use_q8);
-            if (!sp_matmul_ok(W_q, ctx.x_norm_ok, ctx.q_ok)) return false;
-        }
-        {
-            ctx.q8_decode_arena.reset();
-            const sp_ok_tensor& W_k = weight_decoded(
-                ctx.q8_decode_arena, ctx.q8_decode_scratch,
-                weights.wk[L], weights.q8_wk[L], weights.use_q8);
-            if (!sp_matmul_ok(W_k, ctx.x_norm_ok, ctx.k_ok)) return false;
-        }
-        {
-            ctx.q8_decode_arena.reset();
-            const sp_ok_tensor& W_v = weight_decoded(
-                ctx.q8_decode_arena, ctx.q8_decode_scratch,
-                weights.wv[L], weights.q8_wv[L], weights.use_q8);
-            if (!sp_matmul_ok(W_v, ctx.x_norm_ok, ctx.v_ok)) return false;
-        }
+        /* Phase 12 Step C: Q/K/V matmul reads from the per-layer W_q/W_k/W_v
+         * references bound above — either the prefetcher's decoded slot
+         * (use_q8) or the resident sp_ok_tensor (no Q8). */
+        if (!sp_matmul_ok(W_q, ctx.x_norm_ok, ctx.q_ok)) return false;
+        if (!sp_matmul_ok(W_k, ctx.x_norm_ok, ctx.k_ok)) return false;
+        if (!sp_matmul_ok(W_v, ctx.x_norm_ok, ctx.v_ok)) return false;
 
         // 2c.5) Phase 2.3b: optional per-head Q/K norms (Gemma3 / Qwen3).
         // These reset frobenius_scale → 1, so subsequent RoPE re-encodes
@@ -848,17 +1010,13 @@ bool sp_forward_step(sp_forward_context& ctx,
         // attn_out_ok now has frobenius_scale=1.
 
         // 2g) Wo projection → fp32 (absorbs pi^k via Theorem 4).
-        {
-            ctx.q8_decode_arena.reset();
-            const sp_ok_tensor& W_o = weight_decoded(
-                ctx.q8_decode_arena, ctx.q8_decode_scratch,
-                weights.wo[L], weights.q8_wo[L], weights.use_q8);
-            if (!sp_matmul_ok_to_fp32(W_o, ctx.attn_out_ok,
-                                        ctx.proj_out_fp32.data(),
-                                        n_embd, n_tokens)) {
-                std::fprintf(stderr, "[sp_forward] L%d Wo matmul failed\n", L);
-                return false;
-            }
+        // Phase 12 Step C: W_o is bound at top of layer loop (prefetcher
+        // slot when use_q8, weights.wo[L] otherwise).
+        if (!sp_matmul_ok_to_fp32(W_o, ctx.attn_out_ok,
+                                    ctx.proj_out_fp32.data(),
+                                    n_embd, n_tokens)) {
+            std::fprintf(stderr, "[sp_forward] L%d Wo matmul failed\n", L);
+            return false;
         }
 
         // 2g.5) Phase 2.3b: Gemma3 attn sandwich norm on Wo output.
@@ -897,19 +1055,9 @@ bool sp_forward_step(sp_forward_context& ctx,
         // 2k) FFN → fp32 (absorbs ffn_down's frobenius_scale). Activation
         //     selected by ctx.ffn_act: SwiGLU (silu) for Llama / Qwen,
         //     GeGLU_tanh (gelu) for Gemma family.
-        /* Phase 12 Step B-2: FFN needs all 3 weights live simultaneously,
-         * so decode them into separate scratches without resetting the
-         * arena between them. */
-        ctx.q8_decode_arena.reset();
-        const sp_ok_tensor& W_gate = weight_decoded(
-            ctx.q8_decode_arena, ctx.q8_decode_scratch,
-            weights.ffn_gate[L], weights.q8_ffn_gate[L], weights.use_q8);
-        const sp_ok_tensor& W_up = weight_decoded(
-            ctx.q8_decode_arena, ctx.q8_decode_scratch_b,
-            weights.ffn_up[L],   weights.q8_ffn_up[L],   weights.use_q8);
-        const sp_ok_tensor& W_down = weight_decoded(
-            ctx.q8_decode_arena, ctx.q8_decode_scratch_c,
-            weights.ffn_down[L], weights.q8_ffn_down[L], weights.use_q8);
+        /* Phase 12 Step C: W_gate / W_up / W_down are bound at top of
+         * layer loop. When use_q8 they all point into the same prefetcher
+         * slot for layer L; when not, into weights.ffn_*[L]. */
         if (!sp_ffn_swiglu_to_fp32(ctx.x_norm_ok,
                                      W_gate,
                                      W_up,
@@ -934,6 +1082,12 @@ bool sp_forward_step(sp_forward_context& ctx,
         // 2l) Residual: x_fp32 += ffn_out_fp32
         for (int i = 0; i < n_embd; ++i) {
             ctx.x_fp32[i] += ctx.proj_out_fp32[i];
+        }
+
+        // Phase 12 Step C: release the prefetcher slot for layer L so the
+        // worker can refill it with the next layer's decoded weights.
+        if (weights.use_q8 && q8_slot >= 0) {
+            ctx.q8_prefetcher.release(q8_slot);
         }
     }
 

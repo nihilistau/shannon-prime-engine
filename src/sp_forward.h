@@ -1,8 +1,8 @@
-// Shannon-Prime Engine — Theory-First forward pass (Phase 1.6 skeleton).
+// Shannon-Prime Engine ? Theory-First forward pass (Phase 1.6 skeleton).
 // Copyright (C) 2026 Ray Daniels. All Rights Reserved. AGPLv3 / commercial.
 //
 // The pure-SP forward pass. Every step is an endomorphism of E^n (or
-// the Siegel-variety multi-head generalization, Paper A §3) realized
+// the Siegel-variety multi-head generalization, Paper A ?3) realized
 // as a sequence of sp_ok_tensor operations. ggml is NOT used.
 //
 // In Phase 1 SKELETON (this file), the implementation delegates to
@@ -10,9 +10,22 @@
 // through sp_ok_encode (the Frobenius shim). Phase 1.6 work fills in
 // the actual SP-native ops.
 //
-// Reference: docs/THEORY-FIRST-ENGINE-DESIGN.md §Forward pass.
+// Reference: docs/THEORY-FIRST-ENGINE-DESIGN.md ?Forward pass.
 
 #pragma once
+
+/* System headers FIRST -- engine headers below open namespace sp::engine
+ * and MSVC will choke on follow-up <cmath>/<algorithm> inclusion with
+ * either ADL-pollution errors (sp::engine::std::pair) or UCRT __std_smf_*
+ * link-only symbols missing. Including the standard library at root
+ * scope BEFORE any engine namespace opens fixes both. */
+#include <algorithm>
+#include <atomic>
+#include <cmath>
+#include <condition_variable>
+#include <mutex>
+#include <thread>
+#include <vector>
 
 #include "sp_ok_tensor.h"
 #include "sp_kv_cache_ok.h"
@@ -27,7 +40,7 @@
 namespace sp::engine {
 
 // -----------------------------------------------------------------------
-// sp_forward_context — per-request inference state.
+// sp_forward_context ? per-request inference state.
 //
 // The residual stream lives in fp32 (`x_fp32`). At the start of each
 // layer we encode it into the O_K mirror `x_ok` for the RMSNorm + Q/K/V
@@ -38,6 +51,104 @@ namespace sp::engine {
 // crosses through an explicit fp32 island so scale_recip / frobenius_
 // scale mismatches can never silently corrupt the stream.
 // -----------------------------------------------------------------------
+// Forward declaration so sp_forward_context can hold a pointer to the
+// prefetcher without including the implementation here. Defined below
+// after sp_weights so it can refer to the struct.
+struct sp_weights;
+
+// -----------------------------------------------------------------------
+// Phase 12 Step C: background Q8 prefetch worker.
+//
+// A dedicated std::thread that races ahead of the forward path, decoding
+// each layer's 7 weight tensors from packed Q8 storage into one of two
+// double-buffered slots. The forward thread acquires layer L's slot,
+// runs all 7 matmuls reading directly from it, then releases. The
+// worker is woken by `cv_consumed_` whenever a slot becomes free and
+// signals `cv_decoded_` whenever a slot becomes ready.
+//
+// Producer/consumer ordering invariant: the consumer accesses layers in
+// the fixed sequence (0, 1, ..., n_layers-1, 0, 1, ...). The producer
+// maintains `next_layer_to_decode_` which monotonically advances mod
+// n_layers, always one or two layers ahead of the consumer. The step
+// boundary (consumer L=N-1 -> L=0) requires no special handling -- the
+// producer's modulo counter wraps naturally.
+//
+// Memory: each slot holds one layer's decoded weights (~430 MB on
+// Gemma3-1B). 2 slots = ~860 MB of live decode workspace. Combined
+// with the 1.3 GB Q8 resident storage, peak runtime memory is ~2.16 GB
+// versus the original 10.4 GB sp_ok_t arena -- a 4.8x live RAM
+// compression while keeping wall time within striking distance of the
+// uncompressed Phase 11 path.
+//
+// Bit-identical to Step B-2's decode-on-demand path: the prefetcher
+// just runs the same sp_ok_q8_decode_array on the same packed bytes,
+// only ahead of time instead of inline.
+// -----------------------------------------------------------------------
+class sp_q8_prefetcher {
+public:
+    sp_q8_prefetcher() = default;
+    ~sp_q8_prefetcher() { stop(); }
+    sp_q8_prefetcher(const sp_q8_prefetcher&)            = delete;
+    sp_q8_prefetcher& operator=(const sp_q8_prefetcher&) = delete;
+
+    // Reserve slot arenas, launch worker. weights.use_q8 must be true.
+    // Returns false if weights is empty or not in Q8 mode.
+    bool start(const sp_weights& weights);
+
+    // Signal shutdown, join the worker. Safe to call multiple times.
+    void stop();
+
+    // Blocks until layer L is fully decoded in some slot. Returns the
+    // slot index (0 or 1). Caller MUST call release(slot) after all
+    // matmul reads from this slot complete.
+    int acquire(int layer);
+
+    // Mark slot as consumed. Worker may now overwrite it with the next
+    // layer's decoded weights.
+    void release(int slot);
+
+    // Accessors for the 7 decoded tensors in a given slot. Valid
+    // between acquire() and release().
+    const sp_ok_tensor& wq      (int slot) const { return slots_[slot].wq;       }
+    const sp_ok_tensor& wk      (int slot) const { return slots_[slot].wk;       }
+    const sp_ok_tensor& wv      (int slot) const { return slots_[slot].wv;       }
+    const sp_ok_tensor& wo      (int slot) const { return slots_[slot].wo;       }
+    const sp_ok_tensor& ffn_gate(int slot) const { return slots_[slot].ffn_gate; }
+    const sp_ok_tensor& ffn_up  (int slot) const { return slots_[slot].ffn_up;   }
+    const sp_ok_tensor& ffn_down(int slot) const { return slots_[slot].ffn_down; }
+
+    // Diagnostics: per-call decode time accumulator (microseconds).
+    uint64_t decode_us_total() const { return decode_us_total_.load(); }
+    uint64_t acquire_wait_us_total() const { return acquire_wait_us_total_.load(); }
+
+private:
+    void worker_loop();
+    void decode_layer_into(int slot, int layer);
+
+    static constexpr int N_SLOTS = 2;
+    struct slot_t {
+        sp_ok_arena   arena;
+        sp_ok_tensor  wq, wk, wv, wo;
+        sp_ok_tensor  ffn_gate, ffn_up, ffn_down;
+        int           layer_id = -1;   // -1 = empty
+        bool          ready    = false;
+    };
+    slot_t slots_[N_SLOTS];
+
+    const sp_weights* weights_ = nullptr;
+
+    std::mutex              mu_;
+    std::condition_variable cv_decoded_;     // slot became ready
+    std::condition_variable cv_consumed_;    // slot became empty
+
+    std::thread        worker_;
+    std::atomic<bool>  shutdown_{false};
+    int                next_layer_to_decode_ = 0;
+
+    std::atomic<uint64_t> decode_us_total_{0};
+    std::atomic<uint64_t> acquire_wait_us_total_{0};
+};
+
 struct sp_forward_context {
     // fp32 residual stream [n_tokens * n_embd].
     std::vector<float> x_fp32;
@@ -69,10 +180,10 @@ struct sp_forward_context {
     float   rms_eps    = 1e-5f;
     float        rope_base  = 10000.0f;
     sp_rope_mode rope_mode  = sp_rope_mode::NORMAL;  // NEOX for qwen/phi/gemma family
-    // Phase 2.3b iter 2 — Gemma family arch knobs:
+    // Phase 2.3b iter 2 ? Gemma family arch knobs:
     float       embd_scale = 1.0f;                 // sqrt(n_embd) for gemma
     sp_ffn_act  ffn_act    = sp_ffn_act::SwiGLU;   // GeGLU_tanh for gemma
-    // Phase 2.3b iter 3 — Gemma3 SWA / softcap knobs (0 = disabled).
+    // Phase 2.3b iter 3 ? Gemma3 SWA / softcap knobs (0 = disabled).
     // Gemma3 alternates 5 SWA "local" layers : 1 "global" layer.
     // A layer is SWA-local iff (L + 1) % swa_pattern_period != 0
     // AND swa_window > 0. Local layers use `swa_rope_base` (typically
@@ -83,7 +194,7 @@ struct sp_forward_context {
     float  attn_logit_softcap   = 0.0f;    // > 0 caps QK^T/sqrt(d)
     float  final_logit_softcap  = 0.0f;    // > 0 caps LM-head output
 
-    // Phase 3 pivot — attention dispatch.
+    // Phase 3 pivot ? attention dispatch.
     //   0 = standard dot product (Phase 2.2a)
     //   1 = CKKS polynomial-ring (Z[x]/(x^N+1) negacyclic convolution)
     int    attn_mode            = 0;
@@ -100,8 +211,15 @@ struct sp_forward_context {
     std::vector<uint64_t> k_ntt_cache_q2;
     bool                  k_ntt_crt = false;
 
-    // Poncelet adaptive depth tracking (Paper A §7, Theorem 5).
+    // Poncelet adaptive depth tracking (Paper A ?7, Theorem 5).
     sp_ok_t poncelet_delta = sp_ok_t{ 0, 0 };
+
+
+    // Phase 12 Step C: background prefetch worker. Decodes packed Q8
+    // weights one layer ahead of the forward path into double-buffered
+    // slots. Initialized when weights.use_q8 is true at context init,
+    // stopped on context destruct.
+    sp_q8_prefetcher q8_prefetcher;
 
     // Phase 12 Step B-2: decode workspace for resident Q8 weights.
     // sp_weights with use_q8=true releases its layer_arenas back to the
@@ -119,10 +237,10 @@ struct sp_forward_context {
 };
 
 // -----------------------------------------------------------------------
-// sp_weights — per-model weight tensors in O_K coordinates.
+// sp_weights ? per-model weight tensors in O_K coordinates.
 //
 // All MATMUL weights are sp_ok_tensors (shim-list, get Frobenius-shimmed).
-// All RMSNORM scale vectors stay fp32 (bypass-list, no shim — they are
+// All RMSNORM scale vectors stay fp32 (bypass-list, no shim ? they are
 // the scale-reset valve per Phase 1.7 policy).
 // -----------------------------------------------------------------------
 struct sp_weights {
@@ -167,7 +285,7 @@ struct sp_weights {
     // Sized [head_dim]; shared across all heads (broadcast per head).
     std::vector<std::vector<float>> attn_q_norm_w;     // per-layer [head_dim] or empty
     std::vector<std::vector<float>> attn_k_norm_w;     // per-layer [head_dim] or empty
-    // Phase 2.3b: Gemma3 sandwich norms — applied to projection output
+    // Phase 2.3b: Gemma3 sandwich norms ? applied to projection output
     // BEFORE the residual add. Empty = not applied.
     std::vector<std::vector<float>> attn_post_norm_w;  // per-layer [n_embd] or empty
     std::vector<std::vector<float>> ffn_post_norm_w;   // per-layer [n_embd] or empty
@@ -216,26 +334,26 @@ int sp_weights_convert_to_q8(sp_weights& weights);
 // Run a single forward step: given a token id, produce logits[vocab].
 //
 // Phase 2.2d (LIVE):
-//   1. Embedding lookup: weights.tok_embed[token_id] → x_fp32 (n_embd)
+//   1. Embedding lookup: weights.tok_embed[token_id] ? x_fp32 (n_embd)
 //   2. For each layer L:
-//      a. encode x_fp32 → x_ok (scale_recip=residual_scale, frob=1)
+//      a. encode x_fp32 ? x_ok (scale_recip=residual_scale, frob=1)
 //      b. x_norm_ok = sp_rmsnorm_native(x_ok, attn_norm_w[L])
 //      c. q_ok = Wq[L] @ x_norm_ok  (frob=pi^k)
 //         k_ok = Wk[L] @ x_norm_ok  (frob=pi^k)
 //         v_ok = Wv[L] @ x_norm_ok  (frob=pi^k)
-//      d. sp_rope_apply_ok(q_ok); sp_rope_apply_ok(k_ok)   (frob → 1)
+//      d. sp_rope_apply_ok(q_ok); sp_rope_apply_ok(k_ok)   (frob ? 1)
 //      e. kv_cache.append(L, k_ok, v_ok)
 //      f. attn_out_ok = attention(q_ok, K_view, V_view, ...)  (frob=1)
 //      g. wo_out_fp32 = sp_matmul_ok_to_fp32(Wo[L], attn_out_ok)
 //      h. x_fp32 += wo_out_fp32                            (residual)
-//      i. encode x_fp32 → x_ok
+//      i. encode x_fp32 ? x_ok
 //      j. x_norm2_ok = sp_rmsnorm_native(x_ok, ffn_norm_w[L])
 //      k. ffn_out_fp32 = sp_ffn_swiglu_to_fp32(x_norm2_ok, gate, up, down)
 //      l. x_fp32 += ffn_out_fp32                           (residual)
-//   3. encode x_fp32 → x_ok
+//   3. encode x_fp32 ? x_ok
 //   4. x_final_ok = sp_rmsnorm_native(x_ok, final_norm_w)
 //   5. logits_fp32 = sp_matmul_ok_to_fp32(lm_head, x_final_ok)
-//   6. write logits_fp32 → logits_out
+//   6. write logits_fp32 ? logits_out
 //
 // Single-token mode (n_tokens=1). Multi-token prefill lands in 2.2d2.
 bool sp_forward_step(sp_forward_context& ctx,
@@ -279,7 +397,7 @@ size_t sp_weights_required_arena_bytes(int n_layers, int n_embd,
 
 // Allocate all slots at the given shapes; data is uninitialised.
 //
-// `head_dim` is INDEPENDENT of n_embd / n_head — for Gemma3 (n_embd=640,
+// `head_dim` is INDEPENDENT of n_embd / n_head ? for Gemma3 (n_embd=640,
 // n_head=4, head_dim=256) we have d_q = n_head*head_dim = 1024 which is
 // strictly larger than n_embd. For most archs head_dim == n_embd/n_head;
 // pass head_dim=0 to use that default.
