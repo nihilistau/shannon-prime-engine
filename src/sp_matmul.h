@@ -92,4 +92,40 @@ bool sp_matmul_fp32_input_to_ok(const sp_ok_tensor& W,
                                   int                 n_cols,
                                   sp_ok_tensor&       Y);
 
+// -----------------------------------------------------------------------
+// Phase 12 Step D: fused packed-Q8 weight matmul (the production endgame).
+//
+// Same semantics as sp_matmul_ok, but the W operand is provided as a
+// 2 B/element packed sp_ok_q8_tensor plus a per-tensor shift. The
+// kernel sign-extends each int8 pair to int64 and applies the shift
+// inline in the inner loop, then performs the sp_ok ring multiply.
+//
+// API contract:
+//   W_shape  -- sp_ok_tensor with shape[], scale_recip, frobenius_scale
+//               populated (its .data may be nullptr; only metadata is used).
+//   W_q8     -- the packed bytes (numel = W_shape.numel()) + q8_shift.
+//   X        -- input as a full sp_ok_tensor (same as sp_matmul_ok).
+//   Y        -- output sp_ok_tensor (same as sp_matmul_ok).
+//
+// The fused path eliminates the 430 MB decoded-buffer write that Step C's
+// prefetcher introduced; weights are streamed through the matmul kernel
+// at 2 B/element with the shift applied per-lane, dropping DRAM pressure
+// by 8x and keeping the working set resident in L2/L3 across an entire
+// layer's matmuls.
+// -----------------------------------------------------------------------
+bool sp_matmul_ok_q8(const sp_ok_tensor&    W_shape,
+                     const sp_ok_q8_tensor& W_q8,
+                     const sp_ok_tensor&    X,
+                     sp_ok_tensor&          Y);
+
+// fp32-output variant for the Wo projection / LM head bridge.
+// Same divisor calculation as sp_matmul_ok_to_fp32 (W_shape provides
+// scale_recip + frobenius_scale).
+bool sp_matmul_ok_q8_to_fp32(const sp_ok_tensor&    W_shape,
+                             const sp_ok_q8_tensor& W_q8,
+                             const sp_ok_tensor&    X,
+                             float*                 Y_fp32,
+                             int                    out_rows,
+                             int                    n_cols);
+
 }  // namespace sp::engine

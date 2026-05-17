@@ -76,31 +76,20 @@ bool sp_forward_context_init(sp_forward_context& ctx,
         + 4096;
     ctx.layer_arena.reserve(per_layer_bytes);
 
-    // Phase 12 Step C: start the background prefetch worker when weights
-    // are in resident Q8 form. The worker races ahead of the forward
-    // path, double-buffering one layer's decoded weights per slot.
-    if (weights.use_q8) {
-        if (!ctx.q8_prefetcher.start(weights)) {
-            std::fprintf(stderr,
-                "[sp_forward] q8_prefetcher.start failed; falling back "
-                "to inline decode\n");
-            /* Keep the inline-decode arena around as a safety fallback. */
-            const int64_t ffn_elems = (int64_t)weights.d_ff * (int64_t)weights.n_embd;
-            const size_t  ffn_bytes_one = (size_t)ffn_elems * sizeof(sp_ok_t) + 4096;
-            ctx.q8_decode_arena.reserve(3 * ffn_bytes_one);
-        } else {
-            std::fprintf(stderr,
-                "[sp_forward] q8_prefetcher: dedicated worker thread launched, "
-                "2 slots * %.0f MB each\n",
-                (double)((size_t)weights.d_ff * (size_t)weights.n_embd *
-                         sizeof(sp_ok_t) * 7) / (1024.0 * 1024.0) / 7.0);
-        }
-    } else {
-        /* Step B-2 inline-decode arena: kept for the no-Q8 path so any
-         * future code that calls weight_decoded() inline still works. */
+    // Phase 12 Step D: matmul kernels now consume packed Q8 directly
+    // (sp_matmul_ok_q8 / sp_ffn_swiglu_to_fp32_q8) so the Step C
+    // prefetcher and the Step B-2 inline-decode arena are both retired
+    // under use_q8. The non-Q8 path still uses the FFN scratch arena
+    // sized for one layer's worth of decoded buffer (used by the
+    // existing weight_decoded() helper if anyone calls it).
+    if (!weights.use_q8) {
         const int64_t ffn_elems = (int64_t)weights.d_ff * (int64_t)weights.n_embd;
         const size_t  ffn_bytes_one = (size_t)ffn_elems * sizeof(sp_ok_t) + 4096;
         ctx.q8_decode_arena.reserve(3 * ffn_bytes_one);
+    } else {
+        std::fprintf(stderr,
+            "[sp_forward] Q8 mode: fused matmul path "
+            "(no decode workspace, no prefetch worker)\n");
     }
 
     // KV cache: K post-RoPE has frobenius_scale=1, scale_recip = matmul out
@@ -794,23 +783,19 @@ bool sp_forward_step(sp_forward_context& ctx,
     for (int L = 0; L < ctx.n_layers; ++L) {
         ctx.layer_arena.reset();
 
-        /* Phase 12 Step C: acquire layer L's decoded weights from the
-         * prefetcher. The worker thread has (hopefully) raced ahead and
-         * already decoded this layer into a slot; if not, this blocks
-         * until ready. References below into ctx.q8_prefetcher.wq(slot)
-         * etc. are stable until release(slot) is called at end of layer.
-         * When weights.use_q8 is false we read directly from weights.wq[L]. */
-        int q8_slot = -1;
-        if (weights.use_q8) {
-            q8_slot = ctx.q8_prefetcher.acquire(L);
-        }
-        const sp_ok_tensor& W_q  = weights.use_q8 ? ctx.q8_prefetcher.wq(q8_slot)       : weights.wq[L];
-        const sp_ok_tensor& W_k  = weights.use_q8 ? ctx.q8_prefetcher.wk(q8_slot)       : weights.wk[L];
-        const sp_ok_tensor& W_v  = weights.use_q8 ? ctx.q8_prefetcher.wv(q8_slot)       : weights.wv[L];
-        const sp_ok_tensor& W_o  = weights.use_q8 ? ctx.q8_prefetcher.wo(q8_slot)       : weights.wo[L];
-        const sp_ok_tensor& W_gate = weights.use_q8 ? ctx.q8_prefetcher.ffn_gate(q8_slot) : weights.ffn_gate[L];
-        const sp_ok_tensor& W_up   = weights.use_q8 ? ctx.q8_prefetcher.ffn_up(q8_slot)   : weights.ffn_up[L];
-        const sp_ok_tensor& W_down = weights.use_q8 ? ctx.q8_prefetcher.ffn_down(q8_slot) : weights.ffn_down[L];
+        /* Phase 12 Step D: the matmul kernels read packed Q8 weights
+         * directly (see sp_matmul_ok_q8 / sp_matmul_ok_q8_to_fp32 /
+         * sp_ffn_swiglu_to_fp32_q8). The Step C prefetcher path is
+         * obsolete under fused decode -- we no longer need a decoded
+         * scratch slot. For the non-Q8 path the existing references
+         * still bind to the resident sp_ok_tensor. */
+        const sp_ok_tensor& W_q    = weights.wq[L];
+        const sp_ok_tensor& W_k    = weights.wk[L];
+        const sp_ok_tensor& W_v    = weights.wv[L];
+        const sp_ok_tensor& W_o    = weights.wo[L];
+        const sp_ok_tensor& W_gate = weights.ffn_gate[L];
+        const sp_ok_tensor& W_up   = weights.ffn_up[L];
+        const sp_ok_tensor& W_down = weights.ffn_down[L];
 
         // Phase 2.3b iter 3 — per-layer SWA dispatch.
         // Gemma3 pattern: layer L is SWA-local iff (L+1) % period != 0.
@@ -852,12 +837,17 @@ bool sp_forward_step(sp_forward_context& ctx,
         if (!ctx.layer_arena.alloc_tensor(ctx.q_ok)) return false;
         if (!ctx.layer_arena.alloc_tensor(ctx.k_ok)) return false;
         if (!ctx.layer_arena.alloc_tensor(ctx.v_ok)) return false;
-        /* Phase 12 Step C: Q/K/V matmul reads from the per-layer W_q/W_k/W_v
-         * references bound above — either the prefetcher's decoded slot
-         * (use_q8) or the resident sp_ok_tensor (no Q8). */
-        if (!sp_matmul_ok(W_q, ctx.x_norm_ok, ctx.q_ok)) return false;
-        if (!sp_matmul_ok(W_k, ctx.x_norm_ok, ctx.k_ok)) return false;
-        if (!sp_matmul_ok(W_v, ctx.x_norm_ok, ctx.v_ok)) return false;
+        /* Phase 12 Step D: Q/K/V matmul. Under use_q8, fuse the decode
+         * into the multiply inner loop -- no 430 MB decoded scratch. */
+        if (weights.use_q8) {
+            if (!sp_matmul_ok_q8(W_q, weights.q8_wq[L], ctx.x_norm_ok, ctx.q_ok)) return false;
+            if (!sp_matmul_ok_q8(W_k, weights.q8_wk[L], ctx.x_norm_ok, ctx.k_ok)) return false;
+            if (!sp_matmul_ok_q8(W_v, weights.q8_wv[L], ctx.x_norm_ok, ctx.v_ok)) return false;
+        } else {
+            if (!sp_matmul_ok(W_q, ctx.x_norm_ok, ctx.q_ok)) return false;
+            if (!sp_matmul_ok(W_k, ctx.x_norm_ok, ctx.k_ok)) return false;
+            if (!sp_matmul_ok(W_v, ctx.x_norm_ok, ctx.v_ok)) return false;
+        }
 
         // 2c.5) Phase 2.3b: optional per-head Q/K norms (Gemma3 / Qwen3).
         // These reset frobenius_scale → 1, so subsequent RoPE re-encodes
@@ -1010,13 +1000,21 @@ bool sp_forward_step(sp_forward_context& ctx,
         // attn_out_ok now has frobenius_scale=1.
 
         // 2g) Wo projection → fp32 (absorbs pi^k via Theorem 4).
-        // Phase 12 Step C: W_o is bound at top of layer loop (prefetcher
-        // slot when use_q8, weights.wo[L] otherwise).
-        if (!sp_matmul_ok_to_fp32(W_o, ctx.attn_out_ok,
-                                    ctx.proj_out_fp32.data(),
-                                    n_embd, n_tokens)) {
-            std::fprintf(stderr, "[sp_forward] L%d Wo matmul failed\n", L);
-            return false;
+        // Phase 12 Step D: under use_q8, fused-Q8 path.
+        if (weights.use_q8) {
+            if (!sp_matmul_ok_q8_to_fp32(W_o, weights.q8_wo[L], ctx.attn_out_ok,
+                                          ctx.proj_out_fp32.data(),
+                                          n_embd, n_tokens)) {
+                std::fprintf(stderr, "[sp_forward] L%d Wo matmul (q8) failed\n", L);
+                return false;
+            }
+        } else {
+            if (!sp_matmul_ok_to_fp32(W_o, ctx.attn_out_ok,
+                                        ctx.proj_out_fp32.data(),
+                                        n_embd, n_tokens)) {
+                std::fprintf(stderr, "[sp_forward] L%d Wo matmul failed\n", L);
+                return false;
+            }
         }
 
         // 2g.5) Phase 2.3b: Gemma3 attn sandwich norm on Wo output.
@@ -1055,19 +1053,30 @@ bool sp_forward_step(sp_forward_context& ctx,
         // 2k) FFN → fp32 (absorbs ffn_down's frobenius_scale). Activation
         //     selected by ctx.ffn_act: SwiGLU (silu) for Llama / Qwen,
         //     GeGLU_tanh (gelu) for Gemma family.
-        /* Phase 12 Step C: W_gate / W_up / W_down are bound at top of
-         * layer loop. When use_q8 they all point into the same prefetcher
-         * slot for layer L; when not, into weights.ffn_*[L]. */
-        if (!sp_ffn_swiglu_to_fp32(ctx.x_norm_ok,
-                                     W_gate,
-                                     W_up,
-                                     W_down,
-                                     ctx.proj_out_fp32.data(),
-                                     n_tokens,
-                                     ctx.layer_arena,
-                                     ctx.ffn_act)) {
-            std::fprintf(stderr, "[sp_forward] L%d FFN failed\n", L);
-            return false;
+        /* Phase 12 Step D: fused-Q8 FFN under use_q8, otherwise the
+         * original sp_ffn_swiglu_to_fp32 path on resident sp_ok_tensors. */
+        if (weights.use_q8) {
+            if (!sp_ffn_swiglu_to_fp32_q8(ctx.x_norm_ok,
+                                            W_gate, weights.q8_ffn_gate[L],
+                                            W_up,   weights.q8_ffn_up[L],
+                                            W_down, weights.q8_ffn_down[L],
+                                            ctx.proj_out_fp32.data(),
+                                            n_tokens,
+                                            ctx.layer_arena,
+                                            ctx.ffn_act)) {
+                std::fprintf(stderr, "[sp_forward] L%d FFN (q8) failed\n", L);
+                return false;
+            }
+        } else {
+            if (!sp_ffn_swiglu_to_fp32(ctx.x_norm_ok,
+                                        W_gate, W_up, W_down,
+                                        ctx.proj_out_fp32.data(),
+                                        n_tokens,
+                                        ctx.layer_arena,
+                                        ctx.ffn_act)) {
+                std::fprintf(stderr, "[sp_forward] L%d FFN failed\n", L);
+                return false;
+            }
         }
 
         // 2k.5) Phase 2.3b: Gemma3 FFN sandwich norm on down output.
@@ -1083,12 +1092,8 @@ bool sp_forward_step(sp_forward_context& ctx,
         for (int i = 0; i < n_embd; ++i) {
             ctx.x_fp32[i] += ctx.proj_out_fp32[i];
         }
-
-        // Phase 12 Step C: release the prefetcher slot for layer L so the
-        // worker can refill it with the next layer's decoded weights.
-        if (weights.use_q8 && q8_slot >= 0) {
-            ctx.q8_prefetcher.release(q8_slot);
-        }
+        // Phase 12 Step D: no prefetcher slot to release -- the fused
+        // matmul reads packed Q8 directly.
     }
 
     // Advance the KV cache write head AFTER all layers' appends.

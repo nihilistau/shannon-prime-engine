@@ -256,4 +256,118 @@ bool sp_matmul_fp32_input_to_ok(const sp_ok_tensor& W,
     return true;
 }
 
+// ---------- Phase 12 Step D: fused packed-Q8 matmul ------------------------
+
+bool sp_matmul_ok_q8(const sp_ok_tensor&    W_shape,
+                     const sp_ok_q8_tensor& W_q8,
+                     const sp_ok_tensor&    X,
+                     sp_ok_tensor&          Y) {
+    /* Shape contract pulled from W_shape (data may be null, that's the
+     * point of Step B-2's resident packed storage). */
+    if (X.data == nullptr || Y.data == nullptr) return false;
+    if (W_shape.n_dims < 2 || X.n_dims < 2) return false;
+    if (W_q8.data == nullptr || W_q8.numel == 0) return false;
+    const int64_t M  = W_shape.shape[1];
+    const int64_t K  = W_shape.shape[0];
+    const int64_t K2 = X.shape[1];
+    const int64_t N  = X.shape[0];
+    if (K != K2) return false;
+    if (Y.n_dims < 2 || Y.shape[0] != N || Y.shape[1] != M) return false;
+    if ((size_t)(M * K) != W_q8.numel) return false;
+
+    const int8_t shift = W_q8.q8_shift;
+    const int nt = std::max(1, sp_threadpool_n_threads());
+
+    /* Output row i is independent -- partition M across threads. Each
+     * worker reads its slice of W_q8 packed bytes (2 B/elem) and decodes
+     * lane-by-lane into the sp_ok ring multiply.
+     *
+     * Cache behaviour: at 2 B/elem, an entire weight ROW for K=6912 fits
+     * in 13.5 KB -- well under L1 (typically 48 KB). For Gemma3-1B's
+     * ffn_down (M=1152, K=6912) the full matrix is 16 MB packed, fits in
+     * L3 on most workstations. The decode is a per-element sign-extend +
+     * shift, completed inside the inner k loop with no scratch buffer. */
+    sp_parallel_for([&](int thread_id) {
+        int64_t i0, i1;
+        split_rows(M, nt, thread_id, i0, i1);
+        for (int64_t i = i0; i < i1; ++i) {
+            for (int64_t j = 0; j < N; ++j) {
+                int64_t acc_a = 0;
+                int64_t acc_b = 0;
+                const sp_ok_q8_t* w_row = W_q8.data + i * K;
+                for (int64_t k = 0; k < K; ++k) {
+                    /* Decode-and-multiply, fused. The shift inlines as
+                     * two sll's; the ring multiply matches sp_matmul_ok. */
+                    const sp_ok_q8_t& w_q = w_row[k];
+                    const int64_t w_a = ((int64_t)w_q.a) << shift;
+                    const int64_t w_b = ((int64_t)w_q.b) << shift;
+                    const sp_ok_t& x_kj = X.data[k * N + j];
+                    acc_a += w_a * x_kj.a
+                           - (int64_t)SP_OK_OMEGA_NORM * w_b * x_kj.b;
+                    acc_b += w_a * x_kj.b
+                           + x_kj.a * w_b
+                           + w_b * x_kj.b;
+                }
+                Y.data[i * N + j] = sp_ok_t{ acc_a, acc_b };
+            }
+        }
+    });
+
+    Y.scale_recip     = W_shape.scale_recip     * X.scale_recip;
+    Y.frobenius_scale = W_shape.frobenius_scale * X.frobenius_scale;
+    return true;
+}
+
+bool sp_matmul_ok_q8_to_fp32(const sp_ok_tensor&    W_shape,
+                             const sp_ok_q8_tensor& W_q8,
+                             const sp_ok_tensor&    X,
+                             float*                 Y_fp32,
+                             int                    out_rows,
+                             int                    n_cols) {
+    if (X.data == nullptr || Y_fp32 == nullptr) return false;
+    if (W_shape.n_dims < 2 || X.n_dims < 2) return false;
+    if (W_q8.data == nullptr || W_q8.numel == 0) return false;
+    const int64_t M  = W_shape.shape[1];
+    const int64_t K  = W_shape.shape[0];
+    const int64_t K2 = X.shape[1];
+    const int64_t N  = X.shape[0];
+    if (K != K2 || (int64_t)out_rows != M || (int64_t)n_cols != N) return false;
+    if ((size_t)(M * K) != W_q8.numel) return false;
+
+    /* The decode multiplies by 2^shift; that becomes part of W's effective
+     * scale_recip when bridging to fp32. The divisor in the original path
+     * is W.scale_recip * X.scale_recip * W.frobenius * X.frobenius. For
+     * the q8 path we additionally multiply by 2^shift since each w_a is
+     * (int8 << shift). Matches what sp_matmul_ok_q8 produces in the int64
+     * Y output before the fp32 conversion. */
+    const double divisor =
+        (double)W_shape.scale_recip * (double)X.scale_recip *
+        (double)W_shape.frobenius_scale * (double)X.frobenius_scale;
+    if (divisor == 0.0) return false;
+
+    const int8_t shift = W_q8.q8_shift;
+    const int nt = std::max(1, sp_threadpool_n_threads());
+
+    sp_parallel_for([&](int thread_id) {
+        int64_t i0, i1;
+        split_rows(M, nt, thread_id, i0, i1);
+        for (int64_t i = i0; i < i1; ++i) {
+            const sp_ok_q8_t* w_row = W_q8.data + i * K;
+            for (int64_t j = 0; j < N; ++j) {
+                int64_t acc_a = 0;
+                for (int64_t k = 0; k < K; ++k) {
+                    const sp_ok_q8_t& w_q = w_row[k];
+                    const int64_t w_a = ((int64_t)w_q.a) << shift;
+                    const int64_t w_b = ((int64_t)w_q.b) << shift;
+                    const sp_ok_t& x_kj = X.data[k * N + j];
+                    acc_a += w_a * x_kj.a
+                           - (int64_t)SP_OK_OMEGA_NORM * w_b * x_kj.b;
+                }
+                Y_fp32[i * N + j] = (float)((double)acc_a / divisor);
+            }
+        }
+    });
+    return true;
+}
+
 }  // namespace sp::engine

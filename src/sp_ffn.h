@@ -52,4 +52,22 @@ bool sp_ffn_swiglu_to_fp32(const sp_ok_tensor& x,
                             sp_ok_arena&        scratch_arena,
                             sp_ffn_act          act = sp_ffn_act::SwiGLU);
 
+// -----------------------------------------------------------------------
+// Phase 12 Step D: fused-Q8 variant. Each of the three weight tensors
+// (gate, up, down) is supplied as a SHAPE descriptor (data may be null)
+// + a PACKED Q8 descriptor. The matmuls all run through sp_matmul_ok_q8*
+// with the shift inlined per-lane.
+// -----------------------------------------------------------------------
+bool sp_ffn_swiglu_to_fp32_q8(const sp_ok_tensor&    x,
+                              const sp_ok_tensor&    gate_w_shape,
+                              const sp_ok_q8_tensor& gate_w_q8,
+                              const sp_ok_tensor&    up_w_shape,
+                              const sp_ok_q8_tensor& up_w_q8,
+                              const sp_ok_tensor&    down_w_shape,
+                              const sp_ok_q8_tensor& down_w_q8,
+                              float*                 out_fp32,
+                              int                    n_tokens,
+                              sp_ok_arena&           scratch_arena,
+                              sp_ffn_act             act = sp_ffn_act::SwiGLU);
+
 }  // namespace sp::engine
