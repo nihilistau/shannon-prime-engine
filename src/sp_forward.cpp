@@ -74,6 +74,17 @@ bool sp_forward_context_init(sp_forward_context& ctx,
         + 4096;
     ctx.layer_arena.reserve(per_layer_bytes);
 
+    // Phase 12 Step B-2: decode workspace for resident Q8 weights. The
+    // FFN matmul needs all three of (gate, up, down) decoded
+    // simultaneously, so the arena must fit their SUM. Q/K/V/O reuse a
+    // single scratch with arena reset between calls. Worst case is
+    // 3 * ffn_gate elements at 16 B each.
+    {
+        const int64_t ffn_elems = (int64_t)weights.d_ff * (int64_t)weights.n_embd;
+        const size_t  ffn_bytes_one = (size_t)ffn_elems * sizeof(sp_ok_t) + 4096;
+        ctx.q8_decode_arena.reserve(3 * ffn_bytes_one);
+    }
+
     // KV cache: K post-RoPE has frobenius_scale=1, scale_recip = matmul out
     //          = wk.scale_recip * residual_scale = weights.scale_recip^2
     //          V keeps frobenius_scale = wv[0].frobenius_scale (pi^k or 1)
@@ -374,6 +385,166 @@ int sp_weights_apply_frobenius_shim(sp_weights& out,
 }
 
 // =========================================================================
+// Phase 12 Step B-2: convert resident weights to packed-int8 storage
+// =========================================================================
+//
+// For each shim-list sp_ok_tensor, pack its post-Frobenius coordinates
+// into a 2-byte-per-element sp_ok_q8_tensor (per-tensor power-of-2 shift)
+// stored in a parallel q8_layer_arenas[L] arena (~1/8 the size of the
+// original layer_arenas[L]). Then release the original layer_arenas[L]
+// back to the OS — that's where the memory win comes from.
+//
+// The original sp_ok_tensor descriptors (weights.wq[L] etc.) keep their
+// shape, scale_recip, and frobenius_scale fields but their `data`
+// pointers are nulled. The forward path checks weights.use_q8 and reads
+// from weights.q8_wq[L] etc., decoding into the per-call scratch in
+// sp_forward_context.
+
+int sp_weights_convert_to_q8(sp_weights& weights) {
+    if (weights.use_q8) {
+        std::fprintf(stderr,
+            "[sp-weights-q8] convert_to_q8: already converted; no-op.\n");
+        return 0;
+    }
+    if (weights.n_layers <= 0) return 0;
+
+    weights.q8_wq.resize(weights.n_layers);
+    weights.q8_wk.resize(weights.n_layers);
+    weights.q8_wv.resize(weights.n_layers);
+    weights.q8_wo.resize(weights.n_layers);
+    weights.q8_ffn_gate.resize(weights.n_layers);
+    weights.q8_ffn_up.resize(weights.n_layers);
+    weights.q8_ffn_down.resize(weights.n_layers);
+    weights.q8_layer_arenas.resize(weights.n_layers);
+
+    int n_packed = 0;
+    size_t total_freed_bytes = 0;
+    size_t total_q8_bytes    = 0;
+    int    shift_min = 127, shift_max = -1;
+    long long sum_shift = 0;
+
+    /* per-layer pack: compute total q8 storage size for the 7 shim
+     * tensors in this layer, reserve the q8 arena at that exact size,
+     * then pack each tensor through alloc_tensor_q8 + sp_ok_q8_encode_array. */
+    for (int L = 0; L < weights.n_layers; ++L) {
+        const sp_ok_tensor* slots[7] = {
+            &weights.wq[L], &weights.wk[L], &weights.wv[L], &weights.wo[L],
+            &weights.ffn_gate[L], &weights.ffn_up[L], &weights.ffn_down[L]
+        };
+        sp_ok_q8_tensor* q8_slots[7] = {
+            &weights.q8_wq[L], &weights.q8_wk[L], &weights.q8_wv[L],
+            &weights.q8_wo[L], &weights.q8_ffn_gate[L],
+            &weights.q8_ffn_up[L], &weights.q8_ffn_down[L]
+        };
+
+        size_t bytes_needed = 0;
+        for (int s = 0; s < 7; ++s) {
+            const size_t n = (size_t)slots[s]->numel();
+            bytes_needed += n * sizeof(sp_ok_q8_t) + 64;
+        }
+        bytes_needed += 4096;  /* alignment / metadata slack */
+
+        weights.q8_layer_arenas[L].reserve(bytes_needed);
+
+        for (int s = 0; s < 7; ++s) {
+            sp_ok_tensor&    src = const_cast<sp_ok_tensor&>(*slots[s]);
+            sp_ok_q8_tensor& dst = *q8_slots[s];
+
+            const size_t n = (size_t)src.numel();
+            if (n == 0 || src.data == nullptr) continue;
+
+            if (!weights.q8_layer_arenas[L].alloc_tensor_q8(dst, n)) {
+                std::fprintf(stderr,
+                    "[sp-weights-q8] L%d slot=%d alloc_tensor_q8 failed "
+                    "(n=%zu, bytes=%zu, arena_remaining=%zu)\n",
+                    L, s, n, n * sizeof(sp_ok_q8_t),
+                    weights.q8_layer_arenas[L].remaining());
+                return -1;
+            }
+            int8_t shift = sp_ok_q8_encode_array(dst.data, src.data, n);
+            dst.q8_shift        = shift;
+            dst.scale_recip     = src.scale_recip;
+            dst.frobenius_scale = src.frobenius_scale;
+            dst.frobenius_p     = 41;   /* matches the Frobenius-shim default */
+            dst.frobenius_k     = 8;
+
+            /* Null the original sp_ok_t pointer. Shape, scale_recip and
+             * frobenius_scale stay on the descriptor for the decode
+             * helper to consume. */
+            src.data = nullptr;
+
+            ++n_packed;
+            if ((int)shift < shift_min) shift_min = (int)shift;
+            if ((int)shift > shift_max) shift_max = (int)shift;
+            sum_shift += (long long)shift;
+            total_q8_bytes += n * sizeof(sp_ok_q8_t);
+        }
+
+        /* Release the original layer arena back to the OS. Move-assign
+         * the arena into a temporary that immediately destructs — the
+         * sp_ok_arena destructor calls VirtualFree (Windows) / free
+         * (POSIX). Net effect: ~430 MB freed per layer on Gemma3-1B. */
+        total_freed_bytes += weights.layer_arenas[L].capacity();
+        {
+            sp_ok_arena released = std::move(weights.layer_arenas[L]);
+        }
+    }
+
+    weights.use_q8 = true;
+    std::fprintf(stderr,
+        "[sp-weights-q8] convert_to_q8: packed %d tensors  "
+        "shift=[%d..%d] mean=%.1f\n",
+        n_packed, shift_min, shift_max,
+        n_packed ? ((double)sum_shift / (double)n_packed) : 0.0);
+    std::fprintf(stderr,
+        "[sp-weights-q8] memory: released %.2f GB original sp_ok_t arena,  "
+        "allocated %.2f GB packed q8 storage,  ratio=%.2fx\n",
+        (double)total_freed_bytes / (1024.0 * 1024.0 * 1024.0),
+        (double)total_q8_bytes    / (1024.0 * 1024.0 * 1024.0),
+        total_q8_bytes
+            ? (double)total_freed_bytes / (double)total_q8_bytes
+            : 0.0);
+    return n_packed;
+}
+
+// =========================================================================
+// Phase 12 Step B-2: decode helper for the forward path
+// =========================================================================
+//
+// `weight_decoded` returns a const sp_ok_tensor& usable by the existing
+// matmul kernels. When weights.use_q8 is false, returns the original
+// sp_ok_tensor unchanged (zero overhead). When use_q8 is true, decodes
+// the corresponding sp_ok_q8_tensor into `scratch`, sized from the
+// original descriptor's shape (which we kept around for exactly this
+// purpose), and returns the scratch.
+//
+// `arena` must have enough remaining capacity for one full decoded
+// tensor at 16 B/element. Caller is responsible for resetting the arena
+// between independent decodes if memory is tight; sp_forward_context's
+// q8_decode_arena is sized for the largest expected weight.
+
+static const sp_ok_tensor& weight_decoded(sp_ok_arena&            arena,
+                                          sp_ok_tensor&           scratch,
+                                          const sp_ok_tensor&     shape_src,
+                                          const sp_ok_q8_tensor&  packed,
+                                          bool                    use_q8) {
+    if (!use_q8) return shape_src;
+    /* Re-establish shape on the scratch from the shape_src descriptor. */
+    scratch.reset(shape_src.n_dims, shape_src.shape);
+    if (!arena.alloc_tensor(scratch)) {
+        /* Decoder cannot proceed — leave scratch.data nullptr; the
+         * matmul will see it and bail out. */
+        scratch.data = nullptr;
+        return scratch;
+    }
+    sp_ok_q8_decode_array(scratch.data, packed.data,
+                          packed.numel, packed.q8_shift);
+    scratch.scale_recip     = packed.scale_recip;
+    scratch.frobenius_scale = packed.frobenius_scale;
+    return scratch;
+}
+
+// =========================================================================
 // Weight init (skeleton — Phase 2.2c will fill this in via LlamaWeights)
 // =========================================================================
 
@@ -500,9 +671,31 @@ bool sp_forward_step(sp_forward_context& ctx,
         if (!ctx.layer_arena.alloc_tensor(ctx.q_ok)) return false;
         if (!ctx.layer_arena.alloc_tensor(ctx.k_ok)) return false;
         if (!ctx.layer_arena.alloc_tensor(ctx.v_ok)) return false;
-        if (!sp_matmul_ok(weights.wq[L], ctx.x_norm_ok, ctx.q_ok)) return false;
-        if (!sp_matmul_ok(weights.wk[L], ctx.x_norm_ok, ctx.k_ok)) return false;
-        if (!sp_matmul_ok(weights.wv[L], ctx.x_norm_ok, ctx.v_ok)) return false;
+        /* Phase 12 Step B-2: Q/K/V matmul. When weights.use_q8 is true,
+         * each weight is decoded from the packed Q8 storage into
+         * ctx.q8_decode_scratch (arena reset between decodes since these
+         * three calls don't need the prior decoded buffer past the call). */
+        {
+            ctx.q8_decode_arena.reset();
+            const sp_ok_tensor& W_q = weight_decoded(
+                ctx.q8_decode_arena, ctx.q8_decode_scratch,
+                weights.wq[L], weights.q8_wq[L], weights.use_q8);
+            if (!sp_matmul_ok(W_q, ctx.x_norm_ok, ctx.q_ok)) return false;
+        }
+        {
+            ctx.q8_decode_arena.reset();
+            const sp_ok_tensor& W_k = weight_decoded(
+                ctx.q8_decode_arena, ctx.q8_decode_scratch,
+                weights.wk[L], weights.q8_wk[L], weights.use_q8);
+            if (!sp_matmul_ok(W_k, ctx.x_norm_ok, ctx.k_ok)) return false;
+        }
+        {
+            ctx.q8_decode_arena.reset();
+            const sp_ok_tensor& W_v = weight_decoded(
+                ctx.q8_decode_arena, ctx.q8_decode_scratch,
+                weights.wv[L], weights.q8_wv[L], weights.use_q8);
+            if (!sp_matmul_ok(W_v, ctx.x_norm_ok, ctx.v_ok)) return false;
+        }
 
         // 2c.5) Phase 2.3b: optional per-head Q/K norms (Gemma3 / Qwen3).
         // These reset frobenius_scale → 1, so subsequent RoPE re-encodes
@@ -655,11 +848,17 @@ bool sp_forward_step(sp_forward_context& ctx,
         // attn_out_ok now has frobenius_scale=1.
 
         // 2g) Wo projection → fp32 (absorbs pi^k via Theorem 4).
-        if (!sp_matmul_ok_to_fp32(weights.wo[L], ctx.attn_out_ok,
-                                    ctx.proj_out_fp32.data(),
-                                    n_embd, n_tokens)) {
-            std::fprintf(stderr, "[sp_forward] L%d Wo matmul failed\n", L);
-            return false;
+        {
+            ctx.q8_decode_arena.reset();
+            const sp_ok_tensor& W_o = weight_decoded(
+                ctx.q8_decode_arena, ctx.q8_decode_scratch,
+                weights.wo[L], weights.q8_wo[L], weights.use_q8);
+            if (!sp_matmul_ok_to_fp32(W_o, ctx.attn_out_ok,
+                                        ctx.proj_out_fp32.data(),
+                                        n_embd, n_tokens)) {
+                std::fprintf(stderr, "[sp_forward] L%d Wo matmul failed\n", L);
+                return false;
+            }
         }
 
         // 2g.5) Phase 2.3b: Gemma3 attn sandwich norm on Wo output.
@@ -698,10 +897,23 @@ bool sp_forward_step(sp_forward_context& ctx,
         // 2k) FFN → fp32 (absorbs ffn_down's frobenius_scale). Activation
         //     selected by ctx.ffn_act: SwiGLU (silu) for Llama / Qwen,
         //     GeGLU_tanh (gelu) for Gemma family.
+        /* Phase 12 Step B-2: FFN needs all 3 weights live simultaneously,
+         * so decode them into separate scratches without resetting the
+         * arena between them. */
+        ctx.q8_decode_arena.reset();
+        const sp_ok_tensor& W_gate = weight_decoded(
+            ctx.q8_decode_arena, ctx.q8_decode_scratch,
+            weights.ffn_gate[L], weights.q8_ffn_gate[L], weights.use_q8);
+        const sp_ok_tensor& W_up = weight_decoded(
+            ctx.q8_decode_arena, ctx.q8_decode_scratch_b,
+            weights.ffn_up[L],   weights.q8_ffn_up[L],   weights.use_q8);
+        const sp_ok_tensor& W_down = weight_decoded(
+            ctx.q8_decode_arena, ctx.q8_decode_scratch_c,
+            weights.ffn_down[L], weights.q8_ffn_down[L], weights.use_q8);
         if (!sp_ffn_swiglu_to_fp32(ctx.x_norm_ok,
-                                     weights.ffn_gate[L],
-                                     weights.ffn_up[L],
-                                     weights.ffn_down[L],
+                                     W_gate,
+                                     W_up,
+                                     W_down,
                                      ctx.proj_out_fp32.data(),
                                      n_tokens,
                                      ctx.layer_arena,

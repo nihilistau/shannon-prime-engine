@@ -238,6 +238,25 @@ bool sp_weights_load_from_fp16_source(sp_weights& out,
         "[sp-weights-loader] mode=%s  shim-set=%d  bypass-set=%d  "
         "missing=%d  shimmed=%d\n",
         mode, n_set_shim, n_set_bypass, n_missing, n_shimmed);
+
+    // --- Phase 12 Step B-2: resident packed-int8 storage per --frobenius-q8.
+    // Runs AFTER the Frobenius shim so we pack the post-phi^k coordinates.
+    // Releases the original layer arenas back to the OS (memory win
+    // appears in the next process metric, not just inside this function).
+    if (cfg.frobenius_q8) {
+        if (!(cfg.frobenius_quant || cfg.sato_tate_mix)) {
+            std::fprintf(stderr,
+                "[sp-weights-loader] WARNING: --frobenius-q8 set without "
+                "--frobenius-quant or --sato-tate-mix; packing raw "
+                "(a, 0) weights -- compression still works but the "
+                "Theorem 4 cancellation hasn't been applied.\n");
+        }
+        int n_packed = sp_weights_convert_to_q8(out);
+        std::fprintf(stderr,
+            "[sp-weights-loader] mode=%s + Q8  packed=%d tensors  "
+            "(use_q8=%d)\n",
+            mode, n_packed, out.use_q8 ? 1 : 0);
+    }
     return true;
 }
 

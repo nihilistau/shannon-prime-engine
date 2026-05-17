@@ -220,6 +220,10 @@ static void usage(const char* prog) {
         "  --frobenius-quant-p <p>      Split prime in K=Q(√-163). Default 41\n"
         "                               (smallest split prime, |a_41|=1).\n"
         "  --frobenius-quant-k <k>      Frobenius power. Default 8 (gives fp8).\n"
+        "  --frobenius-q8               Resident packed-int8 weight storage\n"
+        "                               (~8x ok_arena compression). Stacks on\n"
+        "                               --frobenius-quant; the int8 lattice is\n"
+        "                               applied AFTER phi_p^k.\n"
         "\n"
         "  --sato-tate-mix p1,k1,p2,k2  Asymmetric mixed-precision (Config E):\n"
         "                               inert prime p1 (zero-drift channel) +\n"
@@ -315,6 +319,7 @@ static int parse_config_flag(sp::engine::Config& cfg, const char* a, const char*
     if (a_eq("--frobenius-quant"))                  { cfg.frobenius_quant = true; return 1; }
     if (a_eq("--frobenius-quant-p") && has_next)    { cfg.frobenius_p = std::atoll(next); return 2; }
     if (a_eq("--frobenius-quant-k") && has_next)    { cfg.frobenius_k = std::atoll(next); return 2; }
+    if (a_eq("--frobenius-q8"))                     { cfg.frobenius_q8 = true; return 1; }
     if (a_eq("--sato-tate-mix") && has_next) {
         // Format: "p1,k1,p2,k2". Defaults stay if parse fails.
         long long a, b, c, d;

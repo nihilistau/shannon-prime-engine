@@ -165,6 +165,15 @@ struct Config {
     int64_t     st_k1              = 2;      // phi_p1^k1 (k1 must be even)
     int64_t     st_p2              = 41;     // split prime (bounded-drift)
     int64_t     st_k2              = 8;      // phi_p2^k2
+
+    // Phase 12 Step B-2: --frobenius-q8.
+    // After the Frobenius shim has run, round-trip every shim-list
+    // sp_ok_tensor through the packed int8 lattice (sp_ok_q8_t pair + per-
+    // tensor power-of-2 shift) and decode back into the same arena. The
+    // forward path is unchanged; every weight now carries the int8
+    // quantization error. Used to measure end-to-end PPL drift from Q8
+    // before committing to resident packed storage in Step C.
+    bool        frobenius_q8       = false;
 };
 
 // Seed Config fields from environment variables. Called by each CLI verb

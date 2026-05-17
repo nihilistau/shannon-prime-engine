@@ -102,6 +102,20 @@ struct sp_forward_context {
 
     // Poncelet adaptive depth tracking (Paper A §7, Theorem 5).
     sp_ok_t poncelet_delta = sp_ok_t{ 0, 0 };
+
+    // Phase 12 Step B-2: decode workspace for resident Q8 weights.
+    // sp_weights with use_q8=true releases its layer_arenas back to the
+    // OS; the matmul kernels still expect sp_ok_t pointers, so we lazily
+    // decode each Q8 weight tensor into one of these scratches at the
+    // matmul call site. Q/K/V/O matmuls reuse `q8_decode_scratch` (arena
+    // reset between calls). The FFN call needs three weights live
+    // simultaneously (gate, up, down) so it uses all three scratches
+    // without a reset between them; the arena is sized for the sum of
+    // those three (~380 MB on Gemma3-1B).
+    sp_ok_arena   q8_decode_arena;
+    sp_ok_tensor  q8_decode_scratch;
+    sp_ok_tensor  q8_decode_scratch_b;
+    sp_ok_tensor  q8_decode_scratch_c;
 };
 
 // -----------------------------------------------------------------------
@@ -129,6 +143,21 @@ struct sp_weights {
     std::vector<sp_ok_tensor> ffn_gate;        //                        [n_embd, d_ff]
     std::vector<sp_ok_tensor> ffn_up;          //                        [n_embd, d_ff]
     std::vector<sp_ok_tensor> ffn_down;        //                        [d_ff,   n_embd]
+
+    // Phase 12 Step B-2: resident packed-int8 storage. When use_q8 is true,
+    // the shim-list sp_ok_tensors above have their data pointers cleared
+    // (their layer arenas are released back to the OS) and the matmul
+    // weights live in these q8_* tensors instead. The forward path lazily
+    // decodes them into a per-call scratch (sp_forward_context::q8_decode_*).
+    bool                              use_q8 = false;
+    std::vector<sp_ok_q8_tensor>      q8_wq;       // post-Frobenius packed
+    std::vector<sp_ok_q8_tensor>      q8_wk;
+    std::vector<sp_ok_q8_tensor>      q8_wv;
+    std::vector<sp_ok_q8_tensor>      q8_wo;
+    std::vector<sp_ok_q8_tensor>      q8_ffn_gate;
+    std::vector<sp_ok_q8_tensor>      q8_ffn_up;
+    std::vector<sp_ok_q8_tensor>      q8_ffn_down;
+    std::vector<sp_ok_arena>          q8_layer_arenas;  // ~1/8 of layer_arenas
 
     // Bypass-list (fp32 norms; scale-reset valve per Phase 1.7 policy):
     std::vector<std::vector<float>> attn_norm_w;       // per-layer [n_embd]
@@ -165,6 +194,24 @@ struct sp_weights {
 // -----------------------------------------------------------------------
 // Top-level forward functions.
 // -----------------------------------------------------------------------
+
+// Phase 12 Step B-2: convert shim-list sp_ok_tensors to resident packed
+// int8 storage. Allocates q8_layer_arenas (8x smaller than the live
+// arenas), packs every shim-list tensor (post-Frobenius coordinates) into
+// the corresponding q8_*[L] descriptor with a per-tensor power-of-2 shift,
+// then releases the original layer_arenas[L] back to the OS. After this
+// runs:
+//   - weights.wq[L].data == nullptr (and friends) -- the unpacked sp_ok_t
+//     buffers no longer exist; any matmul that tries to read them
+//     directly will crash. Forward code must check weights.use_q8 and
+//     dispatch through the decode scratch in sp_forward_context.
+//   - weights.use_q8 == true
+//   - weights.q8_wq[L].numel == old weights.wq[L].numel
+//   - weights.q8_wq[L] carries scale_recip / frobenius_scale / p / k.
+// Returns the count of tensors packed. Bypass-list tensors (tok_embed,
+// lm_head, norms) are NOT affected. Idempotent: calling on an already-
+// converted sp_weights is a no-op.
+int sp_weights_convert_to_q8(sp_weights& weights);
 
 // Run a single forward step: given a token id, produce logits[vocab].
 //
