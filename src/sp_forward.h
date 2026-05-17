@@ -221,6 +221,24 @@ struct sp_forward_context {
     // stopped on context destruct.
     sp_q8_prefetcher q8_prefetcher;
 
+    // Phase 13.C: optional long-term memory bank. When `lt_mem` is non-null
+    // and `lt_mem_alpha > 0`, the forward path will recall a v_hat from the
+    // bank per (layer, head, token) after attention and add `alpha * v_hat`
+    // to attn_out_ok before the Wo projection.
+    //
+    // Pointer-only — the bank is owned by the caller (the CLI), so the
+    // forward context doesn't manage its lifetime. Stays null in normal
+    // (non-memory) inference.
+    struct sp_lt_memory* lt_mem        = nullptr;
+    float                lt_mem_alpha  = 0.0f;
+    double               lt_mem_norm_thr = 1.0;
+
+    // Phase 13.C recall scratch: per-(layer, head, token) Q decode and
+    // v_hat output. Length = head_dim each (lazily sized when lt_mem
+    // is engaged).
+    std::vector<float> lt_q_decode;
+    std::vector<float> lt_v_hat;
+
     // Phase 12 Step B-2: decode workspace for resident Q8 weights.
     // sp_weights with use_q8=true releases its layer_arenas back to the
     // OS; the matmul kernels still expect sp_ok_t pointers, so we lazily

@@ -14,6 +14,7 @@
 #include "sp_matmul.h"
 #include "sp_ok_encode.h"
 #include "sp_rope.h"
+#include "sp_lt_memory.h"
 
 extern "C" {
 #include "../lib/shannon-prime/core/sp_frobenius.h"
@@ -1044,6 +1045,85 @@ bool sp_forward_step_prefill(sp_forward_context& ctx,
                                         ctx.attn_logit_softcap);
         }
         // attn_out_ok now has frobenius_scale=1.
+
+        // ---- Phase 13.C: Algebraic Resonance Memory recall + inject ----
+        // For each (t, h), decode the post-RoPE Q vector from ctx.q_ok,
+        // query the (L, kv_h(h)) slab, and add alpha * v_hat into
+        // attn_out_ok in-place. The bank's slab-norm cache short-circuits
+        // empty / below-threshold slabs in O(1) (no NTT cost).
+        //
+        // Invariant: ctx.lt_mem == nullptr OR ctx.lt_mem_alpha == 0
+        // means the entire block is skipped — bit-identical to the
+        // pre-Phase-13.C path.
+        if (ctx.lt_mem != nullptr && ctx.lt_mem_alpha > 0.0f) {
+            const double q_divisor =
+                (double)ctx.q_ok.scale_recip * (double)ctx.q_ok.frobenius_scale;
+            if (q_divisor != 0.0) {
+                /* Lazy-size scratch (head_dim known per ctx, won't change). */
+                if ((int)ctx.lt_q_decode.size() < head_dim) {
+                    ctx.lt_q_decode.assign((size_t)head_dim, 0.0f);
+                }
+                if ((int)ctx.lt_v_hat.size() < head_dim) {
+                    ctx.lt_v_hat.assign((size_t)head_dim, 0.0f);
+                }
+                const int64_t S_attn = ctx.attn_out_ok.scale_recip;
+                const double  alpha_S = (double)ctx.lt_mem_alpha * (double)S_attn;
+
+                for (int t = 0; t < n_tokens; ++t) {
+                    const int64_t q_row_t = (int64_t)t * (int64_t)d_q;
+                    const int64_t out_row_t = q_row_t;  /* same shape as q_ok */
+                    for (int h = 0; h < n_head; ++h) {
+                        const int kv_h = (h * n_kv_head) / n_head;
+                        const int64_t head_off = (int64_t)h * head_dim;
+
+                        /* Decode Q[t, h, :] → fp32 (post-RoPE, frob=1) and
+                         * accumulate ||q||^2 in the same pass.  We need
+                         * ||q||^2 to normalize the HRR-natural scaling: the
+                         * recall identity yields v_hat ≈ ||q||^2 · v_j + noise,
+                         * so dividing by ||q||^2 brings v_hat back to the
+                         * same magnitude scale as the underlying V. */
+                        double q_l2sq = 0.0;
+                        for (int d = 0; d < head_dim; ++d) {
+                            const sp_ok_t& q_d =
+                                ctx.q_ok.data[q_row_t + head_off + d];
+                            const float qf =
+                                (float)((double)q_d.a / q_divisor);
+                            ctx.lt_q_decode[(size_t)d] = qf;
+                            q_l2sq += (double)qf * (double)qf;
+                        }
+                        if (q_l2sq < 1e-12) continue;
+
+                        bool engaged = false;
+                        if (!sp_lt_memory_recall_for_attn(
+                                *ctx.lt_mem, L, kv_h,
+                                ctx.lt_q_decode.data(),
+                                ctx.lt_v_hat.data(),
+                                ctx.lt_mem_norm_thr,
+                                &engaged)) {
+                            std::fprintf(stderr,
+                                "[sp_forward] L%d t=%d h=%d "
+                                "lt_memory recall failed\n", L, t, h);
+                            continue;
+                        }
+                        if (!engaged) continue;
+
+                        /* Inject α·(v_hat / ||q||^2) into attn_out_ok[t,h,:].a.
+                         * attn_out_ok carries scale_recip = S, frob_scale = 1,
+                         * so the integer increment is round(scaled·S). */
+                        const double inv_q_l2sq = 1.0 / q_l2sq;
+                        const double alpha_norm = alpha_S * inv_q_l2sq;
+                        for (int d = 0; d < head_dim; ++d) {
+                            const double bias_d =
+                                alpha_norm * (double)ctx.lt_v_hat[(size_t)d];
+                            const int64_t bias_int = (int64_t)std::llrint(bias_d);
+                            ctx.attn_out_ok.data[out_row_t + head_off + d].a
+                                += bias_int;
+                        }
+                    }
+                }
+            }
+        }
+        // ---- end Phase 13.C recall + inject ----
 
         // 2g) Wo projection → fp32 (absorbs pi^k via Theorem 4).
         // Phase 12 Step D: under use_q8, fused-Q8 path.

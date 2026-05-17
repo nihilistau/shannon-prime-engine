@@ -1163,6 +1163,8 @@ int main(int argc, char** argv) {
             const bool use_lt_memory =
                 (mem_env != nullptr) && (mem_env[0] && mem_env[0] != '0');
             sp::engine::sp_lt_memory lt_mem{};
+            float lt_mem_alpha = 0.0f;
+            double lt_mem_norm_thr = 1.0;
             if (use_lt_memory) {
                 if (!sp::engine::sp_lt_memory_init(
                         lt_mem, ctx.n_layers, ctx.n_kv_head, ctx.head_dim,
@@ -1170,6 +1172,30 @@ int main(int argc, char** argv) {
                     std::fprintf(stderr,
                         "[sp-engine] perplexity-native: sp_lt_memory_init "
                         "failed — disabling memory\n");
+                } else {
+                    /* Phase 13.C: hook the bank into the forward context so
+                     * the recall/inject block in sp_forward_step_prefill
+                     * fires per (layer, head, token). alpha=0 (default)
+                     * keeps it a no-op for strict invariance verification. */
+                    const char* alpha_env =
+                        std::getenv("SP_ENGINE_MEMORY_ALPHA");
+                    if (alpha_env && alpha_env[0]) {
+                        lt_mem_alpha = (float)std::atof(alpha_env);
+                    }
+                    const char* thr_env =
+                        std::getenv("SP_ENGINE_MEMORY_THRESHOLD");
+                    if (thr_env && thr_env[0]) {
+                        lt_mem_norm_thr = std::atof(thr_env);
+                    }
+                    const char* stride_env =
+                        std::getenv("SP_ENGINE_MEMORY_WRITE_STRIDE");
+                    if (stride_env && stride_env[0]) {
+                        int s = std::atoi(stride_env);
+                        if (s >= 1) lt_mem.write_stride = s;
+                    }
+                    ctx.lt_mem        = &lt_mem;
+                    ctx.lt_mem_alpha  = lt_mem_alpha;
+                    ctx.lt_mem_norm_thr = lt_mem_norm_thr;
                 }
             }
             std::fprintf(stderr,
@@ -1178,6 +1204,13 @@ int main(int argc, char** argv) {
                 mem_env ? mem_env : "(unset)",
                 use_lt_memory ? "TRUE (ARM write hook at chunk boundary)"
                               : "false (no long-term memory)");
+            if (use_lt_memory) {
+                std::fprintf(stderr,
+                    "[sp-engine] perplexity-native: "
+                    "lt_mem_alpha=%.4f  lt_mem_norm_thr=%.3e  "
+                    "write_stride=%d  (alpha=0 → recall strict no-op)\n",
+                    lt_mem_alpha, lt_mem_norm_thr, lt_mem.write_stride);
+            }
 
             for (int c = 0; c < eval_chunks_n; ++c) {
                 for (int t = 0; t < n_ctx; ++t) {
@@ -1268,9 +1301,12 @@ int main(int argc, char** argv) {
             if (use_lt_memory) {
                 std::fprintf(stderr,
                     "[sp-engine] sp_lt_memory: total_writes=%llu  "
-                    "total_evictions=%llu  n_slabs=%d\n",
+                    "total_evictions=%llu  total_recalls=%llu  "
+                    "total_engages=%llu  n_slabs=%d\n",
                     (unsigned long long)lt_mem.total_writes,
                     (unsigned long long)lt_mem.total_evictions,
+                    (unsigned long long)lt_mem.total_recalls,
+                    (unsigned long long)lt_mem.total_engages,
                     lt_mem.n_slabs);
                 /* Sample a handful of slab norms across layers. */
                 const int sample_layers[] = { 0, ctx.n_layers / 4,

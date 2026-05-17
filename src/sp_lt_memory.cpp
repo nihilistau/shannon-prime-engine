@@ -44,8 +44,15 @@ bool sp_lt_memory_init(sp_lt_memory& mem,
     mem.write_scratch_4N.assign((size_t)4 * SP_ARM_RING_N, 0);
     mem.write_int_scratch.assign((size_t)SP_ARM_RING_N,    0);
 
+    /* Phase 13.C recall scratch. */
+    mem.inv_q_fp32_scratch.assign((size_t)SP_ARM_RING_N, 0.0f);
+    mem.norm_scratch_2N.assign((size_t)2 * SP_ARM_RING_N, 0);
+    mem.slab_norm_cache.assign((size_t)mem.n_slabs, 0.0);
+
     mem.total_writes    = 0;
     mem.total_evictions = 0;
+    mem.total_recalls   = 0;
+    mem.total_engages   = 0;
 
     std::fprintf(stderr,
         "[sp_lt_memory] init: n_layers=%d n_kv_head=%d head_dim=%d "
@@ -104,9 +111,10 @@ bool sp_lt_memory_write_evict(sp_lt_memory& mem,
         }
         const int64_t T_stride = K_layer.shape[0];   /* = n_ctx */
 
+        const int stride = (mem.write_stride > 0) ? mem.write_stride : 1;
         for (int kv_h = 0; kv_h < n_kv_head; ++kv_h) {
             const int slab = L * n_kv_head + kv_h;
-            for (int t = 0; t < n_tokens; ++t) {
+            for (int t = 0; t < n_tokens; t += stride) {
                 /* Decode K[kv_h, :, t] and V[kv_h, :, t] from sp_ok_t
                  * to fp32. Cache layout: data[(kv_h*head_dim + d) *
                  * T_stride + t], col-major-by-t. */
@@ -128,6 +136,23 @@ bool sp_lt_memory_write_evict(sp_lt_memory& mem,
         }
     }
     mem.total_evictions += 1;
+
+    /* Refresh per-slab norm cache so recall_for_attn can short-circuit
+     * in O(1) without paying for an inverse NTT per query. One inverse
+     * NTT per slab per chunk (~26 on Gemma3-1B) is dwarfed by the
+     * thousands of per-token recalls that follow. */
+    for (int slab = 0; slab < mem.n_slabs; ++slab) {
+        const uint64_t* slab_q1 =
+            mem.bank.M_q1 + (size_t)slab * (size_t)SP_ARM_RING_N;
+        const uint64_t* slab_q2 =
+            mem.bank.M_q2 + (size_t)slab * (size_t)SP_ARM_RING_N;
+        /* Hand the bank's M_q1/q2 pointers to sp_arm_bank_norm via a
+         * tiny temporary bank descriptor that points at this slab as
+         * slab 0. Simpler: call sp_arm_bank_norm with the real bank. */
+        mem.slab_norm_cache[(size_t)slab] =
+            sp_arm_bank_norm(&mem.bank, slab, mem.norm_scratch_2N.data());
+        (void)slab_q1; (void)slab_q2;
+    }
     return true;
 }
 
@@ -136,12 +161,50 @@ double sp_lt_memory_slab_norm(const sp_lt_memory& mem,
     if (layer < 0 || layer >= mem.n_layers) return 0.0;
     if (kv_head < 0 || kv_head >= mem.n_kv_head) return 0.0;
     const int slab = layer * mem.n_kv_head + kv_head;
-    /* sp_arm_bank_norm needs 2*N uint64 scratch. We can reuse the
-     * write_scratch_4N (only need half). The function is const-ish
-     * in semantics (doesn't mutate the bank) but takes a non-const
-     * scratch pointer; cast away const on the scratch member. */
-    auto& mut_scratch = const_cast<sp_lt_memory&>(mem).write_scratch_4N;
+    /* Prefer the cache (refreshed at every eviction); fall back to a
+     * live compute if the bank was used differently (e.g. test mode). */
+    if (!mem.slab_norm_cache.empty()) {
+        return mem.slab_norm_cache[(size_t)slab];
+    }
+    auto& mut_scratch = const_cast<sp_lt_memory&>(mem).norm_scratch_2N;
     return sp_arm_bank_norm(&mem.bank, slab, mut_scratch.data());
+}
+
+bool sp_lt_memory_recall_for_attn(sp_lt_memory& mem,
+                                    int layer, int kv_head,
+                                    const float* q_vec,
+                                    float* v_hat_out,
+                                    double norm_thr,
+                                    bool* engaged) {
+    if (engaged) *engaged = false;
+    if (layer < 0 || layer >= mem.n_layers) return false;
+    if (kv_head < 0 || kv_head >= mem.n_kv_head) return false;
+    if (!q_vec || !v_hat_out) return false;
+
+    const int slab = layer * mem.n_kv_head + kv_head;
+    mem.total_recalls += 1;
+
+    /* Cheap O(1) threshold check via the cached slab norm. Empty bank
+     * (norm = 0) short-circuits here without paying any NTT cost. */
+    const double slab_norm = (mem.slab_norm_cache.empty())
+        ? 0.0
+        : mem.slab_norm_cache[(size_t)slab];
+    if (slab_norm < norm_thr) {
+        /* Not engaged — leave v_hat_out untouched. */
+        return true;
+    }
+
+    /* Recall: encodes inv(q), forward-NTT-CRT, pointwise mul with bank
+     * slab, inverse-NTT-CRT, CRT stitch, decode to fp32. Reuses the
+     * write scratch (both write and recall need 4*N uint64 + N int64). */
+    sp_arm_bank_recall(&mem.bank, slab, q_vec, v_hat_out,
+                        mem.write_scratch_4N.data(),
+                        mem.write_int_scratch.data(),
+                        mem.inv_q_fp32_scratch.data());
+
+    mem.total_engages += 1;
+    if (engaged) *engaged = true;
+    return true;
 }
 
 }  // namespace sp::engine
