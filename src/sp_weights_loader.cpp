@@ -279,6 +279,44 @@ bool sp_weights_load_from_fp16_source(sp_weights& out,
 // LlamaWeights → fp16_source extractor.
 // =========================================================================
 
+/* IEEE 754 fp32 -> fp16 round-to-zero. Matches the helper in
+ * sp_ok_encode.cpp. */
+static inline uint16_t spwl_fp32_to_fp16(float v) {
+    uint32_t f;
+    std::memcpy(&f, &v, sizeof(f));
+    uint16_t sign = (uint16_t)((f >> 16) & 0x8000);
+    int exp_i = (int)((f >> 23) & 0xFF) - 127 + 15;
+    uint32_t mant = f & 0x7FFFFF;
+    if (exp_i <= 0) return sign;
+    if (exp_i >= 31) return (uint16_t)(sign | 0x7C00);
+    return (uint16_t)(sign | ((uint32_t)exp_i << 10) | (mant >> 13));
+}
+
+/* fp16 -> fp32 helper, used by the Q8_0/Q4_0 dequant paths. */
+static inline float spwl_fp16_to_fp32(uint16_t h) {
+    uint32_t sign = ((uint32_t)(h >> 15)) << 31;
+    uint32_t exp  = (h >> 10) & 0x1F;
+    uint32_t mant = h & 0x3FF;
+    uint32_t f;
+    if (exp == 0) {
+        if (mant == 0) {
+            f = sign;
+        } else {
+            exp = 1;
+            while (!(mant & 0x400)) { mant <<= 1; exp--; }
+            mant &= 0x3FF;
+            f = sign | ((exp + 127 - 15) << 23) | (mant << 13);
+        }
+    } else if (exp == 31) {
+        f = sign | 0x7F800000u | (mant << 13);
+    } else {
+        f = sign | ((exp + 127 - 15) << 23) | (mant << 13);
+    }
+    float r;
+    std::memcpy(&r, &f, sizeof(r));
+    return r;
+}
+
 // Extract fp16 data + dims from a ggml_tensor. Returns nullptr (and logs)
 // if the tensor isn't fp16.
 static const uint16_t* tensor_fp16(const ggml_tensor* t, const char* slot) {
@@ -290,6 +328,75 @@ static const uint16_t* tensor_fp16(const ggml_tensor* t, const char* slot) {
         return nullptr;
     }
     return reinterpret_cast<const uint16_t*>(t->data);
+}
+
+// Phase 15: fp16 if available, else Q8_0/Q4_0 dequant into scratch.
+// For embeddings and lm_head from Q8_0 / Q4_0 GGUFs. Returns a pointer
+// into scratch_pool with the fp16 view; pool is sized to numel uint16_t.
+static const uint16_t* tensor_fp16_or_dequant_to_fp16(
+    const ggml_tensor*       t,
+    std::vector<uint16_t>&   scratch_pool,
+    const char*              slot)
+{
+    if (t == nullptr) return nullptr;
+    if (t->type == GGML_TYPE_F16) {
+        return reinterpret_cast<const uint16_t*>(t->data);
+    }
+    const size_t numel = (size_t)ggml_nelements(t);
+    scratch_pool.resize(numel);
+
+    if (t->type == GGML_TYPE_Q8_0) {
+        if ((numel % SP_OK_BLOCK_SIZE) != 0) {
+            std::fprintf(stderr,
+                "[sp-weights-loader] %s: Q8_0 numel %zu not multiple of 32\n",
+                slot, numel);
+            return nullptr;
+        }
+        const size_t n_blocks = numel / SP_OK_BLOCK_SIZE;
+        const sp_gguf_block_q8_0* src =
+            reinterpret_cast<const sp_gguf_block_q8_0*>(t->data);
+        for (size_t b = 0; b < n_blocks; ++b) {
+            const float s = spwl_fp16_to_fp32(src[b].d);
+            for (int k = 0; k < SP_OK_BLOCK_SIZE; ++k) {
+                const float v = s * (float)src[b].qs[k];
+                scratch_pool[b * SP_OK_BLOCK_SIZE + k] = spwl_fp32_to_fp16(v);
+            }
+        }
+        std::fprintf(stderr,
+            "[sp-weights-loader] %s: dequanted Q8_0 -> fp16 (%zu elems)\n",
+            slot, numel);
+        return scratch_pool.data();
+    }
+
+    if (t->type == GGML_TYPE_Q4_0) {
+        if ((numel % SP_OK_BLOCK_SIZE) != 0) {
+            std::fprintf(stderr,
+                "[sp-weights-loader] %s: Q4_0 numel %zu not multiple of 32\n",
+                slot, numel);
+            return nullptr;
+        }
+        const size_t n_blocks = numel / SP_OK_BLOCK_SIZE;
+        const sp_gguf_block_q4_0* src =
+            reinterpret_cast<const sp_gguf_block_q4_0*>(t->data);
+        for (size_t b = 0; b < n_blocks; ++b) {
+            const float s = spwl_fp16_to_fp32(src[b].d);
+            for (int k = 0; k < SP_OK_BLOCK_SIZE; ++k) {
+                const int8_t code = sp_ok_block_q4_decode_codepoint(
+                    src[b].qs, k);
+                const float v = s * (float)code;
+                scratch_pool[b * SP_OK_BLOCK_SIZE + k] = spwl_fp32_to_fp16(v);
+            }
+        }
+        std::fprintf(stderr,
+            "[sp-weights-loader] %s: dequanted Q4_0 -> fp16 (%zu elems)\n",
+            slot, numel);
+        return scratch_pool.data();
+    }
+
+    std::fprintf(stderr,
+        "[sp-weights-loader] %s: unsupported type %d for fp16-or-dequant\n",
+        slot, (int)t->type);
+    return nullptr;
 }
 
 // Norms in GGUF are typically fp32 already. If they're fp16, dequant.
@@ -447,8 +554,17 @@ bool sp_weights_load_from_llama(sp_weights& out,
     src.d_ff      = d_ff;
     src.vocab     = vocab;
     src.head_dim_override = head_dim;
-    src.tok_embd  = tensor_fp16(weights.tok_embd, "tok_embd");
-    src.lm_head   = tensor_fp16(weights.output,   "lm_head");
+    /* Phase 15: tok_embd / lm_head are Q8_0 in pre-quantised GGUFs.
+     * The dequant helper dispatches on type: fp16 -> pass-through;
+     * Q8_0 / Q4_0 -> dequant into a per-call scratch pool. The scratch
+     * pools must outlive sp_weights_load_from_fp16_source below, so
+     * they're stack-locals scoped here. */
+    std::vector<uint16_t> tok_embd_scratch;
+    std::vector<uint16_t> lm_head_scratch;
+    src.tok_embd  = tensor_fp16_or_dequant_to_fp16(
+        weights.tok_embd, tok_embd_scratch, "tok_embd");
+    src.lm_head   = tensor_fp16_or_dequant_to_fp16(
+        weights.output,   lm_head_scratch,  "lm_head");
     src.final_norm = tensor_fp32_or_dequant(
         weights.output_norm, final_norm_scratch, n_embd, "final_norm");
     src.layers    = layer_srcs.data();
