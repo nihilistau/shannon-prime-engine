@@ -6,6 +6,7 @@
 extern "C" {
 #include "shannon_prime.h"
 #include "shannon_prime_modelpack.h"
+#include "sp_hex_sqfree_cache.h"   // Strike 15a: Hexagon hier backend
 }
 
 #ifdef SP_ENGINE_WITH_CUDA
@@ -134,13 +135,15 @@ struct KvCache::Impl {
     int                  max_seq    = 0;
 
     // Exactly one of these is initialised at any time.
-    sp_shadow_cache_t    shadow{};
-    sp_sqfree_cache_t    sq{};
-    sp_hier_cache_t      hier{};
+    sp_shadow_cache_t       shadow{};
+    sp_sqfree_cache_t       sq{};
+    sp_hier_cache_t         hier{};
+    sp_hex_sqfree_cache_t   hex_sq{};
 
     bool                 shadow_inited = false;
     bool                 sq_inited     = false;
     bool                 hier_inited   = false;
+    bool                 hex_sq_inited = false;  // Strike 15a
 
     sp_config_t          cfg{};
     bool                 calibrated = false;
@@ -204,6 +207,9 @@ struct KvCache::Impl {
             shadow.k_cache = nullptr;
             shadow.v_cache = nullptr;
             sp_shadow_cache_free(&shadow);
+        }
+        if (hex_sq_inited) {
+            sp_hex_sqfree_cache_free(&hex_sq);
         }
         if (sq_inited) {
             sp_sqfree_cache_free(&sq);
@@ -395,6 +401,35 @@ std::unique_ptr<KvCache> KvCache::create(int n_layer, int n_head_kv,
     for (size_t i = 0; i < kbits.size(); ++i) sc->k_band_bits[i] = kbits[i];
     for (size_t i = 0; i < vbits.size(); ++i) sc->v_band_bits[i] = vbits[i];
 
+    // Strike 15a: Hexagon-DSP-accelerated Hierarchical Spinor cache.
+    // Opt-in via SP_ENGINE_HEXAGON_HIER=1 — takes precedence over all
+    // host-scalar paths.  Mirrors the sqfree pipeline (pad → VHT2 →
+    // skeleton/residual split → predict + quantize_spinor) but routes
+    // the heavy MAC + amax + Q3+phase pack through V69 HVX kernels.
+    // Cache is 103 bytes/slot (vs sqfree's ~75-100 B at head_dim=128).
+    {
+        const char *env_hex = std::getenv("SP_ENGINE_HEXAGON_HIER");
+        if (env_hex && env_hex[0] == '1') {
+            const int rbits = (rbits_cpu >= 1 && rbits_cpu <= 4) ? rbits_cpu : 3;
+            if (sp_hex_sqfree_cache_init(&kv->impl_->hex_sq, sc, max_seq,
+                                          rbits, cfg.spinor,
+                                          /*shared_ctx=*/nullptr) != 0) {
+                std::fprintf(stderr,
+                    "[sp-engine] KvCache: hex_sqfree_cache_init failed — "
+                    "falling through to host path\n");
+            } else {
+                kv->impl_->hex_sq_inited = true;
+                kv->impl_->sqfree        = true;   // shares the sqfree API contract
+                kv->impl_->pad_dim       = kv->impl_->hex_sq.pad_dim;
+                std::fprintf(stderr,
+                    "[sp-engine] KvCache: hexagon_hier active — pad_dim=%d, "
+                    "103 B/slot, FastRPC dispatch per K/V read+write\n",
+                    kv->impl_->pad_dim);
+                return kv;
+            }
+        }
+    }
+
     // Hierarchical Vilenkin predictor — maximum compression path.
     // Mutually exclusive with sqfree; takes precedence if both are set.
     if (cfg.hierarchical) {
@@ -569,7 +604,10 @@ bool KvCache::write(int layer, int pos_offset, int n_tokens,
         for (int h = 0; h < H; ++h) {
             const float* k_vec = K_flat + (size_t)(q * H + h) * hd;
             const float* v_vec = V_flat + (size_t)(q * H + h) * hd;
-            if (impl_->hier_inited) {
+            if (impl_->hex_sq_inited) {
+                sp_hex_sqfree_write_k(&impl_->hex_sq, layer, h, pos, k_vec);
+                sp_hex_sqfree_write_v(&impl_->hex_sq, layer, h, pos, v_vec);
+            } else if (impl_->hier_inited) {
                 sp_hier_cache_write_k(&impl_->hier, layer, h, pos, k_vec);
                 sp_hier_cache_write_v(&impl_->hier, layer, h, pos, v_vec);
             } else if (impl_->sqfree) {
@@ -627,7 +665,10 @@ bool KvCache::read(int layer, int kv_len,
         for (int h = 0; h < H; ++h) {
             float* k_vec = K_out.data() + (size_t)(q * H + h) * hd;
             float* v_vec = V_out.data() + (size_t)(q * H + h) * hd;
-            if (impl_->hier_inited) {
+            if (impl_->hex_sq_inited) {
+                sp_hex_sqfree_read_k(&impl_->hex_sq, layer, h, q, k_vec);
+                sp_hex_sqfree_read_v(&impl_->hex_sq, layer, h, q, v_vec);
+            } else if (impl_->hier_inited) {
                 sp_hier_cache_read_k(&impl_->hier, layer, h, q, k_vec);
                 sp_hier_cache_read_v(&impl_->hier, layer, h, q, v_vec);
             } else if (impl_->sqfree) {
@@ -645,7 +686,9 @@ bool KvCache::read(int layer, int kv_len,
 // ── Adaptive calibration ────────────────────────────────────────────
 
 bool KvCache::calibrate_begin() {
-    if (impl_->hier_inited) {
+    if (impl_->hex_sq_inited) {
+        return sp_hex_sqfree_calibrate_begin(&impl_->hex_sq) == 0;
+    } else if (impl_->hier_inited) {
         return sp_hier_cache_calibrate_begin(&impl_->hier) == 0;
     } else if (impl_->sqfree) {
         return sp_sqfree_calibrate_begin(&impl_->sq) == 0;
@@ -673,6 +716,10 @@ void KvCache::calibrate_feed(const float* vec) {
 
     // Shared-mask feed: sqfree and shadow accumulate globally.
     // NOT valid for hierarchical — use the per-slot overload instead.
+    if (impl_->hex_sq_inited) {
+        sp_hex_sqfree_calibrate_feed(&impl_->hex_sq, vec);
+        return;
+    }
     if (impl_->sqfree) {
         sp_sqfree_calibrate_feed(&impl_->sq, vec);
         return;
@@ -730,7 +777,9 @@ void KvCache::calibrate_feed(int slot, const float* vec) {
 
 bool KvCache::calibrate_end() {
     int rc;
-    if (impl_->hier_inited) {
+    if (impl_->hex_sq_inited) {
+        rc = sp_hex_sqfree_calibrate_end(&impl_->hex_sq);
+    } else if (impl_->hier_inited) {
         rc = sp_hier_cache_calibrate_end(&impl_->hier);
     } else if (impl_->sqfree) {
         rc = sp_sqfree_calibrate_end(&impl_->sq);
