@@ -983,6 +983,20 @@ int main(int argc, char** argv) {
             ctx.embd_scale = embd_scale;
             ctx.ffn_act    = ffn_act;
             ctx.rope_mode  = rope_mode;
+
+            /* Phase 16: populate ctx.rope_freq_factors from PrimePE.
+             * pc carries the per-verb Config (parse_config_flag wrote to it
+             * earlier; pc.pe_mode defaults to PrimePe with alpha=0.17). */
+            ctx.rope_freq_factors = sp::engine::prime_pe_freq_factors(
+                pc.pe_mode, pc.pe_alpha, pc.pe_tier,
+                native_head_dim, native_rope_base);
+            if (!ctx.rope_freq_factors.empty()) {
+                std::fprintf(stderr,
+                    "[sp-engine] perplexity-native: PrimePE active "
+                    "(%zu freq factors, alpha=%.3f, tier=%d)\n",
+                    ctx.rope_freq_factors.size(),
+                    (double)pc.pe_alpha, pc.pe_tier);
+            }
             // Phase 3 pivot: SP_ENGINE_POLY_ATTN=1 switches the attention
             // score function from the fp32 dot product (Phase 2.2a) to
             // CKKS polynomial-ring multiplication in Z[x]/(x^N+1). The

@@ -1101,12 +1101,20 @@ bool sp_forward_step_prefill(sp_forward_context& ctx,
         // 2d) RoPE on Q and K (frobenius_scale → 1 after each call). The
         //     per-layer rope_base is `layer_rope_base` (swa_rope_base for
         //     local layers, ctx.rope_base for global layers).
+        /* Phase 16: PrimePE lattice-blended freq factors. ctx.rope_freq_factors
+         * is populated by sp_forward_init_context when pe_mode != Standard and
+         * pe_alpha > 0; empty vector means pass-through (pure geometric). */
+        const float* freq_factors_ptr =
+            ctx.rope_freq_factors.empty() ? nullptr : ctx.rope_freq_factors.data();
+        const int    n_freq_factors    = (int)ctx.rope_freq_factors.size();
         if (!sp_rope_apply_ok(ctx.q_ok, n_head,    head_dim, n_tokens,
                                 rope_pos, layer_rope_base, 1.0f,
-                                ctx.rope_mode)) return false;
+                                ctx.rope_mode,
+                                freq_factors_ptr, n_freq_factors)) return false;
         if (!sp_rope_apply_ok(ctx.k_ok, n_kv_head, head_dim, n_tokens,
                                 rope_pos, layer_rope_base, 1.0f,
-                                ctx.rope_mode)) return false;
+                                ctx.rope_mode,
+                                freq_factors_ptr, n_freq_factors)) return false;
         // V keeps its post-matmul frobenius_scale (matches v cache slot).
 
         // Sanity: K/V must match the cache's stored scales for the strict

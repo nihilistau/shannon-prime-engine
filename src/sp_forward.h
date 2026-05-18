@@ -180,6 +180,9 @@ struct sp_forward_context {
     float   rms_eps    = 1e-5f;
     float        rope_base  = 10000.0f;
     sp_rope_mode rope_mode  = sp_rope_mode::NORMAL;  // NEOX for qwen/phi/gemma family
+    // Phase 16: PrimePE lattice-blended freq factors. Length = head_dim/2.
+    // Empty = pure geometric RoPE (pe_mode=Standard or pe_alpha=0).
+    std::vector<float> rope_freq_factors;
     // Phase 2.3b iter 2 ? Gemma family arch knobs:
     float       embd_scale = 1.0f;                 // sqrt(n_embd) for gemma
     sp_ffn_act  ffn_act    = sp_ffn_act::SwiGLU;   // GeGLU_tanh for gemma

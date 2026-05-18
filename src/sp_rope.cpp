@@ -16,7 +16,9 @@ bool sp_rope_apply_ok(sp_ok_tensor&      qk,
                        const int32_t*     positions,
                        float              freq_base,
                        float              freq_scale,
-                       sp_rope_mode       mode) {
+                       sp_rope_mode       mode,
+                       const float*       freq_factors,
+                       int                n_freq_factors) {
     if (qk.data == nullptr || positions == nullptr) return false;
     if (n_heads <= 0 || head_dim <= 0 || n_tokens <= 0) return false;
     if ((head_dim & 1) != 0) return false;  // pairs of 2
@@ -36,10 +38,22 @@ bool sp_rope_apply_ok(sp_ok_tensor&      qk,
     // Pre-compute per-pair frequencies (independent of token).
     // Per ggml RoPE convention, freq[k] = freq_scale * base^(-2k/head_dim)
     // for both NORMAL and NEOX modes — only the pair-element layout differs.
+    //
+    // Phase 16: PrimePE freq_factors. prime_pe_freq_factors returns
+    // `blended/geometric` per pair (a multiplier), so effective_freq =
+    // geometric * factor = blended. alpha=0 yields all-1.0 factors
+    // (identity). nullptr or mismatched length falls back to pure
+    // geometric (skip the multiply entirely).
+    const bool use_factors =
+        (freq_factors != nullptr) && (n_freq_factors == n_pairs);
     std::vector<float> freqs(n_pairs);
     for (int k = 0; k < n_pairs; ++k) {
         const float exp_arg = -(float)(2 * k) / (float)head_dim;
-        freqs[k] = freq_scale * std::pow(freq_base, exp_arg);
+        float f = freq_scale * std::pow(freq_base, exp_arg);
+        if (use_factors && freq_factors[k] > 0.0f) {
+            f *= freq_factors[k];
+        }
+        freqs[k] = f;
     }
 
     // Step E row-major-by-token layout: qk.data[t * F_outer + i].
@@ -94,11 +108,14 @@ bool sp_rope_apply_ok_contig(sp_ok_tensor& qk,
                               int           start_pos,
                               float         freq_base,
                               float         freq_scale,
-                              sp_rope_mode  mode) {
+                              sp_rope_mode  mode,
+                              const float*  freq_factors,
+                              int           n_freq_factors) {
     std::vector<int32_t> pos(n_tokens);
     for (int t = 0; t < n_tokens; ++t) pos[t] = start_pos + t;
     return sp_rope_apply_ok(qk, n_heads, head_dim, n_tokens,
-                             pos.data(), freq_base, freq_scale, mode);
+                             pos.data(), freq_base, freq_scale, mode,
+                             freq_factors, n_freq_factors);
 }
 
 }  // namespace sp::engine

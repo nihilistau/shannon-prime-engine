@@ -65,7 +65,9 @@ bool sp_rope_apply_ok(sp_ok_tensor&      qk,
                        const int32_t*     positions,
                        float              freq_base,
                        float              freq_scale,
-                       sp_rope_mode       mode = sp_rope_mode::NORMAL);
+                       sp_rope_mode       mode = sp_rope_mode::NORMAL,
+                       const float*       freq_factors  = nullptr,
+                       int                n_freq_factors = 0);
 
 // Convenience overload: same positions buffer for a contiguous run
 // [start_pos, start_pos + n_tokens). Common case for prefill.
@@ -76,6 +78,8 @@ bool sp_rope_apply_ok_contig(sp_ok_tensor& qk,
                               int           start_pos,
                               float         freq_base,
                               float         freq_scale,
-                              sp_rope_mode  mode = sp_rope_mode::NORMAL);
+                              sp_rope_mode  mode = sp_rope_mode::NORMAL,
+                              const float*  freq_factors  = nullptr,
+                              int           n_freq_factors = 0);
 
 }  // namespace sp::engine
