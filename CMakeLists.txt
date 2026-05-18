@@ -531,10 +531,14 @@ endif()
 target_compile_features(sp_engine PUBLIC cxx_std_17)
 # Phase 8: AVX-512 GEMV fast-path in sp_matmul_ok requires AVX2/AVX-512
 # intrinsics + __AVX512F__ macro. Tiger Lake (i9-11900KB) is the floor.
+# Skip these flags on non-x86 targets (Android arm64, etc.) — the fast
+# path #ifdefs out at compile time when the CPU lacks AVX support.
 if(MSVC)
     target_compile_options(sp_engine PRIVATE /W3 /arch:AVX512)
-else()
+elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "(x86_64|AMD64|i.86)")
     target_compile_options(sp_engine PRIVATE -Wall -Wextra -mavx512f -mavx2)
+else()
+    target_compile_options(sp_engine PRIVATE -Wall -Wextra)
 endif()
 
 # --------------------------------------------------------------------

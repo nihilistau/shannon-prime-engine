@@ -200,15 +200,26 @@ def emit_header(head_dim, skeleton_size, predicted_size, predicted_padded,
 # Public entry — sweep all supported configs.
 # ----------------------------------------------------------------------------
 CONFIGS = [
-    # 154 = 2 * 7 * 11.  Skeleton picks 14 Knight coords; 140 residuals.
-    # Pad to 160 = ceil(140/32)*32 so 5 HVX vectors cover each column.
+    # Strike 11c reshape: engine's knight_mask at pad_dim=154 produces
+    # 14 skeleton + 60 non-squarefree-residual; ~80 squarefree-but-not-
+    # skeleton indices are dropped.  Pad to 64 lanes (2 HVX vectors of
+    # 32 i32 each) for the MAC kernel.  W-matrix .rodata shrinks from
+    # 8960 B (14 cols * 160 lanes * 4) to 3584 B (14 cols * 64 lanes * 4).
     {
         "head_dim":         154,
         "skeleton_size":    14,
-        "predicted_size":   140,
-        "predicted_padded": 160,
+        "predicted_size":   60,
+        "predicted_padded": 64,
     },
 ]
+
+
+def _legacy_size_assertion(cfg):
+    """Strike 11c removed the skeleton+predicted == head_dim invariant.
+    The engine's knight_mask drops ~80 squarefree-but-not-skeleton indices,
+    so 14 + 60 = 74 < 154 is intentional."""
+    _ = cfg
+    return True
 
 
 def main():
@@ -219,8 +230,7 @@ def main():
         sk  = cfg["skeleton_size"]
         pr  = cfg["predicted_size"]
         pad = cfg["predicted_padded"]
-        assert sk + pr == hd, (
-            f"skeleton+predicted ({sk}+{pr}) must equal head_dim ({hd})")
+        _legacy_size_assertion(cfg)  # skeleton + predicted != head_dim by design
         assert pad >= pr and pad % 32 == 0, (
             f"predicted_padded ({pad}) must be >= predicted_size ({pr}) "
             f"and divisible by 32")
