@@ -160,6 +160,48 @@ bool sp_ok_arena::alloc_tensor_q8(sp_ok_q8_tensor& t, size_t numel) {
     return true;
 }
 
+bool sp_ok_arena::alloc_tensor_block_q8(sp_ok_block_q8_tensor& t, size_t numel) {
+    if (numel == 0) {
+        t.blocks   = nullptr;
+        t.numel    = 0;
+        t.n_blocks = 0;
+        return true;
+    }
+    if ((numel % SP_OK_BLOCK_SIZE) != 0) return false;
+    const size_t n_blocks = numel / SP_OK_BLOCK_SIZE;
+    const size_t bytes    = n_blocks * sizeof(sp_ok_q8_block_t);
+    void* p = alloc(bytes, 64);
+    if (!p) return false;
+    t.blocks      = static_cast<sp_ok_q8_block_t*>(p);
+    t.numel       = numel;
+    t.n_blocks    = n_blocks;
+    t.frobenius_p = 0;
+    t.frobenius_k = 0;
+    t.reserved    = 0;
+    return true;
+}
+
+bool sp_ok_arena::alloc_tensor_block_q4(sp_ok_block_q4_tensor& t, size_t numel) {
+    if (numel == 0) {
+        t.blocks   = nullptr;
+        t.numel    = 0;
+        t.n_blocks = 0;
+        return true;
+    }
+    if ((numel % SP_OK_BLOCK_SIZE) != 0) return false;
+    const size_t n_blocks = numel / SP_OK_BLOCK_SIZE;
+    const size_t bytes    = n_blocks * sizeof(sp_ok_q4_block_t);
+    void* p = alloc(bytes, 64);
+    if (!p) return false;
+    t.blocks      = static_cast<sp_ok_q4_block_t*>(p);
+    t.numel       = numel;
+    t.n_blocks    = n_blocks;
+    t.frobenius_p = 0;
+    t.frobenius_k = 0;
+    t.reserved    = 0;
+    return true;
+}
+
 bool sp_ok_arena::alloc_tensor_q4(sp_ok_q4_tensor& t, size_t numel) {
     if (numel == 0) {
         t.data  = nullptr;

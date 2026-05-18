@@ -167,4 +167,48 @@ bool sp_matmul_ok_q4_to_fp32(const sp_ok_tensor&    W_shape,
                              int                    out_rows,
                              int                    n_cols);
 
+// -----------------------------------------------------------------------
+// Phase 15: block-scale fused matmul (GGUF Q8_0 / Q4_0 ingest).
+//
+// W is a sp_ok_block_q{8,4}_tensor holding per-block (B_a, B_b) integer
+// scales already fused with the Frobenius element π^k. The inner loop
+// factors the ring product as
+//
+//   F_a[k] = B_a · x.a[k] − 41 · B_b · x.b[k]
+//   F_b[k] = B_a · x.b[k] + B_b · x.a[k] + B_b · x.b[k]
+//   acc_a += w_int[k] · F_a[k]
+//   acc_b += w_int[k] · F_b[k]
+//
+// dropping the heavy ring multiplication to a single scalar mul per k
+// with a tiny 4- or 8-bit multiplier. Per-block scales mean precision
+// survives even on long-tail weight distributions (the per-tensor-shift
+// Q4 blowout from Phase 14 doesn't recur).
+//
+// W_shape carries shape[], scale_recip, frobenius_scale for the
+// downstream Y descriptor. W_shape.data may be null.
+// -----------------------------------------------------------------------
+bool sp_matmul_ok_block_q8(const sp_ok_tensor&          W_shape,
+                            const sp_ok_block_q8_tensor& W_blk,
+                            const sp_ok_tensor&          X,
+                            sp_ok_tensor&                Y);
+
+bool sp_matmul_ok_block_q8_to_fp32(const sp_ok_tensor&          W_shape,
+                                    const sp_ok_block_q8_tensor& W_blk,
+                                    const sp_ok_tensor&          X,
+                                    float*                       Y_fp32,
+                                    int                          out_rows,
+                                    int                          n_cols);
+
+bool sp_matmul_ok_block_q4(const sp_ok_tensor&          W_shape,
+                            const sp_ok_block_q4_tensor& W_blk,
+                            const sp_ok_tensor&          X,
+                            sp_ok_tensor&                Y);
+
+bool sp_matmul_ok_block_q4_to_fp32(const sp_ok_tensor&          W_shape,
+                                    const sp_ok_block_q4_tensor& W_blk,
+                                    const sp_ok_tensor&          X,
+                                    float*                       Y_fp32,
+                                    int                          out_rows,
+                                    int                          n_cols);
+
 }  // namespace sp::engine

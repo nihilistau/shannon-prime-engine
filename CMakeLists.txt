@@ -120,6 +120,7 @@ set(SP_CORE_SRC
     ${SP_CORE_DIR}/core/sp_ok_arith.c
     ${SP_CORE_DIR}/core/sp_ok_q8.c
     ${SP_CORE_DIR}/core/sp_ok_q4.c
+    ${SP_CORE_DIR}/core/sp_ok_block_quant.c
     ${SP_CORE_DIR}/core/sp_frobenius.c
     ${SP_CORE_DIR}/core/sp_ec_weil.c
     ${SP_CORE_DIR}/core/sp_poly_ring.c

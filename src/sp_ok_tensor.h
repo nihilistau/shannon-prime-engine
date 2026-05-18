@@ -27,6 +27,7 @@ extern "C" {
 #include "../lib/shannon-prime/core/sp_ok_arith.h"
 #include "../lib/shannon-prime/core/sp_ok_q8.h"
 #include "../lib/shannon-prime/core/sp_ok_q4.h"
+#include "../lib/shannon-prime/core/sp_ok_block_quant.h"
 }
 
 namespace sp::engine {
@@ -119,6 +120,13 @@ public:
     // p, k) is the caller's responsibility — typically set by the
     // encoder. Returns false on arena exhaustion.
     bool alloc_tensor_q4(sp_ok_q4_tensor& t, size_t numel);
+
+    // Phase 15: GGUF block-quant tensors. Each block is cache-line
+    // aligned and carries the (B_a, B_b) fused scales plus 32 int8 /
+    // 16 packed-nybble codepoints. numel must be a multiple of
+    // SP_OK_BLOCK_SIZE (32).
+    bool alloc_tensor_block_q8(sp_ok_block_q8_tensor& t, size_t numel);
+    bool alloc_tensor_block_q4(sp_ok_block_q4_tensor& t, size_t numel);
 
     void   reset()              { used_ = 0; }
     size_t capacity() const     { return capacity_; }

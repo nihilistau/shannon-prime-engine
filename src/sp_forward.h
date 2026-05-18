@@ -310,6 +310,32 @@ struct sp_weights {
     std::vector<sp_ok_q4_tensor>      q4_ffn_down;
     std::vector<sp_ok_arena>          q4_layer_arenas;  // ~1/16 of layer_arenas
 
+    // Phase 15: GGUF block-quant storage. Mutually exclusive with
+    // use_q8 and use_q4 (only one packed-storage flag is true at a
+    // time). When use_block_q8 (or _q4) is set, the standard wq/wk/wv
+    // etc. sp_ok_tensor descriptors retain only shape + scale metadata;
+    // data ptr is null, and the matmul dispatch picks block_q8 /
+    // block_q4 kernels.
+    bool                                use_block_q8 = false;
+    std::vector<sp_ok_block_q8_tensor>  block_q8_wq;
+    std::vector<sp_ok_block_q8_tensor>  block_q8_wk;
+    std::vector<sp_ok_block_q8_tensor>  block_q8_wv;
+    std::vector<sp_ok_block_q8_tensor>  block_q8_wo;
+    std::vector<sp_ok_block_q8_tensor>  block_q8_ffn_gate;
+    std::vector<sp_ok_block_q8_tensor>  block_q8_ffn_up;
+    std::vector<sp_ok_block_q8_tensor>  block_q8_ffn_down;
+    std::vector<sp_ok_arena>            block_q8_layer_arenas;
+
+    bool                                use_block_q4 = false;
+    std::vector<sp_ok_block_q4_tensor>  block_q4_wq;
+    std::vector<sp_ok_block_q4_tensor>  block_q4_wk;
+    std::vector<sp_ok_block_q4_tensor>  block_q4_wv;
+    std::vector<sp_ok_block_q4_tensor>  block_q4_wo;
+    std::vector<sp_ok_block_q4_tensor>  block_q4_ffn_gate;
+    std::vector<sp_ok_block_q4_tensor>  block_q4_ffn_up;
+    std::vector<sp_ok_block_q4_tensor>  block_q4_ffn_down;
+    std::vector<sp_ok_arena>            block_q4_layer_arenas;
+
     // Bypass-list (fp32 norms; scale-reset valve per Phase 1.7 policy):
     std::vector<std::vector<float>> attn_norm_w;       // per-layer [n_embd]
     std::vector<std::vector<float>> ffn_norm_w;        // per-layer [n_embd]

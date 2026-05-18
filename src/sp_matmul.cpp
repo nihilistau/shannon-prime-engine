@@ -704,4 +704,245 @@ bool sp_matmul_ok_q4_to_fp32(const sp_ok_tensor&    W_shape,
     return true;
 }
 
+// ---------- Phase 15: block-scale fused matmul (Q8_0 / Q4_0 ingest) -----
+
+/* Helper: scalar inner loop for one (i, j) output cell against a slice
+ * of W blocks. Used in the OK->OK path and as the scalar fallback when
+ * AVX-512 is unavailable.
+ *
+ * For each block of 32 elements in K:
+ *   Load B_a, B_b from the block.
+ *   For each k in [0..32):
+ *     int8 w = block.packed[k]                          (Q8 path)
+ *           or sp_ok_block_q4_decode_codepoint(packed, k) (Q4 path, +8-biased)
+ *     F_a = B_a * x.a[k] − 41 * B_b * x.b[k]
+ *     F_b = B_a * x.b[k] + B_b * x.a[k] + B_b * x.b[k]
+ *     acc_a += w * F_a
+ *     acc_b += w * F_b
+ */
+
+template <bool IS_Q4, bool A_ONLY>
+static inline void sp_matmul_ok_block_inner_scalar(
+    const void*    w_blocks,         // sp_ok_q8_block_t* or sp_ok_q4_block_t*
+    const sp_ok_t* x_row,
+    size_t         n_blocks,
+    int64_t&       out_acc_a,
+    int64_t&       out_acc_b)
+{
+    constexpr int64_t W41 = (int64_t)SP_OK_OMEGA_NORM;
+    int64_t acc_a = 0;
+    int64_t acc_b = 0;
+
+    for (size_t b = 0; b < n_blocks; ++b) {
+        int64_t B_a, B_b;
+        const uint8_t* packed;
+        const int8_t*  packed_i8 = nullptr;
+
+        if constexpr (IS_Q4) {
+            const sp_ok_q4_block_t* blk =
+                (const sp_ok_q4_block_t*)w_blocks + b;
+            B_a    = blk->B_a;
+            B_b    = blk->B_b;
+            packed = blk->packed;
+        } else {
+            const sp_ok_q8_block_t* blk =
+                (const sp_ok_q8_block_t*)w_blocks + b;
+            B_a       = blk->B_a;
+            B_b       = blk->B_b;
+            packed_i8 = blk->packed;
+        }
+
+        const size_t k_base = b * (size_t)SP_OK_BLOCK_SIZE;
+        for (int k = 0; k < SP_OK_BLOCK_SIZE; ++k) {
+            int64_t w_int;
+            if constexpr (IS_Q4) {
+                w_int = (int64_t)sp_ok_block_q4_decode_codepoint(packed, k);
+            } else {
+                w_int = (int64_t)packed_i8[k];
+            }
+            const sp_ok_t& x_jk = x_row[k_base + k];
+            const int64_t F_a = B_a * x_jk.a - W41 * B_b * x_jk.b;
+            acc_a += w_int * F_a;
+            if constexpr (!A_ONLY) {
+                const int64_t F_b = B_a * x_jk.b
+                                   + B_b * x_jk.a
+                                   + B_b * x_jk.b;
+                acc_b += w_int * F_b;
+            }
+        }
+    }
+
+    out_acc_a = acc_a;
+    if constexpr (!A_ONLY) out_acc_b = acc_b;
+}
+
+bool sp_matmul_ok_block_q8(const sp_ok_tensor&          W_shape,
+                            const sp_ok_block_q8_tensor& W_blk,
+                            const sp_ok_tensor&          X,
+                            sp_ok_tensor&                Y) {
+    if (X.data == nullptr || Y.data == nullptr) return false;
+    if (W_blk.blocks == nullptr || W_blk.n_blocks == 0) return false;
+    if (W_shape.n_dims < 2 || X.n_dims < 2) return false;
+    const int64_t M  = W_shape.shape[1];
+    const int64_t K  = W_shape.shape[0];
+    const int64_t K2 = X.shape[1];
+    const int64_t N  = X.shape[0];
+    if (K != K2) return false;
+    if (Y.n_dims < 2 || Y.shape[0] != N || Y.shape[1] != M) return false;
+    if ((size_t)(M * K) != W_blk.numel) return false;
+    if ((K % SP_OK_BLOCK_SIZE) != 0) return false;
+    const size_t blocks_per_row = (size_t)K / SP_OK_BLOCK_SIZE;
+    if (W_blk.n_blocks != (size_t)M * blocks_per_row) return false;
+
+    const int nt = std::max(1, sp_threadpool_n_threads());
+
+    sp_parallel_for([&](int thread_id) {
+        int64_t i0, i1;
+        split_rows(M, nt, thread_id, i0, i1);
+        for (int64_t i = i0; i < i1; ++i) {
+            const sp_ok_q8_block_t* w_row =
+                W_blk.blocks + (size_t)i * blocks_per_row;
+            for (int64_t j = 0; j < N; ++j) {
+                int64_t acc_a = 0;
+                int64_t acc_b = 0;
+                const sp_ok_t* x_row = X.data + j * K;
+                sp_matmul_ok_block_inner_scalar<false, false>(
+                    w_row, x_row, blocks_per_row, acc_a, acc_b);
+                Y.data[j * M + i] = sp_ok_t{ acc_a, acc_b };
+            }
+        }
+    });
+
+    Y.scale_recip     = W_shape.scale_recip     * X.scale_recip;
+    Y.frobenius_scale = W_shape.frobenius_scale * X.frobenius_scale;
+    return true;
+}
+
+bool sp_matmul_ok_block_q8_to_fp32(const sp_ok_tensor&          W_shape,
+                                    const sp_ok_block_q8_tensor& W_blk,
+                                    const sp_ok_tensor&          X,
+                                    float*                       Y_fp32,
+                                    int                          out_rows,
+                                    int                          n_cols) {
+    if (X.data == nullptr || Y_fp32 == nullptr) return false;
+    if (W_blk.blocks == nullptr || W_blk.n_blocks == 0) return false;
+    if (W_shape.n_dims < 2 || X.n_dims < 2) return false;
+    const int64_t M  = W_shape.shape[1];
+    const int64_t K  = W_shape.shape[0];
+    const int64_t K2 = X.shape[1];
+    const int64_t N  = X.shape[0];
+    if (K != K2 || (int64_t)out_rows != M || (int64_t)n_cols != N) return false;
+    if ((size_t)(M * K) != W_blk.numel) return false;
+    if ((K % SP_OK_BLOCK_SIZE) != 0) return false;
+    const size_t blocks_per_row = (size_t)K / SP_OK_BLOCK_SIZE;
+
+    const double divisor =
+        (double)W_shape.scale_recip * (double)X.scale_recip *
+        (double)W_shape.frobenius_scale * (double)X.frobenius_scale;
+    if (divisor == 0.0) return false;
+
+    const int nt = std::max(1, sp_threadpool_n_threads());
+
+    sp_parallel_for([&](int thread_id) {
+        int64_t i0, i1;
+        split_rows(M, nt, thread_id, i0, i1);
+        for (int64_t i = i0; i < i1; ++i) {
+            const sp_ok_q8_block_t* w_row =
+                W_blk.blocks + (size_t)i * blocks_per_row;
+            for (int64_t j = 0; j < N; ++j) {
+                int64_t acc_a = 0, acc_b = 0;
+                const sp_ok_t* x_row = X.data + j * K;
+                sp_matmul_ok_block_inner_scalar<false, true>(
+                    w_row, x_row, blocks_per_row, acc_a, acc_b);
+                Y_fp32[j * M + i] = (float)((double)acc_a / divisor);
+            }
+        }
+    });
+    return true;
+}
+
+bool sp_matmul_ok_block_q4(const sp_ok_tensor&          W_shape,
+                            const sp_ok_block_q4_tensor& W_blk,
+                            const sp_ok_tensor&          X,
+                            sp_ok_tensor&                Y) {
+    if (X.data == nullptr || Y.data == nullptr) return false;
+    if (W_blk.blocks == nullptr || W_blk.n_blocks == 0) return false;
+    if (W_shape.n_dims < 2 || X.n_dims < 2) return false;
+    const int64_t M  = W_shape.shape[1];
+    const int64_t K  = W_shape.shape[0];
+    const int64_t K2 = X.shape[1];
+    const int64_t N  = X.shape[0];
+    if (K != K2) return false;
+    if (Y.n_dims < 2 || Y.shape[0] != N || Y.shape[1] != M) return false;
+    if ((size_t)(M * K) != W_blk.numel) return false;
+    if ((K % SP_OK_BLOCK_SIZE) != 0) return false;
+    const size_t blocks_per_row = (size_t)K / SP_OK_BLOCK_SIZE;
+    if (W_blk.n_blocks != (size_t)M * blocks_per_row) return false;
+
+    const int nt = std::max(1, sp_threadpool_n_threads());
+
+    sp_parallel_for([&](int thread_id) {
+        int64_t i0, i1;
+        split_rows(M, nt, thread_id, i0, i1);
+        for (int64_t i = i0; i < i1; ++i) {
+            const sp_ok_q4_block_t* w_row =
+                W_blk.blocks + (size_t)i * blocks_per_row;
+            for (int64_t j = 0; j < N; ++j) {
+                int64_t acc_a = 0, acc_b = 0;
+                const sp_ok_t* x_row = X.data + j * K;
+                sp_matmul_ok_block_inner_scalar<true, false>(
+                    w_row, x_row, blocks_per_row, acc_a, acc_b);
+                Y.data[j * M + i] = sp_ok_t{ acc_a, acc_b };
+            }
+        }
+    });
+
+    Y.scale_recip     = W_shape.scale_recip     * X.scale_recip;
+    Y.frobenius_scale = W_shape.frobenius_scale * X.frobenius_scale;
+    return true;
+}
+
+bool sp_matmul_ok_block_q4_to_fp32(const sp_ok_tensor&          W_shape,
+                                    const sp_ok_block_q4_tensor& W_blk,
+                                    const sp_ok_tensor&          X,
+                                    float*                       Y_fp32,
+                                    int                          out_rows,
+                                    int                          n_cols) {
+    if (X.data == nullptr || Y_fp32 == nullptr) return false;
+    if (W_blk.blocks == nullptr || W_blk.n_blocks == 0) return false;
+    if (W_shape.n_dims < 2 || X.n_dims < 2) return false;
+    const int64_t M  = W_shape.shape[1];
+    const int64_t K  = W_shape.shape[0];
+    const int64_t K2 = X.shape[1];
+    const int64_t N  = X.shape[0];
+    if (K != K2 || (int64_t)out_rows != M || (int64_t)n_cols != N) return false;
+    if ((size_t)(M * K) != W_blk.numel) return false;
+    if ((K % SP_OK_BLOCK_SIZE) != 0) return false;
+    const size_t blocks_per_row = (size_t)K / SP_OK_BLOCK_SIZE;
+
+    const double divisor =
+        (double)W_shape.scale_recip * (double)X.scale_recip *
+        (double)W_shape.frobenius_scale * (double)X.frobenius_scale;
+    if (divisor == 0.0) return false;
+
+    const int nt = std::max(1, sp_threadpool_n_threads());
+
+    sp_parallel_for([&](int thread_id) {
+        int64_t i0, i1;
+        split_rows(M, nt, thread_id, i0, i1);
+        for (int64_t i = i0; i < i1; ++i) {
+            const sp_ok_q4_block_t* w_row =
+                W_blk.blocks + (size_t)i * blocks_per_row;
+            for (int64_t j = 0; j < N; ++j) {
+                int64_t acc_a = 0, acc_b = 0;
+                const sp_ok_t* x_row = X.data + j * K;
+                sp_matmul_ok_block_inner_scalar<true, true>(
+                    w_row, x_row, blocks_per_row, acc_a, acc_b);
+                Y_fp32[j * M + i] = (float)((double)acc_a / divisor);
+            }
+        }
+    });
+    return true;
+}
+
 }  // namespace sp::engine
