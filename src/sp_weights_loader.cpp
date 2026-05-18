@@ -393,6 +393,54 @@ static const uint16_t* tensor_fp16_or_dequant_to_fp16(
         return scratch_pool.data();
     }
 
+    /* Phase 15c: Q4_K dequant for bypass-list (tok_embd / lm_head). */
+    if (t->type == GGML_TYPE_Q4_K) {
+        if ((numel % SP_OK_Q4_K_SUPER) != 0) {
+            std::fprintf(stderr,
+                "[sp-weights-loader] %s: Q4_K numel %zu not multiple of 256\n",
+                slot, numel);
+            return nullptr;
+        }
+        const size_t n_super = numel / SP_OK_Q4_K_SUPER;
+        const sp_gguf_block_q4_K* src =
+            reinterpret_cast<const sp_gguf_block_q4_K*>(t->data);
+        /* Inline get_scale_min_k4 to avoid a math-submodule cross-link. */
+        auto get_sm = [](int j, const uint8_t* q, uint8_t& sc, uint8_t& m) {
+            if (j < 4) { sc = q[j] & 63; m = q[j + 4] & 63; }
+            else {
+                sc = (q[j + 4] & 0x0F) | ((q[j - 4] >> 6) << 4);
+                m  = (q[j + 4] >>  4) | ((q[j - 0] >> 6) << 4);
+            }
+        };
+        for (size_t sb = 0; sb < n_super; ++sb) {
+            const float d    = spwl_fp16_to_fp32(src[sb].d);
+            const float dmin = spwl_fp16_to_fp32(src[sb].dmin);
+            for (int s = 0; s < SP_OK_Q4_K_SUBBLOCKS; ++s) {
+                const int group = s / 2;
+                const int is_hi = (s & 1);
+                const uint8_t* bs = src[sb].qs + group * 32;
+                uint8_t sc6, m6;
+                get_sm(s, src[sb].scales, sc6, m6);
+                const float d_sub = d    * (float)sc6;
+                const float m_sub = dmin * (float)m6;
+                const size_t dst_off = sb * SP_OK_Q4_K_SUPER
+                                     + (size_t)s * SP_OK_BLOCK_SIZE;
+                for (int i = 0; i < SP_OK_BLOCK_SIZE; ++i) {
+                    /* sub_A uses low nybbles of bs[0..31]; sub_B uses high nybbles. */
+                    const uint8_t nyb = is_hi
+                        ? (uint8_t)(bs[i] >> 4)
+                        : (uint8_t)(bs[i] & 0x0F);
+                    const float v = d_sub * (float)nyb - m_sub;
+                    scratch_pool[dst_off + i] = spwl_fp32_to_fp16(v);
+                }
+            }
+        }
+        std::fprintf(stderr,
+            "[sp-weights-loader] %s: dequanted Q4_K -> fp16 (%zu elems)\n",
+            slot, numel);
+        return scratch_pool.data();
+    }
+
     std::fprintf(stderr,
         "[sp-weights-loader] %s: unsupported type %d for fp16-or-dequant\n",
         slot, (int)t->type);

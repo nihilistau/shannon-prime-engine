@@ -1578,6 +1578,9 @@ static inline bool sp_blk_is_q4_0(const ggml_tensor* t) {
 static inline bool sp_blk_is_q4_1(const ggml_tensor* t) {
     return t && t->type == GGML_TYPE_Q4_1;
 }
+static inline bool sp_blk_is_q4_K(const ggml_tensor* t) {
+    return t && t->type == GGML_TYPE_Q4_K;
+}
 
 static bool sp_blk_import_q8(sp_ok_block_q8_tensor& dst,
                               sp_ok_arena&           arena,
@@ -1625,6 +1628,26 @@ static bool sp_blk_import_q4_1(sp_ok_block_q4_1_tensor& dst,
         reinterpret_cast<const sp_gguf_block_q4_1*>(src->data);
     return sp_ok_block_q4_1_from_gguf_q4_1(
         &dst, gsrc, dst.n_blocks, scale_recip, p, k) != 0;
+}
+
+/* Phase 15c: Q4_K_M imports as 8 sub-blocks per super-block into the
+ * same block_q4_1 storage as Q4_1. The kernel sees them identically;
+ * only the importer is different. */
+static bool sp_blk_import_q4_K(sp_ok_block_q4_1_tensor& dst,
+                                sp_ok_arena&             arena,
+                                const ggml_tensor*       src,
+                                int64_t                  p,
+                                int64_t                  k,
+                                int64_t                  scale_recip) {
+    if (!src) return false;
+    const size_t numel = (size_t)ggml_nelements(src);
+    if (numel == 0 || (numel % SP_OK_Q4_K_SUPER) != 0) return false;
+    if (!arena.alloc_tensor_block_q4_1(dst, numel)) return false;
+    const sp_gguf_block_q4_K* gsrc =
+        reinterpret_cast<const sp_gguf_block_q4_K*>(src->data);
+    const size_t n_super = numel / SP_OK_Q4_K_SUPER;
+    return sp_ok_block_q4_K_from_gguf_q4_K(
+        &dst, gsrc, n_super, scale_recip, p, k) != 0;
 }
 
 int sp_weights_ingest_gguf_block_quant(sp_weights&         weights,
@@ -1682,6 +1705,7 @@ int sp_weights_ingest_gguf_block_quant(sp_weights&         weights,
     int n_fused_q8   = 0;
     int n_fused_q4   = 0;
     int n_fused_q4_1 = 0;
+    int n_fused_q4_K = 0;
     int n_skipped    = 0;
 
     for (int L = 0; L < n_layers; ++L) {
@@ -1705,6 +1729,11 @@ int sp_weights_ingest_gguf_block_quant(sp_weights&         weights,
             } else if (sp_blk_is_q4_0(t)) {
                 q4_bytes += (numel / SP_OK_BLOCK_SIZE) * sizeof(sp_ok_q4_block_t) + 128;
             } else if (sp_blk_is_q4_1(t)) {
+                q4_1_bytes += (numel / SP_OK_BLOCK_SIZE) * sizeof(sp_ok_q4_1_block_t) + 128;
+            } else if (sp_blk_is_q4_K(t)) {
+                /* Q4_K fans out 1 super-block → 8 sub-blocks of size 32,
+                 * stored in the same q4_1 layout. Sizing is per 32-elem
+                 * sub-block just like q4_1. */
                 q4_1_bytes += (numel / SP_OK_BLOCK_SIZE) * sizeof(sp_ok_q4_1_block_t) + 128;
             }
         }
@@ -1784,23 +1813,35 @@ int sp_weights_ingest_gguf_block_quant(sp_weights&         weights,
                 shape_dst[s]->data = nullptr;
                 shape_dst[s]->scale_recip = scale_recip;
                 ++n_fused_q4_1;
+            } else if (sp_blk_is_q4_K(t)) {
+                if (!sp_blk_import_q4_K(*q4_1_dst[s],
+                                         weights.block_q4_1_layer_arenas[L],
+                                         t, p, k, scale_recip)) {
+                    std::fprintf(stderr,
+                        "[sp-block-quant] L%d %s: Q4_K import failed\n",
+                        L, slot_names[s]);
+                    return -1;
+                }
+                shape_dst[s]->data = nullptr;
+                shape_dst[s]->scale_recip = scale_recip;
+                ++n_fused_q4_K;
             } else {
                 ++n_skipped;
             }
         }
     }
 
-    if (n_fused_q8 > 0)           weights.use_block_q8 = true;
-    if (n_fused_q4 + n_fused_q4_1 > 0) weights.use_block_q4 = true;
+    if (n_fused_q8 > 0)                                weights.use_block_q8 = true;
+    if (n_fused_q4 + n_fused_q4_1 + n_fused_q4_K > 0)  weights.use_block_q4 = true;
 
     std::fprintf(stderr,
-        "[sp-block-quant] ingest: Q8_0 fused=%d  Q4_0 fused=%d  Q4_1 fused=%d  "
+        "[sp-block-quant] ingest: Q8_0=%d  Q4_0=%d  Q4_1=%d  Q4_K=%d  "
         "skipped=%d  use_block_q8=%d use_block_q4=%d  p=%lld k=%lld\n",
-        n_fused_q8, n_fused_q4, n_fused_q4_1, n_skipped,
+        n_fused_q8, n_fused_q4, n_fused_q4_1, n_fused_q4_K, n_skipped,
         weights.use_block_q8 ? 1 : 0, weights.use_block_q4 ? 1 : 0,
         (long long)p, (long long)k);
 
-    return n_fused_q8 + n_fused_q4 + n_fused_q4_1;
+    return n_fused_q8 + n_fused_q4 + n_fused_q4_1 + n_fused_q4_K;
 }
 
 }  // namespace sp::engine
