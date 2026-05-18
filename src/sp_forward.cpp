@@ -15,6 +15,8 @@
 #include "sp_ok_encode.h"
 #include "sp_rope.h"
 #include "sp_lt_memory.h"
+#include "llama_weights.h"
+#include <ggml.h>
 
 extern "C" {
 #include "../lib/shannon-prime/core/sp_frobenius.h"
@@ -92,10 +94,19 @@ bool sp_forward_context_init(sp_forward_context& ctx,
     // under use_q8. The non-Q8 path still uses the FFN scratch arena
     // sized for one layer's worth of decoded buffer (used by the
     // existing weight_decoded() helper if anyone calls it).
-    if (!weights.use_q8 && !weights.use_q4) {
+    if (!weights.use_q8 && !weights.use_q4 &&
+        !weights.use_block_q8 && !weights.use_block_q4) {
         const int64_t ffn_elems = (int64_t)weights.d_ff * (int64_t)weights.n_embd;
         const size_t  ffn_bytes_one = (size_t)ffn_elems * sizeof(sp_ok_t) + 4096;
         ctx.q8_decode_arena.reserve(3 * ffn_bytes_one);
+    } else if (weights.use_block_q4) {
+        std::fprintf(stderr,
+            "[sp_forward] block-Q4 mode: GGUF-fused 32-elem blocks, "
+            "1.0 B/elem + 0.5 B/elem block metadata\n");
+    } else if (weights.use_block_q8) {
+        std::fprintf(stderr,
+            "[sp_forward] block-Q8 mode: GGUF-fused 32-elem blocks, "
+            "2.0 B/elem + 0.5 B/elem block metadata\n");
     } else if (weights.use_q4) {
         std::fprintf(stderr,
             "[sp_forward] Q4 mode: fused matmul path "
@@ -1021,11 +1032,19 @@ bool sp_forward_step_prefill(sp_forward_context& ctx,
         if (!ctx.layer_arena.alloc_tensor(ctx.q_ok)) return false;
         if (!ctx.layer_arena.alloc_tensor(ctx.k_ok)) return false;
         if (!ctx.layer_arena.alloc_tensor(ctx.v_ok)) return false;
-        /* Phase 12 Step D / Phase 14: Q/K/V matmul. Under use_q4/use_q8,
-         * fuse the decode into the multiply inner loop -- no decoded
-         * scratch. q4 takes priority since the storage is mutually
-         * exclusive. */
-        if (weights.use_q4) {
+        /* Phase 12 Step D / Phase 14 / Phase 15: Q/K/V matmul. Priority
+         * order: block_q4 > block_q8 > q4 > q8 > raw. Block-quant paths
+         * read per-block fused scales (B_a, B_b); q4/q8 use per-tensor
+         * shift. */
+        if (weights.use_block_q4) {
+            if (!sp_matmul_ok_block_q4(W_q, weights.block_q4_wq[L], ctx.x_norm_ok, ctx.q_ok)) return false;
+            if (!sp_matmul_ok_block_q4(W_k, weights.block_q4_wk[L], ctx.x_norm_ok, ctx.k_ok)) return false;
+            if (!sp_matmul_ok_block_q4(W_v, weights.block_q4_wv[L], ctx.x_norm_ok, ctx.v_ok)) return false;
+        } else if (weights.use_block_q8) {
+            if (!sp_matmul_ok_block_q8(W_q, weights.block_q8_wq[L], ctx.x_norm_ok, ctx.q_ok)) return false;
+            if (!sp_matmul_ok_block_q8(W_k, weights.block_q8_wk[L], ctx.x_norm_ok, ctx.k_ok)) return false;
+            if (!sp_matmul_ok_block_q8(W_v, weights.block_q8_wv[L], ctx.x_norm_ok, ctx.v_ok)) return false;
+        } else if (weights.use_q4) {
             if (!sp_matmul_ok_q4(W_q, weights.q4_wq[L], ctx.x_norm_ok, ctx.q_ok)) return false;
             if (!sp_matmul_ok_q4(W_k, weights.q4_wk[L], ctx.x_norm_ok, ctx.k_ok)) return false;
             if (!sp_matmul_ok_q4(W_v, weights.q4_wv[L], ctx.x_norm_ok, ctx.v_ok)) return false;
@@ -1269,8 +1288,22 @@ bool sp_forward_step_prefill(sp_forward_context& ctx,
         // ---- end Phase 13.C recall + inject ----
 
         // 2g) Wo projection → fp32 (absorbs pi^k via Theorem 4).
-        // Phase 12 Step D / Phase 14: under use_q4/use_q8, fused path.
-        if (weights.use_q4) {
+        // Phase 12 / 14 / 15: priority block_q4 > block_q8 > q4 > q8 > raw.
+        if (weights.use_block_q4) {
+            if (!sp_matmul_ok_block_q4_to_fp32(W_o, weights.block_q4_wo[L],
+                    ctx.attn_out_ok, ctx.proj_out_fp32.data(),
+                    n_embd, n_tokens)) {
+                std::fprintf(stderr, "[sp_forward] L%d Wo matmul (block_q4) failed\n", L);
+                return false;
+            }
+        } else if (weights.use_block_q8) {
+            if (!sp_matmul_ok_block_q8_to_fp32(W_o, weights.block_q8_wo[L],
+                    ctx.attn_out_ok, ctx.proj_out_fp32.data(),
+                    n_embd, n_tokens)) {
+                std::fprintf(stderr, "[sp_forward] L%d Wo matmul (block_q8) failed\n", L);
+                return false;
+            }
+        } else if (weights.use_q4) {
             if (!sp_matmul_ok_q4_to_fp32(W_o, weights.q4_wo[L], ctx.attn_out_ok,
                                           ctx.proj_out_fp32.data(),
                                           n_embd, n_tokens)) {
@@ -1333,10 +1366,33 @@ bool sp_forward_step_prefill(sp_forward_context& ctx,
         // 2k) FFN → fp32 (absorbs ffn_down's frobenius_scale). Activation
         //     selected by ctx.ffn_act: SwiGLU (silu) for Llama / Qwen,
         //     GeGLU_tanh (gelu) for Gemma family.
-        /* Phase 12 Step D / Phase 14: fused FFN. Q4 takes priority over
-         * Q8 (mutually exclusive). Falls through to the resident sp_ok_t
-         * path when no packed storage is live. */
-        if (weights.use_q4) {
+        /* Phase 12 / 14 / 15: fused FFN.
+         * Priority: block_q4 > block_q8 > q4 > q8 > raw. */
+        if (weights.use_block_q4) {
+            if (!sp_ffn_swiglu_to_fp32_block_q4(ctx.x_norm_ok,
+                    W_gate, weights.block_q4_ffn_gate[L],
+                    W_up,   weights.block_q4_ffn_up[L],
+                    W_down, weights.block_q4_ffn_down[L],
+                    ctx.proj_out_fp32.data(),
+                    n_tokens,
+                    ctx.layer_arena,
+                    ctx.ffn_act)) {
+                std::fprintf(stderr, "[sp_forward] L%d FFN (block_q4) failed\n", L);
+                return false;
+            }
+        } else if (weights.use_block_q8) {
+            if (!sp_ffn_swiglu_to_fp32_block_q8(ctx.x_norm_ok,
+                    W_gate, weights.block_q8_ffn_gate[L],
+                    W_up,   weights.block_q8_ffn_up[L],
+                    W_down, weights.block_q8_ffn_down[L],
+                    ctx.proj_out_fp32.data(),
+                    n_tokens,
+                    ctx.layer_arena,
+                    ctx.ffn_act)) {
+                std::fprintf(stderr, "[sp_forward] L%d FFN (block_q8) failed\n", L);
+                return false;
+            }
+        } else if (weights.use_q4) {
             if (!sp_ffn_swiglu_to_fp32_q4(ctx.x_norm_ok,
                                             W_gate, weights.q4_ffn_gate[L],
                                             W_up,   weights.q4_ffn_up[L],
@@ -1468,6 +1524,200 @@ bool sp_forward_step(sp_forward_context& ctx,
                      std::vector<float>& logits_out) {
     return sp_forward_step_prefill(ctx, weights, &token_id, 1,
                                     position, logits_out);
+}
+
+// =========================================================================
+// Phase 15: GGUF Q8_0 / Q4_0 block-quant ingest
+// =========================================================================
+//
+// For each weight tensor in the LlamaWeights, branch on the ggml type:
+//   GGML_TYPE_Q8_0 -> sp_ok_block_q8_from_gguf_q8_0
+//   GGML_TYPE_Q4_0 -> sp_ok_block_q4_from_gguf_q4_0
+//   other          -> log + skip (the caller already populated the fp16
+//                     path for norms / embeddings)
+//
+// Sets weights.use_block_q8 / use_block_q4 based on what was consumed.
+
+static inline bool sp_blk_is_q8_0(const ggml_tensor* t) {
+    return t && t->type == GGML_TYPE_Q8_0;
+}
+static inline bool sp_blk_is_q4_0(const ggml_tensor* t) {
+    return t && t->type == GGML_TYPE_Q4_0;
+}
+
+static bool sp_blk_import_q8(sp_ok_block_q8_tensor& dst,
+                              sp_ok_arena&           arena,
+                              const ggml_tensor*     src,
+                              int64_t                p,
+                              int64_t                k,
+                              int64_t                scale_recip) {
+    if (!src) return false;
+    const size_t numel = (size_t)ggml_nelements(src);
+    if (numel == 0 || (numel % SP_OK_BLOCK_SIZE) != 0) return false;
+    if (!arena.alloc_tensor_block_q8(dst, numel)) return false;
+    const sp_gguf_block_q8_0* gsrc =
+        reinterpret_cast<const sp_gguf_block_q8_0*>(src->data);
+    return sp_ok_block_q8_from_gguf_q8_0(
+        &dst, gsrc, dst.n_blocks, scale_recip, p, k) != 0;
+}
+
+static bool sp_blk_import_q4(sp_ok_block_q4_tensor& dst,
+                              sp_ok_arena&           arena,
+                              const ggml_tensor*     src,
+                              int64_t                p,
+                              int64_t                k,
+                              int64_t                scale_recip) {
+    if (!src) return false;
+    const size_t numel = (size_t)ggml_nelements(src);
+    if (numel == 0 || (numel % SP_OK_BLOCK_SIZE) != 0) return false;
+    if (!arena.alloc_tensor_block_q4(dst, numel)) return false;
+    const sp_gguf_block_q4_0* gsrc =
+        reinterpret_cast<const sp_gguf_block_q4_0*>(src->data);
+    return sp_ok_block_q4_from_gguf_q4_0(
+        &dst, gsrc, dst.n_blocks, scale_recip, p, k) != 0;
+}
+
+int sp_weights_ingest_gguf_block_quant(sp_weights&         weights,
+                                         const LlamaWeights& src,
+                                         int64_t             p,
+                                         int64_t             k,
+                                         int64_t             scale_recip) {
+    const auto& layers = src.layers();
+    const int n_layers = (int)layers.size();
+    if (n_layers <= 0) {
+        std::fprintf(stderr,
+            "[sp-block-quant] no layers in LlamaWeights\n");
+        return 0;
+    }
+    if (weights.n_layers != n_layers) {
+        std::fprintf(stderr,
+            "[sp-block-quant] sp_weights n_layers=%d vs LlamaWeights "
+            "n_layers=%d mismatch\n", weights.n_layers, n_layers);
+        return 0;
+    }
+
+    /* Allocate per-layer block_q8/q4 slot vectors. We size both vectors
+     * always; whichever the GGUF actually contains gets populated, the
+     * other stays empty + zeroed. */
+    weights.block_q8_wq.assign(n_layers, {});
+    weights.block_q8_wk.assign(n_layers, {});
+    weights.block_q8_wv.assign(n_layers, {});
+    weights.block_q8_wo.assign(n_layers, {});
+    weights.block_q8_ffn_gate.assign(n_layers, {});
+    weights.block_q8_ffn_up.assign(n_layers, {});
+    weights.block_q8_ffn_down.assign(n_layers, {});
+    weights.block_q8_layer_arenas.clear();
+    weights.block_q8_layer_arenas.resize(n_layers);
+
+    weights.block_q4_wq.assign(n_layers, {});
+    weights.block_q4_wk.assign(n_layers, {});
+    weights.block_q4_wv.assign(n_layers, {});
+    weights.block_q4_wo.assign(n_layers, {});
+    weights.block_q4_ffn_gate.assign(n_layers, {});
+    weights.block_q4_ffn_up.assign(n_layers, {});
+    weights.block_q4_ffn_down.assign(n_layers, {});
+    weights.block_q4_layer_arenas.clear();
+    weights.block_q4_layer_arenas.resize(n_layers);
+
+    int n_fused_q8 = 0;
+    int n_fused_q4 = 0;
+    int n_skipped  = 0;
+
+    for (int L = 0; L < n_layers; ++L) {
+        const auto& lyr = layers[L];
+
+        /* Pre-size the per-layer arenas. Compute total bytes needed by
+         * iterating tensor pointers + their numels. */
+        size_t q8_bytes = 0;
+        size_t q4_bytes = 0;
+        const ggml_tensor* slots[7] = {
+            lyr.wq, lyr.wk, lyr.wv, lyr.wo,
+            lyr.ffn_gate, lyr.ffn_up, lyr.ffn_down
+        };
+        for (int s = 0; s < 7; ++s) {
+            const ggml_tensor* t = slots[s];
+            if (!t) continue;
+            const size_t numel = (size_t)ggml_nelements(t);
+            if (sp_blk_is_q8_0(t)) {
+                q8_bytes += (numel / SP_OK_BLOCK_SIZE) * sizeof(sp_ok_q8_block_t) + 128;
+            } else if (sp_blk_is_q4_0(t)) {
+                q4_bytes += (numel / SP_OK_BLOCK_SIZE) * sizeof(sp_ok_q4_block_t) + 128;
+            }
+        }
+        if (q8_bytes > 0) weights.block_q8_layer_arenas[L].reserve(q8_bytes + 4096);
+        if (q4_bytes > 0) weights.block_q4_layer_arenas[L].reserve(q4_bytes + 4096);
+
+        /* Walk and ingest. */
+        sp_ok_block_q8_tensor* q8_dst[7] = {
+            &weights.block_q8_wq[L], &weights.block_q8_wk[L],
+            &weights.block_q8_wv[L], &weights.block_q8_wo[L],
+            &weights.block_q8_ffn_gate[L], &weights.block_q8_ffn_up[L],
+            &weights.block_q8_ffn_down[L]
+        };
+        sp_ok_block_q4_tensor* q4_dst[7] = {
+            &weights.block_q4_wq[L], &weights.block_q4_wk[L],
+            &weights.block_q4_wv[L], &weights.block_q4_wo[L],
+            &weights.block_q4_ffn_gate[L], &weights.block_q4_ffn_up[L],
+            &weights.block_q4_ffn_down[L]
+        };
+        sp_ok_tensor* shape_dst[7] = {
+            &weights.wq[L], &weights.wk[L], &weights.wv[L], &weights.wo[L],
+            &weights.ffn_gate[L], &weights.ffn_up[L], &weights.ffn_down[L]
+        };
+        const char* slot_names[7] = {
+            "wq", "wk", "wv", "wo", "ffn_gate", "ffn_up", "ffn_down"
+        };
+
+        for (int s = 0; s < 7; ++s) {
+            const ggml_tensor* t = slots[s];
+            if (!t) continue;
+            if (sp_blk_is_q8_0(t)) {
+                if (!sp_blk_import_q8(*q8_dst[s],
+                                       weights.block_q8_layer_arenas[L],
+                                       t, p, k, scale_recip)) {
+                    std::fprintf(stderr,
+                        "[sp-block-quant] L%d %s: Q8_0 import failed\n",
+                        L, slot_names[s]);
+                    return -1;
+                }
+                /* Null out the sp_ok_tensor.data so any matmul reading
+                 * raw weights would crash loudly instead of silently
+                 * reading garbage. Keep shape + scale metadata for the
+                 * downstream divisor. */
+                shape_dst[s]->data = nullptr;
+                shape_dst[s]->scale_recip = scale_recip;
+                /* frobenius_scale stays at its post-shim value, set by
+                 * the standard load path before this fn was invoked. */
+                ++n_fused_q8;
+            } else if (sp_blk_is_q4_0(t)) {
+                if (!sp_blk_import_q4(*q4_dst[s],
+                                       weights.block_q4_layer_arenas[L],
+                                       t, p, k, scale_recip)) {
+                    std::fprintf(stderr,
+                        "[sp-block-quant] L%d %s: Q4_0 import failed\n",
+                        L, slot_names[s]);
+                    return -1;
+                }
+                shape_dst[s]->data = nullptr;
+                shape_dst[s]->scale_recip = scale_recip;
+                ++n_fused_q4;
+            } else {
+                ++n_skipped;
+            }
+        }
+    }
+
+    if (n_fused_q8 > 0) weights.use_block_q8 = true;
+    if (n_fused_q4 > 0) weights.use_block_q4 = true;
+
+    std::fprintf(stderr,
+        "[sp-block-quant] ingest: Q8_0 fused=%d  Q4_0 fused=%d  skipped=%d  "
+        "use_block_q8=%d use_block_q4=%d  p=%lld k=%lld\n",
+        n_fused_q8, n_fused_q4, n_skipped,
+        weights.use_block_q8 ? 1 : 0, weights.use_block_q4 ? 1 : 0,
+        (long long)p, (long long)k);
+
+    return n_fused_q8 + n_fused_q4;
 }
 
 }  // namespace sp::engine

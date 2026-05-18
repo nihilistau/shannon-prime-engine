@@ -271,6 +271,7 @@ bool sp_weights_load_from_fp16_source(sp_weights& out,
             "(use_q8=%d)\n",
             mode, n_packed, out.use_q8 ? 1 : 0);
     }
+
     return true;
 }
 
@@ -452,7 +453,25 @@ bool sp_weights_load_from_llama(sp_weights& out,
         weights.output_norm, final_norm_scratch, n_embd, "final_norm");
     src.layers    = layer_srcs.data();
 
-    return sp_weights_load_from_fp16_source(out, src, cfg, scale_recip);
+    if (!sp_weights_load_from_fp16_source(out, src, cfg, scale_recip)) {
+        return false;
+    }
+
+    /* Phase 15: --gguf-block-quant overlay. The fp16 path above already
+     * loaded norms / embeddings and (when applicable) ran the Frobenius
+     * shim on the per-tensor sp_ok_t weights. The ingest now walks the
+     * LlamaWeights again, picks tensors with type Q8_0 / Q4_0, and
+     * overlays the block-fused storage on top — nulling the original
+     * sp_ok_tensor data ptrs so the forward dispatch routes through the
+     * new block_q{8,4} kernels. */
+    if (cfg.gguf_block_quant) {
+        const int64_t p = cfg.frobenius_quant ? cfg.frobenius_p : (int64_t)41;
+        const int64_t k = cfg.frobenius_quant ? cfg.frobenius_k : (int64_t)8;
+        int n_fused = sp_weights_ingest_gguf_block_quant(
+            out, weights, p, k, scale_recip);
+        if (n_fused < 0) return false;
+    }
+    return true;
 }
 
 }  // namespace sp::engine

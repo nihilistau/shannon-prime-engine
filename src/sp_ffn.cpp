@@ -261,4 +261,106 @@ bool sp_ffn_swiglu_to_fp32_q4(const sp_ok_tensor&    x,
     return true;
 }
 
+// =========================================================================
+// Phase 15: block-quant FFN variants
+// =========================================================================
+
+bool sp_ffn_swiglu_to_fp32_block_q8(const sp_ok_tensor&          x,
+                                     const sp_ok_tensor&          gate_w_shape,
+                                     const sp_ok_block_q8_tensor& gate_w_blk,
+                                     const sp_ok_tensor&          up_w_shape,
+                                     const sp_ok_block_q8_tensor& up_w_blk,
+                                     const sp_ok_tensor&          down_w_shape,
+                                     const sp_ok_block_q8_tensor& down_w_blk,
+                                     float*                       out_fp32,
+                                     int                          n_tokens,
+                                     sp_ok_arena&                 scratch_arena,
+                                     sp_ffn_act                   act) {
+    if (x.data == nullptr || out_fp32 == nullptr) return false;
+    if (gate_w_blk.blocks == nullptr || up_w_blk.blocks == nullptr ||
+        down_w_blk.blocks == nullptr) return false;
+    const int n_embd = (int)gate_w_shape.shape[0];
+    const int d_ff   = (int)gate_w_shape.shape[1];
+    if (n_embd <= 0 || d_ff <= 0 || n_tokens <= 0) return false;
+
+    std::vector<float> gate_all(d_ff * n_tokens);
+    std::vector<float> up_all(d_ff * n_tokens);
+    std::vector<float> act_all(d_ff * n_tokens);
+
+    if (!sp_matmul_ok_block_q8_to_fp32(gate_w_shape, gate_w_blk, x,
+                                        gate_all.data(), d_ff, n_tokens)) return false;
+    if (!sp_matmul_ok_block_q8_to_fp32(up_w_shape, up_w_blk, x,
+                                        up_all.data(),   d_ff, n_tokens)) return false;
+
+    switch (act) {
+    case sp_ffn_act::SwiGLU:
+        sp_silu_bridge(gate_all.data(), up_all.data(),
+                       d_ff * n_tokens, act_all.data());
+        break;
+    case sp_ffn_act::GeGLU_tanh:
+        sp_gelu_tanh_bridge(gate_all.data(), up_all.data(),
+                            d_ff * n_tokens, act_all.data());
+        break;
+    }
+
+    sp_ok_tensor act_ok;
+    int64_t act_shape[4] = { n_tokens, d_ff, 1, 1 };
+    if (!sp_ok_encode_from_fp32(act_ok, act_all.data(), 2, act_shape,
+                                  /*scale*/ down_w_shape.scale_recip,
+                                  scratch_arena)) {
+        return false;
+    }
+    return sp_matmul_ok_block_q8_to_fp32(down_w_shape, down_w_blk, act_ok,
+                                          out_fp32, n_embd, n_tokens);
+}
+
+bool sp_ffn_swiglu_to_fp32_block_q4(const sp_ok_tensor&          x,
+                                     const sp_ok_tensor&          gate_w_shape,
+                                     const sp_ok_block_q4_tensor& gate_w_blk,
+                                     const sp_ok_tensor&          up_w_shape,
+                                     const sp_ok_block_q4_tensor& up_w_blk,
+                                     const sp_ok_tensor&          down_w_shape,
+                                     const sp_ok_block_q4_tensor& down_w_blk,
+                                     float*                       out_fp32,
+                                     int                          n_tokens,
+                                     sp_ok_arena&                 scratch_arena,
+                                     sp_ffn_act                   act) {
+    if (x.data == nullptr || out_fp32 == nullptr) return false;
+    if (gate_w_blk.blocks == nullptr || up_w_blk.blocks == nullptr ||
+        down_w_blk.blocks == nullptr) return false;
+    const int n_embd = (int)gate_w_shape.shape[0];
+    const int d_ff   = (int)gate_w_shape.shape[1];
+    if (n_embd <= 0 || d_ff <= 0 || n_tokens <= 0) return false;
+
+    std::vector<float> gate_all(d_ff * n_tokens);
+    std::vector<float> up_all(d_ff * n_tokens);
+    std::vector<float> act_all(d_ff * n_tokens);
+
+    if (!sp_matmul_ok_block_q4_to_fp32(gate_w_shape, gate_w_blk, x,
+                                        gate_all.data(), d_ff, n_tokens)) return false;
+    if (!sp_matmul_ok_block_q4_to_fp32(up_w_shape, up_w_blk, x,
+                                        up_all.data(),   d_ff, n_tokens)) return false;
+
+    switch (act) {
+    case sp_ffn_act::SwiGLU:
+        sp_silu_bridge(gate_all.data(), up_all.data(),
+                       d_ff * n_tokens, act_all.data());
+        break;
+    case sp_ffn_act::GeGLU_tanh:
+        sp_gelu_tanh_bridge(gate_all.data(), up_all.data(),
+                            d_ff * n_tokens, act_all.data());
+        break;
+    }
+
+    sp_ok_tensor act_ok;
+    int64_t act_shape[4] = { n_tokens, d_ff, 1, 1 };
+    if (!sp_ok_encode_from_fp32(act_ok, act_all.data(), 2, act_shape,
+                                  /*scale*/ down_w_shape.scale_recip,
+                                  scratch_arena)) {
+        return false;
+    }
+    return sp_matmul_ok_block_q4_to_fp32(down_w_shape, down_w_blk, act_ok,
+                                          out_fp32, n_embd, n_tokens);
+}
+
 }  // namespace sp::engine

@@ -193,6 +193,19 @@ struct Config {
     //
     // 0 disables pruning (encode every value).
     uint64_t    frobenius_q4_prune = 0;
+
+    // Phase 15: --gguf-block-quant.
+    // Read GGUF Q8_0 / Q4_0 tensors directly. Fuses each block's fp16
+    // scale with the Frobenius element π^k into per-block (B_a, B_b)
+    // integers at load time, leaves the int4/int8 codepoints untouched.
+    // Solves the Phase 14 Q4 per-tensor-shift blowout by inheriting
+    // GGUF's per-block scale resolution.
+    //
+    // Detected per-tensor: tensors stored as GGML_TYPE_Q8_0 or
+    // GGML_TYPE_Q4_0 get fused; others fall back to the standard fp16
+    // path. Mutually exclusive with --frobenius-q8 and --frobenius-q4
+    // at the per-weights-load level (only one packed storage flag wins).
+    bool        gguf_block_quant   = false;
 };
 
 // Seed Config fields from environment variables. Called by each CLI verb

@@ -86,4 +86,31 @@ bool sp_ffn_swiglu_to_fp32_q4(const sp_ok_tensor&    x,
                               sp_ok_arena&           scratch_arena,
                               sp_ffn_act             act = sp_ffn_act::SwiGLU);
 
+// -----------------------------------------------------------------------
+// Phase 15: GGUF block-quant fused FFN variants.
+// -----------------------------------------------------------------------
+bool sp_ffn_swiglu_to_fp32_block_q8(const sp_ok_tensor&          x,
+                                     const sp_ok_tensor&          gate_w_shape,
+                                     const sp_ok_block_q8_tensor& gate_w_blk,
+                                     const sp_ok_tensor&          up_w_shape,
+                                     const sp_ok_block_q8_tensor& up_w_blk,
+                                     const sp_ok_tensor&          down_w_shape,
+                                     const sp_ok_block_q8_tensor& down_w_blk,
+                                     float*                       out_fp32,
+                                     int                          n_tokens,
+                                     sp_ok_arena&                 scratch_arena,
+                                     sp_ffn_act                   act = sp_ffn_act::SwiGLU);
+
+bool sp_ffn_swiglu_to_fp32_block_q4(const sp_ok_tensor&          x,
+                                     const sp_ok_tensor&          gate_w_shape,
+                                     const sp_ok_block_q4_tensor& gate_w_blk,
+                                     const sp_ok_tensor&          up_w_shape,
+                                     const sp_ok_block_q4_tensor& up_w_blk,
+                                     const sp_ok_tensor&          down_w_shape,
+                                     const sp_ok_block_q4_tensor& down_w_blk,
+                                     float*                       out_fp32,
+                                     int                          n_tokens,
+                                     sp_ok_arena&                 scratch_arena,
+                                     sp_ffn_act                   act = sp_ffn_act::SwiGLU);
+
 }  // namespace sp::engine

@@ -401,6 +401,26 @@ int sp_weights_convert_to_q8(sp_weights& weights);
 int sp_weights_convert_to_q4(sp_weights& weights,
                               uint64_t    prune_threshold = 0);
 
+// Phase 15: ingest GGUF Q8_0 / Q4_0 tensors directly into block-fused
+// storage. Caller passes the LlamaWeights walker plus the Frobenius
+// (p, k); the function reads each tensor's ggml type, branches to the
+// appropriate sp_ok_block_q{8,4}_from_gguf_q{8,4}_0 importer, and
+// populates weights.block_q{8,4}_* slot vectors.
+//
+// Tensors that aren't Q8_0 or Q4_0 (e.g. fp16 norms, fp32 embed) are
+// left to the existing fp16 path -- the caller is expected to invoke
+// sp_weights_load_from_llama for norms + embeddings first, then this
+// function to overlay the block-quant weight storage on top.
+//
+// Returns count of tensors successfully fused. Sets weights.use_block_q8
+// and / or weights.use_block_q4 based on what was actually consumed.
+class LlamaWeights;
+int sp_weights_ingest_gguf_block_quant(sp_weights&         weights,
+                                         const LlamaWeights& src,
+                                         int64_t             p,
+                                         int64_t             k,
+                                         int64_t             scale_recip);
+
 // Run a single forward step: given a token id, produce logits[vocab].
 //
 // Phase 2.2d (LIVE):

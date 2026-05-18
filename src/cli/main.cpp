@@ -235,6 +235,12 @@ static void usage(const char* prog) {
         "                               packing. Produces runs of 0x00 bytes\n"
         "                               for downstream entropy coding.\n"
         "                               Implies --frobenius-q4.\n"
+        "  --gguf-block-quant           Read GGUF Q8_0 / Q4_0 tensors directly\n"
+        "                               and fuse each block's fp16 scale with\n"
+        "                               the Frobenius element pi^k. Inherits\n"
+        "                               GGUF's per-block calibration. Targets\n"
+        "                               pre-quantised models (e.g. gemma-3-1b-\n"
+        "                               it-Q8_0.gguf).\n"
         "\n"
         "  --sato-tate-mix p1,k1,p2,k2  Asymmetric mixed-precision (Config E):\n"
         "                               inert prime p1 (zero-drift channel) +\n"
@@ -333,6 +339,7 @@ static int parse_config_flag(sp::engine::Config& cfg, const char* a, const char*
     if (a_eq("--frobenius-q8"))                     { cfg.frobenius_q8 = true; return 1; }
     if (a_eq("--frobenius-q4"))                     { cfg.frobenius_q4 = true; return 1; }
     if (a_eq("--frobenius-q4-prune") && has_next)   { cfg.frobenius_q4_prune = (uint64_t)std::atoll(next); cfg.frobenius_q4 = true; return 2; }
+    if (a_eq("--gguf-block-quant"))                 { cfg.gguf_block_quant = true; return 1; }
     if (a_eq("--sato-tate-mix") && has_next) {
         // Format: "p1,k1,p2,k2". Defaults stay if parse fails.
         long long a, b, c, d;
