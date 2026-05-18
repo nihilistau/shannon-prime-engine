@@ -1037,9 +1037,20 @@ bool sp_forward_step_prefill(sp_forward_context& ctx,
          * read per-block fused scales (B_a, B_b); q4/q8 use per-tensor
          * shift. */
         if (weights.use_block_q4) {
-            if (!sp_matmul_ok_block_q4(W_q, weights.block_q4_wq[L], ctx.x_norm_ok, ctx.q_ok)) return false;
-            if (!sp_matmul_ok_block_q4(W_k, weights.block_q4_wk[L], ctx.x_norm_ok, ctx.k_ok)) return false;
-            if (!sp_matmul_ok_block_q4(W_v, weights.block_q4_wv[L], ctx.x_norm_ok, ctx.v_ok)) return false;
+            /* Per-tensor dispatch: either block_q4_*[L] or block_q4_1_*[L]
+             * has populated blocks; the other is empty. */
+            auto blk_qkv = [&](const sp_ok_tensor& W_shape,
+                                const sp_ok_block_q4_tensor& q4_0,
+                                const sp_ok_block_q4_1_tensor& q4_1,
+                                const sp_ok_tensor& X_in,
+                                sp_ok_tensor& Y_out) -> bool {
+                if (q4_0.blocks) return sp_matmul_ok_block_q4(W_shape, q4_0, X_in, Y_out);
+                if (q4_1.blocks) return sp_matmul_ok_block_q4_1(W_shape, q4_1, X_in, Y_out);
+                return false;
+            };
+            if (!blk_qkv(W_q, weights.block_q4_wq[L], weights.block_q4_1_wq[L], ctx.x_norm_ok, ctx.q_ok)) return false;
+            if (!blk_qkv(W_k, weights.block_q4_wk[L], weights.block_q4_1_wk[L], ctx.x_norm_ok, ctx.k_ok)) return false;
+            if (!blk_qkv(W_v, weights.block_q4_wv[L], weights.block_q4_1_wv[L], ctx.x_norm_ok, ctx.v_ok)) return false;
         } else if (weights.use_block_q8) {
             if (!sp_matmul_ok_block_q8(W_q, weights.block_q8_wq[L], ctx.x_norm_ok, ctx.q_ok)) return false;
             if (!sp_matmul_ok_block_q8(W_k, weights.block_q8_wk[L], ctx.x_norm_ok, ctx.k_ok)) return false;
@@ -1290,10 +1301,18 @@ bool sp_forward_step_prefill(sp_forward_context& ctx,
         // 2g) Wo projection → fp32 (absorbs pi^k via Theorem 4).
         // Phase 12 / 14 / 15: priority block_q4 > block_q8 > q4 > q8 > raw.
         if (weights.use_block_q4) {
-            if (!sp_matmul_ok_block_q4_to_fp32(W_o, weights.block_q4_wo[L],
+            bool wo_ok = false;
+            if (weights.block_q4_wo[L].blocks) {
+                wo_ok = sp_matmul_ok_block_q4_to_fp32(W_o, weights.block_q4_wo[L],
                     ctx.attn_out_ok, ctx.proj_out_fp32.data(),
-                    n_embd, n_tokens)) {
-                std::fprintf(stderr, "[sp_forward] L%d Wo matmul (block_q4) failed\n", L);
+                    n_embd, n_tokens);
+            } else if (weights.block_q4_1_wo[L].blocks) {
+                wo_ok = sp_matmul_ok_block_q4_1_to_fp32(W_o, weights.block_q4_1_wo[L],
+                    ctx.attn_out_ok, ctx.proj_out_fp32.data(),
+                    n_embd, n_tokens);
+            }
+            if (!wo_ok) {
+                std::fprintf(stderr, "[sp_forward] L%d Wo matmul (block_q4 mixed) failed\n", L);
                 return false;
             }
         } else if (weights.use_block_q8) {
@@ -1369,15 +1388,27 @@ bool sp_forward_step_prefill(sp_forward_context& ctx,
         /* Phase 12 / 14 / 15: fused FFN.
          * Priority: block_q4 > block_q8 > q4 > q8 > raw. */
         if (weights.use_block_q4) {
-            if (!sp_ffn_swiglu_to_fp32_block_q4(ctx.x_norm_ok,
-                    W_gate, weights.block_q4_ffn_gate[L],
-                    W_up,   weights.block_q4_ffn_up[L],
-                    W_down, weights.block_q4_ffn_down[L],
+            /* Mixed Q4_0 / Q4_1: each FFN tensor is either populated as
+             * block_q4_*[L] (Q4_0) or block_q4_1_*[L] (Q4_1). Pass both
+             * pointers; helper picks the non-null one. */
+            const auto& gq40 = weights.block_q4_ffn_gate[L];
+            const auto& gq41 = weights.block_q4_1_ffn_gate[L];
+            const auto& uq40 = weights.block_q4_ffn_up[L];
+            const auto& uq41 = weights.block_q4_1_ffn_up[L];
+            const auto& dq40 = weights.block_q4_ffn_down[L];
+            const auto& dq41 = weights.block_q4_1_ffn_down[L];
+            if (!sp_ffn_swiglu_to_fp32_block_q4_mixed(ctx.x_norm_ok,
+                    W_gate, gq40.blocks ? &gq40 : nullptr,
+                             gq41.blocks ? &gq41 : nullptr,
+                    W_up,   uq40.blocks ? &uq40 : nullptr,
+                             uq41.blocks ? &uq41 : nullptr,
+                    W_down, dq40.blocks ? &dq40 : nullptr,
+                             dq41.blocks ? &dq41 : nullptr,
                     ctx.proj_out_fp32.data(),
                     n_tokens,
                     ctx.layer_arena,
                     ctx.ffn_act)) {
-                std::fprintf(stderr, "[sp_forward] L%d FFN (block_q4) failed\n", L);
+                std::fprintf(stderr, "[sp_forward] L%d FFN (block_q4 mixed) failed\n", L);
                 return false;
             }
         } else if (weights.use_block_q8) {
@@ -1544,6 +1575,9 @@ static inline bool sp_blk_is_q8_0(const ggml_tensor* t) {
 static inline bool sp_blk_is_q4_0(const ggml_tensor* t) {
     return t && t->type == GGML_TYPE_Q4_0;
 }
+static inline bool sp_blk_is_q4_1(const ggml_tensor* t) {
+    return t && t->type == GGML_TYPE_Q4_1;
+}
 
 static bool sp_blk_import_q8(sp_ok_block_q8_tensor& dst,
                               sp_ok_arena&           arena,
@@ -1574,6 +1608,22 @@ static bool sp_blk_import_q4(sp_ok_block_q4_tensor& dst,
     const sp_gguf_block_q4_0* gsrc =
         reinterpret_cast<const sp_gguf_block_q4_0*>(src->data);
     return sp_ok_block_q4_from_gguf_q4_0(
+        &dst, gsrc, dst.n_blocks, scale_recip, p, k) != 0;
+}
+
+static bool sp_blk_import_q4_1(sp_ok_block_q4_1_tensor& dst,
+                                sp_ok_arena&             arena,
+                                const ggml_tensor*       src,
+                                int64_t                  p,
+                                int64_t                  k,
+                                int64_t                  scale_recip) {
+    if (!src) return false;
+    const size_t numel = (size_t)ggml_nelements(src);
+    if (numel == 0 || (numel % SP_OK_BLOCK_SIZE) != 0) return false;
+    if (!arena.alloc_tensor_block_q4_1(dst, numel)) return false;
+    const sp_gguf_block_q4_1* gsrc =
+        reinterpret_cast<const sp_gguf_block_q4_1*>(src->data);
+    return sp_ok_block_q4_1_from_gguf_q4_1(
         &dst, gsrc, dst.n_blocks, scale_recip, p, k) != 0;
 }
 
@@ -1619,17 +1669,29 @@ int sp_weights_ingest_gguf_block_quant(sp_weights&         weights,
     weights.block_q4_layer_arenas.clear();
     weights.block_q4_layer_arenas.resize(n_layers);
 
-    int n_fused_q8 = 0;
-    int n_fused_q4 = 0;
-    int n_skipped  = 0;
+    weights.block_q4_1_wq.assign(n_layers, {});
+    weights.block_q4_1_wk.assign(n_layers, {});
+    weights.block_q4_1_wv.assign(n_layers, {});
+    weights.block_q4_1_wo.assign(n_layers, {});
+    weights.block_q4_1_ffn_gate.assign(n_layers, {});
+    weights.block_q4_1_ffn_up.assign(n_layers, {});
+    weights.block_q4_1_ffn_down.assign(n_layers, {});
+    weights.block_q4_1_layer_arenas.clear();
+    weights.block_q4_1_layer_arenas.resize(n_layers);
+
+    int n_fused_q8   = 0;
+    int n_fused_q4   = 0;
+    int n_fused_q4_1 = 0;
+    int n_skipped    = 0;
 
     for (int L = 0; L < n_layers; ++L) {
         const auto& lyr = layers[L];
 
         /* Pre-size the per-layer arenas. Compute total bytes needed by
          * iterating tensor pointers + their numels. */
-        size_t q8_bytes = 0;
-        size_t q4_bytes = 0;
+        size_t q8_bytes   = 0;
+        size_t q4_bytes   = 0;
+        size_t q4_1_bytes = 0;
         const ggml_tensor* slots[7] = {
             lyr.wq, lyr.wk, lyr.wv, lyr.wo,
             lyr.ffn_gate, lyr.ffn_up, lyr.ffn_down
@@ -1642,10 +1704,13 @@ int sp_weights_ingest_gguf_block_quant(sp_weights&         weights,
                 q8_bytes += (numel / SP_OK_BLOCK_SIZE) * sizeof(sp_ok_q8_block_t) + 128;
             } else if (sp_blk_is_q4_0(t)) {
                 q4_bytes += (numel / SP_OK_BLOCK_SIZE) * sizeof(sp_ok_q4_block_t) + 128;
+            } else if (sp_blk_is_q4_1(t)) {
+                q4_1_bytes += (numel / SP_OK_BLOCK_SIZE) * sizeof(sp_ok_q4_1_block_t) + 128;
             }
         }
-        if (q8_bytes > 0) weights.block_q8_layer_arenas[L].reserve(q8_bytes + 4096);
-        if (q4_bytes > 0) weights.block_q4_layer_arenas[L].reserve(q4_bytes + 4096);
+        if (q8_bytes > 0)   weights.block_q8_layer_arenas[L].reserve(q8_bytes + 4096);
+        if (q4_bytes > 0)   weights.block_q4_layer_arenas[L].reserve(q4_bytes + 4096);
+        if (q4_1_bytes > 0) weights.block_q4_1_layer_arenas[L].reserve(q4_1_bytes + 4096);
 
         /* Walk and ingest. */
         sp_ok_block_q8_tensor* q8_dst[7] = {
@@ -1659,6 +1724,12 @@ int sp_weights_ingest_gguf_block_quant(sp_weights&         weights,
             &weights.block_q4_wv[L], &weights.block_q4_wo[L],
             &weights.block_q4_ffn_gate[L], &weights.block_q4_ffn_up[L],
             &weights.block_q4_ffn_down[L]
+        };
+        sp_ok_block_q4_1_tensor* q4_1_dst[7] = {
+            &weights.block_q4_1_wq[L], &weights.block_q4_1_wk[L],
+            &weights.block_q4_1_wv[L], &weights.block_q4_1_wo[L],
+            &weights.block_q4_1_ffn_gate[L], &weights.block_q4_1_ffn_up[L],
+            &weights.block_q4_1_ffn_down[L]
         };
         sp_ok_tensor* shape_dst[7] = {
             &weights.wq[L], &weights.wk[L], &weights.wv[L], &weights.wo[L],
@@ -1701,23 +1772,35 @@ int sp_weights_ingest_gguf_block_quant(sp_weights&         weights,
                 shape_dst[s]->data = nullptr;
                 shape_dst[s]->scale_recip = scale_recip;
                 ++n_fused_q4;
+            } else if (sp_blk_is_q4_1(t)) {
+                if (!sp_blk_import_q4_1(*q4_1_dst[s],
+                                         weights.block_q4_1_layer_arenas[L],
+                                         t, p, k, scale_recip)) {
+                    std::fprintf(stderr,
+                        "[sp-block-quant] L%d %s: Q4_1 import failed\n",
+                        L, slot_names[s]);
+                    return -1;
+                }
+                shape_dst[s]->data = nullptr;
+                shape_dst[s]->scale_recip = scale_recip;
+                ++n_fused_q4_1;
             } else {
                 ++n_skipped;
             }
         }
     }
 
-    if (n_fused_q8 > 0) weights.use_block_q8 = true;
-    if (n_fused_q4 > 0) weights.use_block_q4 = true;
+    if (n_fused_q8 > 0)           weights.use_block_q8 = true;
+    if (n_fused_q4 + n_fused_q4_1 > 0) weights.use_block_q4 = true;
 
     std::fprintf(stderr,
-        "[sp-block-quant] ingest: Q8_0 fused=%d  Q4_0 fused=%d  skipped=%d  "
-        "use_block_q8=%d use_block_q4=%d  p=%lld k=%lld\n",
-        n_fused_q8, n_fused_q4, n_skipped,
+        "[sp-block-quant] ingest: Q8_0 fused=%d  Q4_0 fused=%d  Q4_1 fused=%d  "
+        "skipped=%d  use_block_q8=%d use_block_q4=%d  p=%lld k=%lld\n",
+        n_fused_q8, n_fused_q4, n_fused_q4_1, n_skipped,
         weights.use_block_q8 ? 1 : 0, weights.use_block_q4 ? 1 : 0,
         (long long)p, (long long)k);
 
-    return n_fused_q8 + n_fused_q4;
+    return n_fused_q8 + n_fused_q4 + n_fused_q4_1;
 }
 
 }  // namespace sp::engine

@@ -211,4 +211,22 @@ bool sp_matmul_ok_block_q4_to_fp32(const sp_ok_tensor&          W_shape,
                                     int                          out_rows,
                                     int                          n_cols);
 
+/* Phase 15b: Q4_1 matmul. Asymmetric: W[k] = d·x_int[k] + m.
+ *   acc_a = Σ_k x_int[k] · F_a[k]  +  M_a · Sx_a − 41·M_b · Sx_b
+ *   acc_b = Σ_k x_int[k] · F_b[k]  +  M_a · Sx_b + M_b · Sx_a + M_b · Sx_b
+ * where F_a/F_b are the Q4_0-style per-element ring factors and
+ * Sx_a, Sx_b are the once-per-block sum-of-x.a / sum-of-x.b. The
+ * x_int[k] values are UNSIGNED nybbles in [0, 15] (no -8 bias). */
+bool sp_matmul_ok_block_q4_1(const sp_ok_tensor&            W_shape,
+                              const sp_ok_block_q4_1_tensor& W_blk,
+                              const sp_ok_tensor&            X,
+                              sp_ok_tensor&                  Y);
+
+bool sp_matmul_ok_block_q4_1_to_fp32(const sp_ok_tensor&            W_shape,
+                                      const sp_ok_block_q4_1_tensor& W_blk,
+                                      const sp_ok_tensor&            X,
+                                      float*                         Y_fp32,
+                                      int                            out_rows,
+                                      int                            n_cols);
+
 }  // namespace sp::engine

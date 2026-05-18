@@ -363,4 +363,81 @@ bool sp_ffn_swiglu_to_fp32_block_q4(const sp_ok_tensor&          x,
                                           out_fp32, n_embd, n_tokens);
 }
 
+// Helper: route a single matmul to whichever block_q4 variant has a
+// non-null tensor for that slot.
+static inline bool sp_ffn_blk_matmul_mixed_to_fp32(
+    const sp_ok_tensor&            W_shape,
+    const sp_ok_block_q4_tensor*   W_q4_0,
+    const sp_ok_block_q4_1_tensor* W_q4_1,
+    const sp_ok_tensor&            X,
+    float*                         Y_fp32,
+    int                            out_rows,
+    int                            n_cols)
+{
+    if (W_q4_0 && W_q4_0->blocks) {
+        return sp_matmul_ok_block_q4_to_fp32(
+            W_shape, *W_q4_0, X, Y_fp32, out_rows, n_cols);
+    }
+    if (W_q4_1 && W_q4_1->blocks) {
+        return sp_matmul_ok_block_q4_1_to_fp32(
+            W_shape, *W_q4_1, X, Y_fp32, out_rows, n_cols);
+    }
+    return false;
+}
+
+bool sp_ffn_swiglu_to_fp32_block_q4_mixed(
+    const sp_ok_tensor&              x,
+    const sp_ok_tensor&              gate_shape,
+    const sp_ok_block_q4_tensor*     gate_q4_0,
+    const sp_ok_block_q4_1_tensor*   gate_q4_1,
+    const sp_ok_tensor&              up_shape,
+    const sp_ok_block_q4_tensor*     up_q4_0,
+    const sp_ok_block_q4_1_tensor*   up_q4_1,
+    const sp_ok_tensor&              down_shape,
+    const sp_ok_block_q4_tensor*     down_q4_0,
+    const sp_ok_block_q4_1_tensor*   down_q4_1,
+    float*                           out_fp32,
+    int                              n_tokens,
+    sp_ok_arena&                     scratch_arena,
+    sp_ffn_act                       act)
+{
+    if (x.data == nullptr || out_fp32 == nullptr) return false;
+    const int n_embd = (int)gate_shape.shape[0];
+    const int d_ff   = (int)gate_shape.shape[1];
+    if (n_embd <= 0 || d_ff <= 0 || n_tokens <= 0) return false;
+
+    std::vector<float> gate_all(d_ff * n_tokens);
+    std::vector<float> up_all(d_ff * n_tokens);
+    std::vector<float> act_all(d_ff * n_tokens);
+
+    if (!sp_ffn_blk_matmul_mixed_to_fp32(
+            gate_shape, gate_q4_0, gate_q4_1, x,
+            gate_all.data(), d_ff, n_tokens)) return false;
+    if (!sp_ffn_blk_matmul_mixed_to_fp32(
+            up_shape, up_q4_0, up_q4_1, x,
+            up_all.data(), d_ff, n_tokens)) return false;
+
+    switch (act) {
+    case sp_ffn_act::SwiGLU:
+        sp_silu_bridge(gate_all.data(), up_all.data(),
+                       d_ff * n_tokens, act_all.data());
+        break;
+    case sp_ffn_act::GeGLU_tanh:
+        sp_gelu_tanh_bridge(gate_all.data(), up_all.data(),
+                            d_ff * n_tokens, act_all.data());
+        break;
+    }
+
+    sp_ok_tensor act_ok;
+    int64_t act_shape[4] = { n_tokens, d_ff, 1, 1 };
+    if (!sp_ok_encode_from_fp32(act_ok, act_all.data(), 2, act_shape,
+                                  /*scale*/ down_shape.scale_recip,
+                                  scratch_arena)) {
+        return false;
+    }
+    return sp_ffn_blk_matmul_mixed_to_fp32(
+        down_shape, down_q4_0, down_q4_1, act_ok,
+        out_fp32, n_embd, n_tokens);
+}
+
 }  // namespace sp::engine

@@ -945,4 +945,151 @@ bool sp_matmul_ok_block_q4_to_fp32(const sp_ok_tensor&          W_shape,
     return true;
 }
 
+// ---------- Phase 15b: Q4_1 matmul (asymmetric block_min) ----------------
+//
+// Math: W[k] = d·x_int[k] + m, where x_int[k] is UNSIGNED [0, 15] and
+// (d, m) is fused into per-block (B, M) integer pairs at load time.
+// The ring-multiplied accumulator becomes
+//
+//   acc_a = Σ_k (x_int[k]·B_a + M_a)·x.a[k] − 41·(x_int[k]·B_b + M_b)·x.b[k]
+//         = Σ_k x_int[k] · F_a[k]  +  Σ_k (M_a · x.a[k] − 41·M_b · x.b[k])
+//         = Σ_k x_int[k] · F_a[k]  +  M_a · Sx_a − 41·M_b · Sx_b
+//
+// where Sx_a = Σ_k x.a[k] over the 32 elements of the block, Sx_b
+// similar. Sx_a / Sx_b depend only on X, so the M-contribution is two
+// mults per block per token — negligible vs the K-loop cost.
+
+template <bool A_ONLY>
+static inline void sp_matmul_ok_block_q4_1_inner(
+    const sp_ok_q4_1_block_t* w_blocks,
+    const sp_ok_t*            x_row,
+    size_t                    n_blocks,
+    int64_t&                  out_acc_a,
+    int64_t&                  out_acc_b)
+{
+    constexpr int64_t W41 = (int64_t)SP_OK_OMEGA_NORM;
+    int64_t acc_a = 0;
+    int64_t acc_b = 0;
+
+    for (size_t b = 0; b < n_blocks; ++b) {
+        const sp_ok_q4_1_block_t& blk = w_blocks[b];
+        const size_t k_base = b * (size_t)SP_OK_BLOCK_SIZE;
+
+        /* Sx_a / Sx_b over the 32 elements of this block (depend on X only). */
+        int64_t Sx_a = 0;
+        int64_t Sx_b = 0;
+        for (int k = 0; k < SP_OK_BLOCK_SIZE; ++k) {
+            Sx_a += x_row[k_base + k].a;
+            Sx_b += x_row[k_base + k].b;
+        }
+
+        /* Σ_k x_int[k] · F_a / F_b */
+        for (int k = 0; k < SP_OK_BLOCK_SIZE; ++k) {
+            const int64_t w_int = (int64_t)
+                sp_ok_block_q4_1_decode_codepoint(blk.packed, k);
+            const sp_ok_t& x_jk = x_row[k_base + k];
+            const int64_t F_a = blk.B_a * x_jk.a - W41 * blk.B_b * x_jk.b;
+            acc_a += w_int * F_a;
+            if constexpr (!A_ONLY) {
+                const int64_t F_b = blk.B_a * x_jk.b
+                                   + blk.B_b * x_jk.a
+                                   + blk.B_b * x_jk.b;
+                acc_b += w_int * F_b;
+            }
+        }
+
+        /* M-contribution: (M_a, M_b) · (Sx_a, Sx_b) once per block. */
+        acc_a += blk.M_a * Sx_a - W41 * blk.M_b * Sx_b;
+        if constexpr (!A_ONLY) {
+            acc_b += blk.M_a * Sx_b + blk.M_b * Sx_a + blk.M_b * Sx_b;
+        }
+    }
+
+    out_acc_a = acc_a;
+    if constexpr (!A_ONLY) out_acc_b = acc_b;
+}
+
+bool sp_matmul_ok_block_q4_1(const sp_ok_tensor&            W_shape,
+                              const sp_ok_block_q4_1_tensor& W_blk,
+                              const sp_ok_tensor&            X,
+                              sp_ok_tensor&                  Y) {
+    if (X.data == nullptr || Y.data == nullptr) return false;
+    if (W_blk.blocks == nullptr || W_blk.n_blocks == 0) return false;
+    if (W_shape.n_dims < 2 || X.n_dims < 2) return false;
+    const int64_t M  = W_shape.shape[1];
+    const int64_t K  = W_shape.shape[0];
+    const int64_t K2 = X.shape[1];
+    const int64_t N  = X.shape[0];
+    if (K != K2) return false;
+    if (Y.n_dims < 2 || Y.shape[0] != N || Y.shape[1] != M) return false;
+    if ((size_t)(M * K) != W_blk.numel) return false;
+    if ((K % SP_OK_BLOCK_SIZE) != 0) return false;
+    const size_t blocks_per_row = (size_t)K / SP_OK_BLOCK_SIZE;
+
+    const int nt = std::max(1, sp_threadpool_n_threads());
+
+    sp_parallel_for([&](int thread_id) {
+        int64_t i0, i1;
+        split_rows(M, nt, thread_id, i0, i1);
+        for (int64_t i = i0; i < i1; ++i) {
+            const sp_ok_q4_1_block_t* w_row =
+                W_blk.blocks + (size_t)i * blocks_per_row;
+            for (int64_t j = 0; j < N; ++j) {
+                int64_t acc_a = 0, acc_b = 0;
+                const sp_ok_t* x_row = X.data + j * K;
+                sp_matmul_ok_block_q4_1_inner<false>(
+                    w_row, x_row, blocks_per_row, acc_a, acc_b);
+                Y.data[j * M + i] = sp_ok_t{ acc_a, acc_b };
+            }
+        }
+    });
+
+    Y.scale_recip     = W_shape.scale_recip     * X.scale_recip;
+    Y.frobenius_scale = W_shape.frobenius_scale * X.frobenius_scale;
+    return true;
+}
+
+bool sp_matmul_ok_block_q4_1_to_fp32(const sp_ok_tensor&            W_shape,
+                                      const sp_ok_block_q4_1_tensor& W_blk,
+                                      const sp_ok_tensor&            X,
+                                      float*                         Y_fp32,
+                                      int                            out_rows,
+                                      int                            n_cols) {
+    if (X.data == nullptr || Y_fp32 == nullptr) return false;
+    if (W_blk.blocks == nullptr || W_blk.n_blocks == 0) return false;
+    if (W_shape.n_dims < 2 || X.n_dims < 2) return false;
+    const int64_t M  = W_shape.shape[1];
+    const int64_t K  = W_shape.shape[0];
+    const int64_t K2 = X.shape[1];
+    const int64_t N  = X.shape[0];
+    if (K != K2 || (int64_t)out_rows != M || (int64_t)n_cols != N) return false;
+    if ((size_t)(M * K) != W_blk.numel) return false;
+    if ((K % SP_OK_BLOCK_SIZE) != 0) return false;
+    const size_t blocks_per_row = (size_t)K / SP_OK_BLOCK_SIZE;
+
+    const double divisor =
+        (double)W_shape.scale_recip * (double)X.scale_recip *
+        (double)W_shape.frobenius_scale * (double)X.frobenius_scale;
+    if (divisor == 0.0) return false;
+
+    const int nt = std::max(1, sp_threadpool_n_threads());
+
+    sp_parallel_for([&](int thread_id) {
+        int64_t i0, i1;
+        split_rows(M, nt, thread_id, i0, i1);
+        for (int64_t i = i0; i < i1; ++i) {
+            const sp_ok_q4_1_block_t* w_row =
+                W_blk.blocks + (size_t)i * blocks_per_row;
+            for (int64_t j = 0; j < N; ++j) {
+                int64_t acc_a = 0, acc_b = 0;
+                const sp_ok_t* x_row = X.data + j * K;
+                sp_matmul_ok_block_q4_1_inner<true>(
+                    w_row, x_row, blocks_per_row, acc_a, acc_b);
+                Y_fp32[j * M + i] = (float)((double)acc_a / divisor);
+            }
+        }
+    });
+    return true;
+}
+
 }  // namespace sp::engine

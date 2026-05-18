@@ -336,6 +336,20 @@ struct sp_weights {
     std::vector<sp_ok_block_q4_tensor>  block_q4_ffn_down;
     std::vector<sp_ok_arena>            block_q4_layer_arenas;
 
+    /* Phase 15b: Q4_1 storage. Per-tensor dispatch — set on a per-LAYER
+     * basis via the *_is_q4_1 vectors below, since mixed-quant GGUFs
+     * (typical llama-quantize Q4_0 output) put Q4_0 on most tensors and
+     * Q4_1 on a subset (typically ffn_down). The forward dispatch
+     * checks block_q4_1_*[L].blocks != nullptr to route per-tensor. */
+    std::vector<sp_ok_block_q4_1_tensor>  block_q4_1_wq;
+    std::vector<sp_ok_block_q4_1_tensor>  block_q4_1_wk;
+    std::vector<sp_ok_block_q4_1_tensor>  block_q4_1_wv;
+    std::vector<sp_ok_block_q4_1_tensor>  block_q4_1_wo;
+    std::vector<sp_ok_block_q4_1_tensor>  block_q4_1_ffn_gate;
+    std::vector<sp_ok_block_q4_1_tensor>  block_q4_1_ffn_up;
+    std::vector<sp_ok_block_q4_1_tensor>  block_q4_1_ffn_down;
+    std::vector<sp_ok_arena>              block_q4_1_layer_arenas;
+
     // Bypass-list (fp32 norms; scale-reset valve per Phase 1.7 policy):
     std::vector<std::vector<float>> attn_norm_w;       // per-layer [n_embd]
     std::vector<std::vector<float>> ffn_norm_w;        // per-layer [n_embd]

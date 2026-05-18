@@ -113,4 +113,24 @@ bool sp_ffn_swiglu_to_fp32_block_q4(const sp_ok_tensor&          x,
                                      sp_ok_arena&                 scratch_arena,
                                      sp_ffn_act                   act = sp_ffn_act::SwiGLU);
 
+/* Phase 15b: mixed Q4_0 / Q4_1 FFN. Either of the three weight tensors
+ * (gate, up, down) may be Q4_0 or Q4_1; pass the matching block pointer
+ * for the populated one and nullptr for the other. Used for GGUF Q4_0
+ * files where ffn_down is upgraded to Q4_1 by llama-quantize. */
+bool sp_ffn_swiglu_to_fp32_block_q4_mixed(
+    const sp_ok_tensor&              x,
+    const sp_ok_tensor&              gate_shape,
+    const sp_ok_block_q4_tensor*     gate_q4_0,    /* one of these two non-null */
+    const sp_ok_block_q4_1_tensor*   gate_q4_1,
+    const sp_ok_tensor&              up_shape,
+    const sp_ok_block_q4_tensor*     up_q4_0,
+    const sp_ok_block_q4_1_tensor*   up_q4_1,
+    const sp_ok_tensor&              down_shape,
+    const sp_ok_block_q4_tensor*     down_q4_0,
+    const sp_ok_block_q4_1_tensor*   down_q4_1,
+    float*                           out_fp32,
+    int                              n_tokens,
+    sp_ok_arena&                     scratch_arena,
+    sp_ffn_act                       act = sp_ffn_act::SwiGLU);
+
 }  // namespace sp::engine

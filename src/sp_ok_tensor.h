@@ -127,6 +127,7 @@ public:
     // SP_OK_BLOCK_SIZE (32).
     bool alloc_tensor_block_q8(sp_ok_block_q8_tensor& t, size_t numel);
     bool alloc_tensor_block_q4(sp_ok_block_q4_tensor& t, size_t numel);
+    bool alloc_tensor_block_q4_1(sp_ok_block_q4_1_tensor& t, size_t numel);
 
     void   reset()              { used_ = 0; }
     size_t capacity() const     { return capacity_; }
