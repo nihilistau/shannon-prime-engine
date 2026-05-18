@@ -277,6 +277,125 @@ bool sp_matmul_fp32_input_to_ok(const sp_ok_tensor& W,
 }
 
 // ---------- Phase 12 Step D: fused packed-Q8 matmul ------------------------
+//
+// Phase 14c (this commit): AVX-512 inner loop for the fused decode-and-multiply.
+// Process 8 ring elements per iter; 4 _mm512_mullo_epi64 (full int64×int64)
+// across 8 lanes in parallel, vs ~32 scalar int64 mults per 8 elements.
+// Hoists the 41 (= SP_OK_OMEGA_NORM) factor out of the hot loop by
+// accumulating sum(w_b * x.b) as a separate lane-parallel sum and applying *41
+// once at horizontal-reduce time.
+//
+// We use mullo_epi64 (not mul_epi32) because production Q8 + Frobenius k=8
+// hits shifts ~26-29 on Gemma3-1B: (int8 << shift) doesn't fit in int32.
+// mullo_epi64 is 3-cycle latency / 1-cycle throughput on Tiger Lake — slower
+// per-mul than mul_epi32's 1/1, but still ~4-5x faster than the scalar inner
+// loop across the 8-way parallelism.
+//
+// Overflow profile matches the scalar path: per-product is up to
+// (w_a<<shift) * x_a which in practice clusters near 2^39 (W centred near 0
+// after shift selection, X bounded by post-RMSNorm ~2^28). Accumulator over
+// K=6912 stays under 2^52 — plenty of int64 headroom.
+
+#if defined(SP_MATMUL_HAVE_SIMD) && defined(__AVX512F__)
+/* Inner-K accumulator for one (i, j) output cell. Processes K elements,
+ * delivers (acc_a, acc_b) via out params. Caller writes Y. */
+static inline void sp_matmul_ok_q8_inner_avx512(
+    const sp_ok_q8_t* w_row,
+    const sp_ok_t*    x_row,
+    int64_t           K,
+    int               shift,
+    int64_t&          out_acc_a,
+    int64_t&          out_acc_b)
+{
+    /* Three lane-parallel accumulators (8x int64 each). Algebra:
+     *   For each k:
+     *     acc_a_part   += w_a(k) * x_a(k)
+     *     acc_b_xb_sum += w_b(k) * x_b(k)
+     *     acc_b_cross  += w_a(k) * x_b(k) + w_b(k) * x_a(k)
+     *   After the K loop:
+     *     acc_a = acc_a_part  - SP_OK_OMEGA_NORM * acc_b_xb_sum
+     *     acc_b = acc_b_cross + acc_b_xb_sum
+     * Hoists the *41 out of the inner loop. */
+    __m512i acc_a_part   = _mm512_setzero_si512();
+    __m512i acc_b_xb_sum = _mm512_setzero_si512();
+    __m512i acc_b_cross  = _mm512_setzero_si512();
+
+    /* Constants for the deinterleave shuffles. Defined once per fn-call. */
+    const __m512i idx_a_i32 = _mm512_setr_epi32( 0, 2, 4, 6, 8,10,12,14,
+                                                  0, 0, 0, 0, 0, 0, 0, 0);
+    const __m512i idx_b_i32 = _mm512_setr_epi32( 1, 3, 5, 7, 9,11,13,15,
+                                                  0, 0, 0, 0, 0, 0, 0, 0);
+    const __m512i idx_xa_i64 = _mm512_setr_epi64(0, 2, 4, 6,  8,10,12,14);
+    const __m512i idx_xb_i64 = _mm512_setr_epi64(1, 3, 5, 7,  9,11,13,15);
+
+    int64_t k = 0;
+    for (; k + 8 <= K; k += 8) {
+        /* ---- Load 16 packed Q8 bytes = 8 ring elements (a0,b0,...,a7,b7) ---- */
+        __m128i wq_packed = _mm_loadu_si128((const __m128i*)(w_row + k));
+
+        /* Sign-extend 16 int8 -> 16 int32 in one __m512i. */
+        __m512i wq_32 = _mm512_cvtepi8_epi32(wq_packed);
+
+        /* Deinterleave a-coords and b-coords into the low 256 bits of two
+         * temporaries. The high 256 bits are don't-care; we discard via
+         * cast-to-256. */
+        __m256i wa_32 = _mm512_castsi512_si256(
+            _mm512_permutexvar_epi32(idx_a_i32, wq_32));
+        __m256i wb_32 = _mm512_castsi512_si256(
+            _mm512_permutexvar_epi32(idx_b_i32, wq_32));
+
+        /* Promote int32 -> int64 (8 lanes each), then apply per-tensor shift. */
+        __m512i wa_64 = _mm512_slli_epi64(_mm512_cvtepi32_epi64(wa_32), shift);
+        __m512i wb_64 = _mm512_slli_epi64(_mm512_cvtepi32_epi64(wb_32), shift);
+
+        /* ---- Load 8 sp_ok_t (16 int64) for X ---- */
+        __m512i x_lo = _mm512_loadu_si512((const __m512i*)(x_row + k));     /* x[k..k+3] */
+        __m512i x_hi = _mm512_loadu_si512((const __m512i*)(x_row + k + 4)); /* x[k+4..k+7] */
+
+        /* Deinterleave x_a and x_b across the two halves via permutex2var. */
+        __m512i xa = _mm512_permutex2var_epi64(x_lo, idx_xa_i64, x_hi);
+        __m512i xb = _mm512_permutex2var_epi64(x_lo, idx_xb_i64, x_hi);
+
+        /* ---- Four int64×int64 multiplies (8 lanes parallel) per chunk ----
+         * mullo_epi64 = full 64×64→64 low product per lane. Slower than
+         * mul_epi32 but works for any shift; required when (int8<<shift)
+         * doesn't fit in int32 (i.e. Frobenius k=8 production). */
+        __m512i p_wa_xa = _mm512_mullo_epi64(wa_64, xa);
+        __m512i p_wb_xb = _mm512_mullo_epi64(wb_64, xb);
+        __m512i p_wa_xb = _mm512_mullo_epi64(wa_64, xb);
+        __m512i p_wb_xa = _mm512_mullo_epi64(wb_64, xa);
+
+        acc_a_part   = _mm512_add_epi64(acc_a_part,   p_wa_xa);
+        acc_b_xb_sum = _mm512_add_epi64(acc_b_xb_sum, p_wb_xb);
+        acc_b_cross  = _mm512_add_epi64(acc_b_cross,
+                                         _mm512_add_epi64(p_wa_xb, p_wb_xa));
+    }
+
+    /* Horizontal-reduce to scalars and combine into the omega form. */
+    int64_t s_a_part   = _mm512_reduce_add_epi64(acc_a_part);
+    int64_t s_b_xb_sum = _mm512_reduce_add_epi64(acc_b_xb_sum);
+    int64_t s_b_cross  = _mm512_reduce_add_epi64(acc_b_cross);
+
+    int64_t acc_a = s_a_part  - (int64_t)SP_OK_OMEGA_NORM * s_b_xb_sum;
+    int64_t acc_b = s_b_cross + s_b_xb_sum;
+
+    /* Scalar tail for K not multiple of 8. */
+    for (; k < K; ++k) {
+        const sp_ok_q8_t& w_q = w_row[k];
+        const int64_t w_a = ((int64_t)w_q.a) << shift;
+        const int64_t w_b = ((int64_t)w_q.b) << shift;
+        const sp_ok_t& x_jk = x_row[k];
+        acc_a += w_a * x_jk.a
+               - (int64_t)SP_OK_OMEGA_NORM * w_b * x_jk.b;
+        acc_b += w_a * x_jk.b
+               + x_jk.a * w_b
+               + w_b * x_jk.b;
+    }
+
+    out_acc_a = acc_a;
+    out_acc_b = acc_b;
+}
+#endif  /* AVX512F */
 
 bool sp_matmul_ok_q8(const sp_ok_tensor&    W_shape,
                      const sp_ok_q8_tensor& W_q8,
@@ -298,6 +417,14 @@ bool sp_matmul_ok_q8(const sp_ok_tensor&    W_shape,
     const int8_t shift = W_q8.q8_shift;
     const int nt = std::max(1, sp_threadpool_n_threads());
 
+    /* SIMD gate: AVX-512 inner uses _mm512_mullo_epi64 (full int64×int64),
+     * works for any non-negative shift. Same overflow profile as scalar. */
+#if defined(SP_MATMUL_HAVE_SIMD) && defined(__AVX512F__)
+    const bool use_simd = (shift >= 0);
+#else
+    const bool use_simd = false;
+#endif
+
     /* Output row i is independent -- partition M across threads. Each
      * worker reads its slice of W_q8 packed bytes (2 B/elem) and decodes
      * lane-by-lane into the sp_ok ring multiply.
@@ -316,18 +443,26 @@ bool sp_matmul_ok_q8(const sp_ok_tensor&    W_shape,
                 int64_t acc_a = 0;
                 int64_t acc_b = 0;
                 const sp_ok_t* x_row = X.data + j * K;
-                for (int64_t k = 0; k < K; ++k) {
-                    /* Decode-and-multiply, fused. The shift inlines as
-                     * two sll's; the ring multiply matches sp_matmul_ok. */
-                    const sp_ok_q8_t& w_q = w_row[k];
-                    const int64_t w_a = ((int64_t)w_q.a) << shift;
-                    const int64_t w_b = ((int64_t)w_q.b) << shift;
-                    const sp_ok_t& x_jk = x_row[k];
-                    acc_a += w_a * x_jk.a
-                           - (int64_t)SP_OK_OMEGA_NORM * w_b * x_jk.b;
-                    acc_b += w_a * x_jk.b
-                           + x_jk.a * w_b
-                           + w_b * x_jk.b;
+#if defined(SP_MATMUL_HAVE_SIMD) && defined(__AVX512F__)
+                if (use_simd) {
+                    sp_matmul_ok_q8_inner_avx512(
+                        w_row, x_row, K, (int)shift, acc_a, acc_b);
+                } else
+#endif
+                {
+                    for (int64_t k = 0; k < K; ++k) {
+                        /* Decode-and-multiply, fused. The shift inlines as
+                         * two sll's; the ring multiply matches sp_matmul_ok. */
+                        const sp_ok_q8_t& w_q = w_row[k];
+                        const int64_t w_a = ((int64_t)w_q.a) << shift;
+                        const int64_t w_b = ((int64_t)w_q.b) << shift;
+                        const sp_ok_t& x_jk = x_row[k];
+                        acc_a += w_a * x_jk.a
+                               - (int64_t)SP_OK_OMEGA_NORM * w_b * x_jk.b;
+                        acc_b += w_a * x_jk.b
+                               + x_jk.a * w_b
+                               + w_b * x_jk.b;
+                    }
                 }
                 Y.data[j * M + i] = sp_ok_t{ acc_a, acc_b };
             }
@@ -369,6 +504,12 @@ bool sp_matmul_ok_q8_to_fp32(const sp_ok_tensor&    W_shape,
     const int8_t shift = W_q8.q8_shift;
     const int nt = std::max(1, sp_threadpool_n_threads());
 
+#if defined(SP_MATMUL_HAVE_SIMD) && defined(__AVX512F__)
+    const bool use_simd = (shift >= 0) && (shift <= 24);
+#else
+    const bool use_simd = false;
+#endif
+
     sp_parallel_for([&](int thread_id) {
         int64_t i0, i1;
         split_rows(M, nt, thread_id, i0, i1);
@@ -377,13 +518,72 @@ bool sp_matmul_ok_q8_to_fp32(const sp_ok_tensor&    W_shape,
             for (int64_t j = 0; j < N; ++j) {
                 int64_t acc_a = 0;
                 const sp_ok_t* x_row = X.data + j * K;
-                for (int64_t k = 0; k < K; ++k) {
-                    const sp_ok_q8_t& w_q = w_row[k];
-                    const int64_t w_a = ((int64_t)w_q.a) << shift;
-                    const int64_t w_b = ((int64_t)w_q.b) << shift;
-                    const sp_ok_t& x_jk = x_row[k];
-                    acc_a += w_a * x_jk.a
-                           - (int64_t)SP_OK_OMEGA_NORM * w_b * x_jk.b;
+#if defined(SP_MATMUL_HAVE_SIMD) && defined(__AVX512F__)
+                if (use_simd) {
+                    /* fp32 variant only needs the a-component; drop the
+                     * b-cross accumulators since they'd be discarded. */
+                    __m512i acc_a_part   = _mm512_setzero_si512();
+                    __m512i acc_b_xb_sum = _mm512_setzero_si512();
+
+                    const __m512i idx_a_i32 = _mm512_setr_epi32(
+                         0, 2, 4, 6, 8,10,12,14,  0, 0, 0, 0, 0, 0, 0, 0);
+                    const __m512i idx_b_i32 = _mm512_setr_epi32(
+                         1, 3, 5, 7, 9,11,13,15,  0, 0, 0, 0, 0, 0, 0, 0);
+                    const __m512i idx_xa_i64 = _mm512_setr_epi64(
+                         0, 2, 4, 6,  8,10,12,14);
+                    const __m512i idx_xb_i64 = _mm512_setr_epi64(
+                         1, 3, 5, 7,  9,11,13,15);
+
+                    int64_t k = 0;
+                    for (; k + 8 <= K; k += 8) {
+                        __m128i wq_packed = _mm_loadu_si128(
+                            (const __m128i*)(w_row + k));
+                        __m512i wq_32 = _mm512_cvtepi8_epi32(wq_packed);
+                        __m256i wa_32 = _mm512_castsi512_si256(
+                            _mm512_permutexvar_epi32(idx_a_i32, wq_32));
+                        __m256i wb_32 = _mm512_castsi512_si256(
+                            _mm512_permutexvar_epi32(idx_b_i32, wq_32));
+                        __m512i wa_64 = _mm512_slli_epi64(
+                            _mm512_cvtepi32_epi64(wa_32), shift);
+                        __m512i wb_64 = _mm512_slli_epi64(
+                            _mm512_cvtepi32_epi64(wb_32), shift);
+                        __m512i x_lo = _mm512_loadu_si512(
+                            (const __m512i*)(x_row + k));
+                        __m512i x_hi = _mm512_loadu_si512(
+                            (const __m512i*)(x_row + k + 4));
+                        __m512i xa = _mm512_permutex2var_epi64(
+                            x_lo, idx_xa_i64, x_hi);
+                        __m512i xb = _mm512_permutex2var_epi64(
+                            x_lo, idx_xb_i64, x_hi);
+                        acc_a_part   = _mm512_add_epi64(acc_a_part,
+                            _mm512_mullo_epi64(wa_64, xa));
+                        acc_b_xb_sum = _mm512_add_epi64(acc_b_xb_sum,
+                            _mm512_mullo_epi64(wb_64, xb));
+                    }
+                    int64_t s_a_part   = _mm512_reduce_add_epi64(acc_a_part);
+                    int64_t s_b_xb_sum = _mm512_reduce_add_epi64(acc_b_xb_sum);
+                    acc_a = s_a_part
+                          - (int64_t)SP_OK_OMEGA_NORM * s_b_xb_sum;
+                    /* Scalar tail */
+                    for (; k < K; ++k) {
+                        const sp_ok_q8_t& w_q = w_row[k];
+                        const int64_t w_a = ((int64_t)w_q.a) << shift;
+                        const int64_t w_b = ((int64_t)w_q.b) << shift;
+                        const sp_ok_t& x_jk = x_row[k];
+                        acc_a += w_a * x_jk.a
+                               - (int64_t)SP_OK_OMEGA_NORM * w_b * x_jk.b;
+                    }
+                } else
+#endif
+                {
+                    for (int64_t k = 0; k < K; ++k) {
+                        const sp_ok_q8_t& w_q = w_row[k];
+                        const int64_t w_a = ((int64_t)w_q.a) << shift;
+                        const int64_t w_b = ((int64_t)w_q.b) << shift;
+                        const sp_ok_t& x_jk = x_row[k];
+                        acc_a += w_a * x_jk.a
+                               - (int64_t)SP_OK_OMEGA_NORM * w_b * x_jk.b;
+                    }
                 }
                 Y_fp32[j * M + i] = (float)((double)acc_a / divisor);
             }
