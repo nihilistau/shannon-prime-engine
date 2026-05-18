@@ -369,6 +369,7 @@ static inline bool sp_ffn_blk_matmul_mixed_to_fp32(
     const sp_ok_tensor&            W_shape,
     const sp_ok_block_q4_tensor*   W_q4_0,
     const sp_ok_block_q4_1_tensor* W_q4_1,
+    const sp_ok_block_q8_tensor*   W_q8,
     const sp_ok_tensor&            X,
     float*                         Y_fp32,
     int                            out_rows,
@@ -382,9 +383,13 @@ static inline bool sp_ffn_blk_matmul_mixed_to_fp32(
         return sp_matmul_ok_block_q4_1_to_fp32(
             W_shape, *W_q4_1, X, Y_fp32, out_rows, n_cols);
     }
-    /* Phase 15d fallback: when no block storage is populated for this
-     * tensor (e.g. Q5_0 or Q6_K that dequanted into raw sp_ok_t), the
-     * caller passes W_shape with .data populated. Use the raw matmul. */
+    /* Phase 15e: block_q8 (also covers Q5_0 ingested via Q5_0->block_q8). */
+    if (W_q8 && W_q8->blocks) {
+        return sp_matmul_ok_block_q8_to_fp32(
+            W_shape, *W_q8, X, Y_fp32, out_rows, n_cols);
+    }
+    /* Phase 15d raw fallback: Q6_K and any other unsupported type ends
+     * up here with W_shape.data populated from the fp16 dequant path. */
     if (W_shape.data) {
         return sp_matmul_ok_to_fp32(W_shape, X, Y_fp32, out_rows, n_cols);
     }
@@ -396,12 +401,15 @@ bool sp_ffn_swiglu_to_fp32_block_q4_mixed(
     const sp_ok_tensor&              gate_shape,
     const sp_ok_block_q4_tensor*     gate_q4_0,
     const sp_ok_block_q4_1_tensor*   gate_q4_1,
+    const sp_ok_block_q8_tensor*     gate_q8,
     const sp_ok_tensor&              up_shape,
     const sp_ok_block_q4_tensor*     up_q4_0,
     const sp_ok_block_q4_1_tensor*   up_q4_1,
+    const sp_ok_block_q8_tensor*     up_q8,
     const sp_ok_tensor&              down_shape,
     const sp_ok_block_q4_tensor*     down_q4_0,
     const sp_ok_block_q4_1_tensor*   down_q4_1,
+    const sp_ok_block_q8_tensor*     down_q8,
     float*                           out_fp32,
     int                              n_tokens,
     sp_ok_arena&                     scratch_arena,
@@ -417,10 +425,10 @@ bool sp_ffn_swiglu_to_fp32_block_q4_mixed(
     std::vector<float> act_all(d_ff * n_tokens);
 
     if (!sp_ffn_blk_matmul_mixed_to_fp32(
-            gate_shape, gate_q4_0, gate_q4_1, x,
+            gate_shape, gate_q4_0, gate_q4_1, gate_q8, x,
             gate_all.data(), d_ff, n_tokens)) return false;
     if (!sp_ffn_blk_matmul_mixed_to_fp32(
-            up_shape, up_q4_0, up_q4_1, x,
+            up_shape, up_q4_0, up_q4_1, up_q8, x,
             up_all.data(), d_ff, n_tokens)) return false;
 
     switch (act) {
@@ -442,7 +450,7 @@ bool sp_ffn_swiglu_to_fp32_block_q4_mixed(
         return false;
     }
     return sp_ffn_blk_matmul_mixed_to_fp32(
-        down_shape, down_q4_0, down_q4_1, act_ok,
+        down_shape, down_q4_0, down_q4_1, down_q8, act_ok,
         out_fp32, n_embd, n_tokens);
 }
 

@@ -1404,17 +1404,23 @@ bool sp_forward_step_prefill(sp_forward_context& ctx,
              * pointers; helper picks the non-null one. */
             const auto& gq40 = weights.block_q4_ffn_gate[L];
             const auto& gq41 = weights.block_q4_1_ffn_gate[L];
+            const auto& gq8  = weights.block_q8_ffn_gate[L];
             const auto& uq40 = weights.block_q4_ffn_up[L];
             const auto& uq41 = weights.block_q4_1_ffn_up[L];
+            const auto& uq8  = weights.block_q8_ffn_up[L];
             const auto& dq40 = weights.block_q4_ffn_down[L];
             const auto& dq41 = weights.block_q4_1_ffn_down[L];
+            const auto& dq8  = weights.block_q8_ffn_down[L];
             if (!sp_ffn_swiglu_to_fp32_block_q4_mixed(ctx.x_norm_ok,
                     W_gate, gq40.blocks ? &gq40 : nullptr,
                              gq41.blocks ? &gq41 : nullptr,
+                             gq8.blocks  ? &gq8  : nullptr,
                     W_up,   uq40.blocks ? &uq40 : nullptr,
                              uq41.blocks ? &uq41 : nullptr,
+                             uq8.blocks  ? &uq8  : nullptr,
                     W_down, dq40.blocks ? &dq40 : nullptr,
                              dq41.blocks ? &dq41 : nullptr,
+                             dq8.blocks  ? &dq8  : nullptr,
                     ctx.proj_out_fp32.data(),
                     n_tokens,
                     ctx.layer_arena,
@@ -1592,6 +1598,9 @@ static inline bool sp_blk_is_q4_1(const ggml_tensor* t) {
 static inline bool sp_blk_is_q4_K(const ggml_tensor* t) {
     return t && t->type == GGML_TYPE_Q4_K;
 }
+static inline bool sp_blk_is_q5_0(const ggml_tensor* t) {
+    return t && t->type == GGML_TYPE_Q5_0;
+}
 
 static bool sp_blk_import_q8(sp_ok_block_q8_tensor& dst,
                               sp_ok_arena&           arena,
@@ -1638,6 +1647,24 @@ static bool sp_blk_import_q4_1(sp_ok_block_q4_1_tensor& dst,
     const sp_gguf_block_q4_1* gsrc =
         reinterpret_cast<const sp_gguf_block_q4_1*>(src->data);
     return sp_ok_block_q4_1_from_gguf_q4_1(
+        &dst, gsrc, dst.n_blocks, scale_recip, p, k) != 0;
+}
+
+/* Phase 15e: Q5_0 → block_q8. Decode int5 codepoints to int8 at load,
+ * fuse block_scale × π^k same as Q8_0. Reuses block_q8 matmul kernel. */
+static bool sp_blk_import_q5_0_to_q8(sp_ok_block_q8_tensor& dst,
+                                       sp_ok_arena&           arena,
+                                       const ggml_tensor*     src,
+                                       int64_t                p,
+                                       int64_t                k,
+                                       int64_t                scale_recip) {
+    if (!src) return false;
+    const size_t numel = (size_t)ggml_nelements(src);
+    if (numel == 0 || (numel % SP_OK_BLOCK_SIZE) != 0) return false;
+    if (!arena.alloc_tensor_block_q8(dst, numel)) return false;
+    const sp_gguf_block_q5_0* gsrc =
+        reinterpret_cast<const sp_gguf_block_q5_0*>(src->data);
+    return sp_ok_block_q5_0_to_block_q8(
         &dst, gsrc, dst.n_blocks, scale_recip, p, k) != 0;
 }
 
@@ -1714,6 +1741,7 @@ int sp_weights_ingest_gguf_block_quant(sp_weights&         weights,
     weights.block_q4_1_layer_arenas.resize(n_layers);
 
     int n_fused_q8   = 0;
+    int n_fused_q5_0 = 0;
     int n_fused_q4   = 0;
     int n_fused_q4_1 = 0;
     int n_fused_q4_K = 0;
@@ -1735,7 +1763,8 @@ int sp_weights_ingest_gguf_block_quant(sp_weights&         weights,
             const ggml_tensor* t = slots[s];
             if (!t) continue;
             const size_t numel = (size_t)ggml_nelements(t);
-            if (sp_blk_is_q8_0(t)) {
+            if (sp_blk_is_q8_0(t) || sp_blk_is_q5_0(t)) {
+                /* Q5_0 reuses block_q8 storage (decoded int5 -> int8). */
                 q8_bytes += (numel / SP_OK_BLOCK_SIZE) * sizeof(sp_ok_q8_block_t) + 128;
             } else if (sp_blk_is_q4_0(t)) {
                 q4_bytes += (numel / SP_OK_BLOCK_SIZE) * sizeof(sp_ok_q4_block_t) + 128;
@@ -1824,6 +1853,18 @@ int sp_weights_ingest_gguf_block_quant(sp_weights&         weights,
                 shape_dst[s]->data = nullptr;
                 shape_dst[s]->scale_recip = scale_recip;
                 ++n_fused_q4_1;
+            } else if (sp_blk_is_q5_0(t)) {
+                if (!sp_blk_import_q5_0_to_q8(*q8_dst[s],
+                                                weights.block_q8_layer_arenas[L],
+                                                t, p, k, scale_recip)) {
+                    std::fprintf(stderr,
+                        "[sp-block-quant] L%d %s: Q5_0->block_q8 import failed\n",
+                        L, slot_names[s]);
+                    return -1;
+                }
+                shape_dst[s]->data = nullptr;
+                shape_dst[s]->scale_recip = scale_recip;
+                ++n_fused_q5_0;
             } else if (sp_blk_is_q4_K(t)) {
                 if (!sp_blk_import_q4_K(*q4_1_dst[s],
                                          weights.block_q4_1_layer_arenas[L],
@@ -1842,17 +1883,18 @@ int sp_weights_ingest_gguf_block_quant(sp_weights&         weights,
         }
     }
 
-    if (n_fused_q8 > 0)                                weights.use_block_q8 = true;
+    if (n_fused_q8 + n_fused_q5_0 > 0)                 weights.use_block_q8 = true;
     if (n_fused_q4 + n_fused_q4_1 + n_fused_q4_K > 0)  weights.use_block_q4 = true;
 
     std::fprintf(stderr,
-        "[sp-block-quant] ingest: Q8_0=%d  Q4_0=%d  Q4_1=%d  Q4_K=%d  "
+        "[sp-block-quant] ingest: Q8_0=%d  Q5_0=%d  Q4_0=%d  Q4_1=%d  Q4_K=%d  "
         "skipped=%d  use_block_q8=%d use_block_q4=%d  p=%lld k=%lld\n",
-        n_fused_q8, n_fused_q4, n_fused_q4_1, n_fused_q4_K, n_skipped,
+        n_fused_q8, n_fused_q5_0, n_fused_q4, n_fused_q4_1, n_fused_q4_K,
+        n_skipped,
         weights.use_block_q8 ? 1 : 0, weights.use_block_q4 ? 1 : 0,
         (long long)p, (long long)k);
 
-    return n_fused_q8 + n_fused_q4 + n_fused_q4_1 + n_fused_q4_K;
+    return n_fused_q8 + n_fused_q5_0 + n_fused_q4 + n_fused_q4_1 + n_fused_q4_K;
 }
 
 }  // namespace sp::engine
