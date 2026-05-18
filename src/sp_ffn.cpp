@@ -382,6 +382,12 @@ static inline bool sp_ffn_blk_matmul_mixed_to_fp32(
         return sp_matmul_ok_block_q4_1_to_fp32(
             W_shape, *W_q4_1, X, Y_fp32, out_rows, n_cols);
     }
+    /* Phase 15d fallback: when no block storage is populated for this
+     * tensor (e.g. Q5_0 or Q6_K that dequanted into raw sp_ok_t), the
+     * caller passes W_shape with .data populated. Use the raw matmul. */
+    if (W_shape.data) {
+        return sp_matmul_ok_to_fp32(W_shape, X, Y_fp32, out_rows, n_cols);
+    }
     return false;
 }
 

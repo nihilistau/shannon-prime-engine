@@ -441,6 +441,94 @@ static const uint16_t* tensor_fp16_or_dequant_to_fp16(
         return scratch_pool.data();
     }
 
+    /* Phase 15d: Q5_0 / Q5_1 / Q6_K dequant for both bypass-list AND
+     * weight tensors. Q4_K_M models use these heavily; without these
+     * paths most of a Q4_K_M's weights are unreachable. */
+    if (t->type == 6 /* GGML_TYPE_Q5_0 */) {
+        if ((numel % 32) != 0) return nullptr;
+        const size_t n_blocks = numel / 32;
+        struct gguf_q5_0 { uint16_t d; uint8_t qh[4]; uint8_t qs[16]; };
+        const gguf_q5_0* src = reinterpret_cast<const gguf_q5_0*>(t->data);
+        for (size_t b = 0; b < n_blocks; ++b) {
+            const float d = spwl_fp16_to_fp32(src[b].d);
+            uint32_t qh; std::memcpy(&qh, src[b].qh, 4);
+            for (int j = 0; j < 16; ++j) {
+                const uint8_t xh_0 = ((qh >> (j +  0)) << 4) & 0x10;
+                const uint8_t xh_1 = ((qh >> (j + 12))     ) & 0x10;
+                const int32_t x0 = ((src[b].qs[j] & 0x0F) | xh_0) - 16;
+                const int32_t x1 = ((src[b].qs[j] >>   4) | xh_1) - 16;
+                scratch_pool[b * 32 + j     ] = spwl_fp32_to_fp16((float)x0 * d);
+                scratch_pool[b * 32 + j + 16] = spwl_fp32_to_fp16((float)x1 * d);
+            }
+        }
+        std::fprintf(stderr,
+            "[sp-weights-loader] %s: dequanted Q5_0 -> fp16 (%zu elems)\n",
+            slot, numel);
+        return scratch_pool.data();
+    }
+
+    if (t->type == 7 /* GGML_TYPE_Q5_1 */) {
+        if ((numel % 32) != 0) return nullptr;
+        const size_t n_blocks = numel / 32;
+        struct gguf_q5_1 { uint16_t d; uint16_t m; uint8_t qh[4]; uint8_t qs[16]; };
+        const gguf_q5_1* src = reinterpret_cast<const gguf_q5_1*>(t->data);
+        for (size_t b = 0; b < n_blocks; ++b) {
+            const float d = spwl_fp16_to_fp32(src[b].d);
+            const float m = spwl_fp16_to_fp32(src[b].m);
+            uint32_t qh; std::memcpy(&qh, src[b].qh, 4);
+            for (int j = 0; j < 16; ++j) {
+                const uint8_t xh_0 = ((qh >> (j +  0)) << 4) & 0x10;
+                const uint8_t xh_1 = ((qh >> (j + 12))     ) & 0x10;
+                const int x0 = (src[b].qs[j] & 0x0F) | xh_0;
+                const int x1 = (src[b].qs[j] >>   4) | xh_1;
+                scratch_pool[b * 32 + j     ] = spwl_fp32_to_fp16((float)x0 * d + m);
+                scratch_pool[b * 32 + j + 16] = spwl_fp32_to_fp16((float)x1 * d + m);
+            }
+        }
+        std::fprintf(stderr,
+            "[sp-weights-loader] %s: dequanted Q5_1 -> fp16 (%zu elems)\n",
+            slot, numel);
+        return scratch_pool.data();
+    }
+
+    if (t->type == 14 /* GGML_TYPE_Q6_K */) {
+        /* QK_K = 256. Each super-block has ql[128] + qh[64] + scales[16] + d */
+        if ((numel % 256) != 0) return nullptr;
+        const size_t n_super = numel / 256;
+        struct gguf_q6_K {
+            uint8_t ql[128]; uint8_t qh[64];
+            int8_t scales[16]; uint16_t d;
+        };
+        const gguf_q6_K* src = reinterpret_cast<const gguf_q6_K*>(t->data);
+        for (size_t sb = 0; sb < n_super; ++sb) {
+            const float d = spwl_fp16_to_fp32(src[sb].d);
+            const uint8_t* ql_base = src[sb].ql;
+            const uint8_t* qh_base = src[sb].qh;
+            const int8_t*  sc_base = src[sb].scales;
+            uint16_t* dst = scratch_pool.data() + sb * 256;
+            for (int n = 0; n < 256; n += 128) {
+                const uint8_t* ql = ql_base + (n / 128) * 64;
+                const uint8_t* qh = qh_base + (n / 128) * 32;
+                const int8_t*  sc = sc_base + (n / 128) * 8;
+                for (int l = 0; l < 32; ++l) {
+                    const int is = l / 16;
+                    const int8_t q1 = (int8_t)((ql[l +  0] & 0xF) | (((qh[l] >> 0) & 3) << 4)) - 32;
+                    const int8_t q2 = (int8_t)((ql[l + 32] & 0xF) | (((qh[l] >> 2) & 3) << 4)) - 32;
+                    const int8_t q3 = (int8_t)((ql[l +  0]  >> 4) | (((qh[l] >> 4) & 3) << 4)) - 32;
+                    const int8_t q4 = (int8_t)((ql[l + 32]  >> 4) | (((qh[l] >> 6) & 3) << 4)) - 32;
+                    dst[n + l +  0] = spwl_fp32_to_fp16(d * (float)sc[is + 0] * (float)q1);
+                    dst[n + l + 32] = spwl_fp32_to_fp16(d * (float)sc[is + 2] * (float)q2);
+                    dst[n + l + 64] = spwl_fp32_to_fp16(d * (float)sc[is + 4] * (float)q3);
+                    dst[n + l + 96] = spwl_fp32_to_fp16(d * (float)sc[is + 6] * (float)q4);
+                }
+            }
+        }
+        std::fprintf(stderr,
+            "[sp-weights-loader] %s: dequanted Q6_K -> fp16 (%zu elems)\n",
+            slot, numel);
+        return scratch_pool.data();
+    }
+
     std::fprintf(stderr,
         "[sp-weights-loader] %s: unsupported type %d for fp16-or-dequant\n",
         slot, (int)t->type);
@@ -533,6 +621,12 @@ bool sp_weights_load_from_llama(sp_weights& out,
 
     // Build the layer sources.
     std::vector<sp_weights_layer_fp16_source> layer_srcs(n_layers);
+    /* Phase 15d: weight tensors can be Q5_0 / Q5_1 / Q6_K — types the
+     * standard fp16 walker doesn't understand. Pre-allocate per-layer
+     * per-slot scratch pools that outlive the load_from_fp16_source
+     * call below. 7 slots per layer (wq, wk, wv, wo, ffn_gate, ffn_up,
+     * ffn_down). For fp16 tensors the scratch stays empty (pass-through). */
+    std::vector<std::vector<uint16_t>> weight_scratch(n_layers * 7);
     // Bypass-list norms are fp32 — dequant into per-tensor scratch pools
     // owned by this function so the pointers stay valid through
     // sp_weights_load_from_fp16_source. 6 slots per layer:
@@ -553,13 +647,13 @@ bool sp_weights_load_from_llama(sp_weights& out,
             return false;
         }
         auto& s = layer_srcs[L];
-        s.wq       = tensor_fp16(lyr.wq,       "wq");
-        s.wk       = tensor_fp16(lyr.wk,       "wk");
-        s.wv       = tensor_fp16(lyr.wv,       "wv");
-        s.wo       = tensor_fp16(lyr.wo,       "wo");
-        s.ffn_gate = tensor_fp16(lyr.ffn_gate, "ffn_gate");
-        s.ffn_up   = tensor_fp16(lyr.ffn_up,   "ffn_up");
-        s.ffn_down = tensor_fp16(lyr.ffn_down, "ffn_down");
+        s.wq       = tensor_fp16_or_dequant_to_fp16(lyr.wq,       weight_scratch[L*7+0], "wq");
+        s.wk       = tensor_fp16_or_dequant_to_fp16(lyr.wk,       weight_scratch[L*7+1], "wk");
+        s.wv       = tensor_fp16_or_dequant_to_fp16(lyr.wv,       weight_scratch[L*7+2], "wv");
+        s.wo       = tensor_fp16_or_dequant_to_fp16(lyr.wo,       weight_scratch[L*7+3], "wo");
+        s.ffn_gate = tensor_fp16_or_dequant_to_fp16(lyr.ffn_gate, weight_scratch[L*7+4], "ffn_gate");
+        s.ffn_up   = tensor_fp16_or_dequant_to_fp16(lyr.ffn_up,   weight_scratch[L*7+5], "ffn_up");
+        s.ffn_down = tensor_fp16_or_dequant_to_fp16(lyr.ffn_down, weight_scratch[L*7+6], "ffn_down");
         s.attn_norm = tensor_fp32_or_dequant(
             lyr.attn_norm, norm_scratch[L * 6 + 0], n_embd, "attn_norm");
         s.ffn_norm  = tensor_fp32_or_dequant(

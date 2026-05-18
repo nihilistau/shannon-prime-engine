@@ -1037,20 +1037,27 @@ bool sp_forward_step_prefill(sp_forward_context& ctx,
          * read per-block fused scales (B_a, B_b); q4/q8 use per-tensor
          * shift. */
         if (weights.use_block_q4) {
-            /* Per-tensor dispatch: either block_q4_*[L] or block_q4_1_*[L]
-             * has populated blocks; the other is empty. */
+            /* Per-tensor dispatch: route each tensor to whichever storage
+             * has its data — block_q4_0 -> block_q4_1 -> block_q8 -> raw. */
             auto blk_qkv = [&](const sp_ok_tensor& W_shape,
                                 const sp_ok_block_q4_tensor& q4_0,
                                 const sp_ok_block_q4_1_tensor& q4_1,
+                                const sp_ok_block_q8_tensor& q8_blk,
+                                const sp_ok_tensor& W_raw,
                                 const sp_ok_tensor& X_in,
                                 sp_ok_tensor& Y_out) -> bool {
                 if (q4_0.blocks) return sp_matmul_ok_block_q4(W_shape, q4_0, X_in, Y_out);
                 if (q4_1.blocks) return sp_matmul_ok_block_q4_1(W_shape, q4_1, X_in, Y_out);
+                if (q8_blk.blocks) return sp_matmul_ok_block_q8(W_shape, q8_blk, X_in, Y_out);
+                if (W_raw.data) return sp_matmul_ok(W_raw, X_in, Y_out);
                 return false;
             };
-            if (!blk_qkv(W_q, weights.block_q4_wq[L], weights.block_q4_1_wq[L], ctx.x_norm_ok, ctx.q_ok)) return false;
-            if (!blk_qkv(W_k, weights.block_q4_wk[L], weights.block_q4_1_wk[L], ctx.x_norm_ok, ctx.k_ok)) return false;
-            if (!blk_qkv(W_v, weights.block_q4_wv[L], weights.block_q4_1_wv[L], ctx.x_norm_ok, ctx.v_ok)) return false;
+            if (!blk_qkv(W_q, weights.block_q4_wq[L], weights.block_q4_1_wq[L],
+                        weights.block_q8_wq[L], weights.wq[L], ctx.x_norm_ok, ctx.q_ok)) return false;
+            if (!blk_qkv(W_k, weights.block_q4_wk[L], weights.block_q4_1_wk[L],
+                        weights.block_q8_wk[L], weights.wk[L], ctx.x_norm_ok, ctx.k_ok)) return false;
+            if (!blk_qkv(W_v, weights.block_q4_wv[L], weights.block_q4_1_wv[L],
+                        weights.block_q8_wv[L], weights.wv[L], ctx.x_norm_ok, ctx.v_ok)) return false;
         } else if (weights.use_block_q8) {
             if (!sp_matmul_ok_block_q8(W_q, weights.block_q8_wq[L], ctx.x_norm_ok, ctx.q_ok)) return false;
             if (!sp_matmul_ok_block_q8(W_k, weights.block_q8_wk[L], ctx.x_norm_ok, ctx.k_ok)) return false;
@@ -1304,12 +1311,16 @@ bool sp_forward_step_prefill(sp_forward_context& ctx,
             bool wo_ok = false;
             if (weights.block_q4_wo[L].blocks) {
                 wo_ok = sp_matmul_ok_block_q4_to_fp32(W_o, weights.block_q4_wo[L],
-                    ctx.attn_out_ok, ctx.proj_out_fp32.data(),
-                    n_embd, n_tokens);
+                    ctx.attn_out_ok, ctx.proj_out_fp32.data(), n_embd, n_tokens);
             } else if (weights.block_q4_1_wo[L].blocks) {
                 wo_ok = sp_matmul_ok_block_q4_1_to_fp32(W_o, weights.block_q4_1_wo[L],
-                    ctx.attn_out_ok, ctx.proj_out_fp32.data(),
-                    n_embd, n_tokens);
+                    ctx.attn_out_ok, ctx.proj_out_fp32.data(), n_embd, n_tokens);
+            } else if (weights.block_q8_wo[L].blocks) {
+                wo_ok = sp_matmul_ok_block_q8_to_fp32(W_o, weights.block_q8_wo[L],
+                    ctx.attn_out_ok, ctx.proj_out_fp32.data(), n_embd, n_tokens);
+            } else if (weights.wo[L].data) {
+                wo_ok = sp_matmul_ok_to_fp32(weights.wo[L], ctx.attn_out_ok,
+                    ctx.proj_out_fp32.data(), n_embd, n_tokens);
             }
             if (!wo_ok) {
                 std::fprintf(stderr, "[sp_forward] L%d Wo matmul (block_q4 mixed) failed\n", L);
