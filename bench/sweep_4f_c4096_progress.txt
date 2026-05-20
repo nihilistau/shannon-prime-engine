@@ -1,0 +1,16 @@
+Phase 4f c4096 sweep starting Wed 20/05/2026 15:29:05.31 
+Engine: ..\build-cuda\bin\sp-engine.exe 
+Model: D:\Files\Models\Mine\gemma-3-1b-it\gemma-3-1b-it-Q4_0\gemma-3-1b-it-Q4_0.gguf 
+Corpus: test_corpus.txt 
+Settings: ctx=128 chunks=4 frobenius-quant + gguf-block-quant cap=4096 
+ 
+Re-using baseline from prior run: PPL_native = 10.4658 
+ 
+--- cap=4096 tau=0.0700 --- 
+PPL_native = 174.5451  (over 252 tokens, 4 chunks at ctx=128, frobenius_quant=1 sato_tate=0)
+perplexity = 174.5451 (n=4, ctx=128)
+sieve evictions = 5677 / 13312 (42.65%)  admissions = 7635  replacements = 0  subsumption-hits = 5677
+ 
+--- cap=4096 tau=0.0800 --- 
+ 
+--- cap=4096 tau=0.0900 --- 

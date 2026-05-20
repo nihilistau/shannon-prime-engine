@@ -1,0 +1,31 @@
+Phase 4f sweep starting Wed 20/05/2026 15:06:30.56 
+Engine: ..\build-cuda\bin\sp-engine.exe 
+Model: D:\Files\Models\Mine\gemma-3-1b-it\gemma-3-1b-it-Q4_0\gemma-3-1b-it-Q4_0.gguf 
+Corpus: test_corpus.txt 
+Settings: ctx=128 chunks=4 frobenius-quant + gguf-block-quant 
+ 
+=== BASELINE === 
+PPL_native = 10.4658  (over 252 tokens, 4 chunks at ctx=128, frobenius_quant=1 sato_tate=0)
+perplexity = 10.4658 (n=4, ctx=128)
+ 
+--- cap=1024 tau=0.0700 --- 
+PPL_native = 174.5451  (over 252 tokens, 4 chunks at ctx=128, frobenius_quant=1 sato_tate=0)
+perplexity = 174.5451 (n=4, ctx=128)
+sieve evictions = 5677 / 13312 (42.65%)  admissions = 7635  replacements = 0  subsumption-hits = 5677
+ 
+--- cap=1024 tau=0.0800 --- 
+PPL_native = 39.5540  (over 252 tokens, 4 chunks at ctx=128, frobenius_quant=1 sato_tate=0)
+perplexity = 39.5540 (n=4, ctx=128)
+sieve evictions = 5493 / 13312 (41.26%)  admissions = 7819  replacements = 0  subsumption-hits = 5493
+ 
+--- cap=1024 tau=0.0900 --- 
+PPL_native = 191.2681  (over 252 tokens, 4 chunks at ctx=128, frobenius_quant=1 sato_tate=0)
+perplexity = 191.2681 (n=4, ctx=128)
+sieve evictions = 5377 / 13312 (40.39%)  admissions = 7935  replacements = 0  subsumption-hits = 5377
+ 
+--- cap=1024 tau=0.1000 --- 
+PPL_native = 40.0224  (over 252 tokens, 4 chunks at ctx=128, frobenius_quant=1 sato_tate=0)
+perplexity = 40.0224 (n=4, ctx=128)
+sieve evictions = 5293 / 13312 (39.76%)  admissions = 8019  replacements = 0  subsumption-hits = 5293
+ 
+--- cap=1024 tau=0.1100 --- 

@@ -1,0 +1,2 @@
+PPL_native = 10.4658  (over 252 tokens, 4 chunks at ctx=128, frobenius_quant=1 sato_tate=0)
+perplexity = 10.4658 (n=4, ctx=128)

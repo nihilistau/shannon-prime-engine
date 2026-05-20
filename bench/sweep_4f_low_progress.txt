@@ -1,0 +1,14 @@
+Phase 4f LOW sweep starting Wed 20/05/2026 15:54:09.05 
+Baseline (from v1): PPL_native = 10.4658 
+ 
+--- tau=0.0000 --- 
+PPL_native = 1802.8341  (over 252 tokens, 4 chunks at ctx=128, frobenius_quant=1 sato_tate=0)
+perplexity = 1802.8341 (n=4, ctx=128)
+sieve evictions = 9707 / 13312 (72.92%)  admissions = 3605  replacements = 0  subsumption-hits = 9707
+ 
+--- tau=0.0050 --- 
+PPL_native = 719.5411  (over 252 tokens, 4 chunks at ctx=128, frobenius_quant=1 sato_tate=0)
+perplexity = 719.5411 (n=4, ctx=128)
+sieve evictions = 8651 / 13312 (64.99%)  admissions = 4661  replacements = 0  subsumption-hits = 8651
+ 
+--- tau=0.0100 --- 
