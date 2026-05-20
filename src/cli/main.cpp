@@ -221,6 +221,9 @@ static void usage(const char* prog) {
         "  --friedman-capacity <n>      Per-(layer,head) cache capacity (default 4096)\n"
         "  --kste-tau-A <f>             Anchor inclusion threshold * amax (default 0.0)\n"
         "  --kste-alpha <f>             Residual->anchor bucket span (default 0.7)\n"
+        "  --friedman-gamma <f>         Phase-4g soft-mask strength; 0=hard NEG_INF (default),\n"
+        "                               >0 subtracts gamma from evicted-position attn scores\n"
+        "                               before softmax (exp(-gamma) downweight after renorm)\n"
         "  --frobenius-quant            Enable single-prime Frobenius quantization\n"
         "                               (Config B): calibration-free fp8 via φ_p^k.\n"
         "  --frobenius-quant-p <p>      Split prime in K=Q(√-163). Default 41\n"
@@ -354,6 +357,7 @@ static int parse_config_flag(sp::engine::Config& cfg, const char* a, const char*
     if (a_eq("--friedman-capacity") && has_next)      { cfg.friedman_capacity = (int)std::atoll(next); return 2; }
     if (a_eq("--kste-tau-A") && has_next)             { cfg.kste_tau_A = (float)std::atof(next); return 2; }
     if (a_eq("--kste-alpha") && has_next)             { cfg.kste_alpha = (float)std::atof(next); return 2; }
+    if (a_eq("--friedman-gamma") && has_next)         { cfg.friedman_attn_gamma = (float)std::atof(next); return 2; }
     if (a_eq("--frobenius-q8"))                     { cfg.frobenius_q8 = true; return 1; }
     if (a_eq("--frobenius-q4"))                     { cfg.frobenius_q4 = true; return 1; }
     if (a_eq("--frobenius-q4-prune") && has_next)   { cfg.frobenius_q4_prune = (uint64_t)std::atoll(next); cfg.frobenius_q4 = true; return 2; }
@@ -1007,7 +1011,8 @@ int main(int argc, char** argv) {
             if (pc.friedman_sieve) {
                 if (!sp::engine::sp_forward_friedman_setup(
                         ctx, pc.friedman_mode, pc.friedman_capacity,
-                        pc.kste_tau_A, pc.kste_alpha)) {
+                        pc.kste_tau_A, pc.kste_alpha,
+                        pc.friedman_attn_gamma)) {
                     std::fprintf(stderr,
                         "[sp-engine] perplexity-native: Friedman sieve setup failed; "
                         "continuing without sieve\n");

@@ -180,6 +180,11 @@ struct sp_forward_context {
     // softmax mass on evicted positions to zero.  Size n_layers * n_ctx.
     std::vector<uint8_t> friedman_evicted_mask;
 
+    // Phase 4g — soft-attenuation strength.  When > 0, the mask above is
+    // applied as (score -= gamma) before softmax instead of NEG_INF.  Set
+    // via sp_forward_friedman_setup() from Config::friedman_attn_gamma.
+    float friedman_attn_gamma = 0.0f;
+
     int     n_layers   = 0;
     int     n_embd     = 0;
     int     n_head     = 0;
@@ -616,7 +621,8 @@ bool sp_forward_friedman_setup(sp_forward_context& ctx,
                                int   mode_int,      // 0=off,1=observer,2=policy
                                int   capacity,
                                float tau_A,
-                               float alpha);
+                               float alpha,
+                               float attn_gamma = 0.0f);  // Phase 4g soft mask
 void sp_forward_friedman_teardown(sp_forward_context& ctx);
 
 // Aggregated sieve counters across all (layer, kv-head) caches.

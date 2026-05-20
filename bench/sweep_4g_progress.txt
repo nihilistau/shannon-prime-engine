@@ -1,0 +1,37 @@
+Phase 4g sweep starting Wed 20/05/2026 16:47:23.11 
+Anchored at tau_A=0.30 (Phase 4f U-floor) 
+Baseline PPL (sieve off, from Phase 4f): 10.4658 
+Phase 4f hard-mask PPL at tau=0.30: 34.7317 
+Gate band [10.4135, 10.5181] 
+ 
+--- gamma=0.0000 --- 
+PPL_native = 34.7317  (over 252 tokens, 4 chunks at ctx=128, frobenius_quant=1 sato_tate=0)
+perplexity = 34.7317 (n=4, ctx=128)
+sieve evictions = 4573 / 13312 (34.35%)  admissions = 8739  replacements = 0  subsumption-hits = 4573
+ 
+--- gamma=0.5000 --- 
+PPL_native = 10.3777  (over 252 tokens, 4 chunks at ctx=128, frobenius_quant=1 sato_tate=0)
+perplexity = 10.3777 (n=4, ctx=128)
+sieve evictions = 4785 / 13312 (35.95%)  admissions = 8527  replacements = 0  subsumption-hits = 4785
+ 
+--- gamma=1.0000 --- 
+PPL_native = 10.5919  (over 252 tokens, 4 chunks at ctx=128, frobenius_quant=1 sato_tate=0)
+perplexity = 10.5919 (n=4, ctx=128)
+sieve evictions = 4772 / 13312 (35.85%)  admissions = 8540  replacements = 0  subsumption-hits = 4772
+ 
+--- gamma=2.0000 --- 
+PPL_native = 11.9524  (over 252 tokens, 4 chunks at ctx=128, frobenius_quant=1 sato_tate=0)
+perplexity = 11.9524 (n=4, ctx=128)
+sieve evictions = 4818 / 13312 (36.19%)  admissions = 8494  replacements = 0  subsumption-hits = 4818
+ 
+--- gamma=4.0000 --- 
+PPL_native = 16.9627  (over 252 tokens, 4 chunks at ctx=128, frobenius_quant=1 sato_tate=0)
+perplexity = 16.9627 (n=4, ctx=128)
+sieve evictions = 4811 / 13312 (36.14%)  admissions = 8501  replacements = 0  subsumption-hits = 4811
+ 
+--- gamma=8.0000 --- 
+PPL_native = 25.4095  (over 252 tokens, 4 chunks at ctx=128, frobenius_quant=1 sato_tate=0)
+perplexity = 25.4095 (n=4, ctx=128)
+sieve evictions = 4666 / 13312 (35.05%)  admissions = 8646  replacements = 0  subsumption-hits = 4666
+ 
+--- gamma=16.0000 --- 

@@ -53,7 +53,8 @@ void sp_attention_dot_product(const sp_ok_tensor& q,
                                 int   pos_offset_arg,
                                 int   swa_window,
                                 float attn_logit_softcap,
-                                 const uint8_t* evicted_mask)
+                                 const uint8_t* evicted_mask,
+                                 float evicted_gamma)
 {
     if (q.data == nullptr || k.data == nullptr || v.data == nullptr ||
         out.data == nullptr) return;
@@ -186,12 +187,23 @@ void sp_attention_dot_product(const sp_ok_tensor& q,
 
             // 3) softmax over the full T_valid window — the NEG_INF tails
             //    softmax to 0 and contribute nothing to the normalization.
-            // Phase 4d: Friedman sieve POLICY mask � final NEG_INF pass on
-            // positions the sieve flagged as structurally subsumed.  Runs
-            // after the in-window score compute + softcap, before softmax.
+            // Phase 4d/4g: Friedman sieve POLICY mask on positions the sieve
+            // flagged as structurally subsumed.  Runs after the in-window
+            // score compute + softcap, before softmax.
+            //   evicted_gamma <= 0  → hard NEG_INF (Phase 4d default)
+            //   evicted_gamma  > 0  → soft attenuation: subtract gamma from
+            //                         the pre-softmax score (Phase 4g).
+            //                         Equivalent to scaling the post-softmax
+            //                         probability by exp(-gamma) before
+            //                         renormalisation; never zeroed.
             if (evicted_mask) {
-                for (int64_t t = 0; t < T_valid; ++t)
-                    if (evicted_mask[t]) scores[t] = NEG_INF;
+                if (evicted_gamma > 0.0f) {
+                    for (int64_t t = 0; t < T_valid; ++t)
+                        if (evicted_mask[t]) scores[t] -= evicted_gamma;
+                } else {
+                    for (int64_t t = 0; t < T_valid; ++t)
+                        if (evicted_mask[t]) scores[t] = NEG_INF;
+                }
             }
             sp_softmax_bridge(scores.data(), (int)T_valid, weights.data());
 
@@ -261,7 +273,8 @@ void sp_attention_poly_ring(const sp_ok_tensor& q,
                               float attn_logit_softcap,
                               const uint64_t* k_ntt_slab_q1,
                               const uint64_t* k_ntt_slab_q2,
-                                 const uint8_t* evicted_mask)
+                                 const uint8_t* evicted_mask,
+                                 float evicted_gamma)
 {
     if (q.data == nullptr || k.data == nullptr || v.data == nullptr ||
         out.data == nullptr) return;
@@ -451,12 +464,20 @@ void sp_attention_poly_ring(const sp_ok_tensor& q,
             }
 
             // Softmax over the full window (NEG_INF tails softmax to 0).
-            // Phase 4d: Friedman sieve POLICY mask � final NEG_INF pass on
-            // positions the sieve flagged as structurally subsumed.  Runs
-            // after the in-window score compute + softcap, before softmax.
+            // Phase 4d/4g: Friedman sieve POLICY mask — hard or soft.
+            //   evicted_gamma <= 0  → hard NEG_INF (Phase 4d default)
+            //   evicted_gamma  > 0  → soft attenuation: subtract gamma
+            //                         (Phase 4g); the masked position keeps
+            //                         exp(-gamma)-fraction of its softmax
+            //                         weight after renormalisation.
             if (evicted_mask) {
-                for (int64_t t = 0; t < T_valid; ++t)
-                    if (evicted_mask[t]) scores[t] = NEG_INF;
+                if (evicted_gamma > 0.0f) {
+                    for (int64_t t = 0; t < T_valid; ++t)
+                        if (evicted_mask[t]) scores[t] -= evicted_gamma;
+                } else {
+                    for (int64_t t = 0; t < T_valid; ++t)
+                        if (evicted_mask[t]) scores[t] = NEG_INF;
+                }
             }
             sp_softmax_bridge(scores.data(), (int)T_valid, weights.data());
 

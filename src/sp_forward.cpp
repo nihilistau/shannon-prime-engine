@@ -1273,7 +1273,8 @@ bool sp_forward_step_prefill(sp_forward_context& ctx,
                                       layer_swa_window,
                                       ctx.attn_logit_softcap,
                                       k_ntt_slab_q1, k_ntt_slab_q2,
-                                      fr_mask_L);
+                                      fr_mask_L,
+                                      ctx.friedman_attn_gamma);
         } else {
             const uint8_t* fr_mask_Ld = ctx.friedman_evicted_mask.empty()
                 ? nullptr
@@ -1283,7 +1284,8 @@ bool sp_forward_step_prefill(sp_forward_context& ctx,
                                         t_valid, t_stride, position_base,
                                         layer_swa_window,
                                         ctx.attn_logit_softcap,
-                                        fr_mask_Ld);
+                                        fr_mask_Ld,
+                                        ctx.friedman_attn_gamma);
         }
         // attn_out_ok now has frobenius_scale=1.
 
@@ -1965,8 +1967,12 @@ bool sp_forward_friedman_setup(sp_forward_context& ctx,
                                int   mode_int,
                                int   capacity,
                                float tau_A,
-                               float alpha)
+                               float alpha,
+                               float attn_gamma)
 {
+    // Phase 4g — record the soft-attenuation strength.  The mask consumer
+    // (sp_attention_*) reads ctx.friedman_attn_gamma directly.
+    ctx.friedman_attn_gamma = (attn_gamma > 0.0f) ? attn_gamma : 0.0f;
     if (capacity <= 0) capacity = 4096;
     sp_friedman_mode mode = SP_FRIEDMAN_MODE_OFF;
     if      (mode_int == 1) mode = SP_FRIEDMAN_MODE_OBSERVER;
@@ -1992,8 +1998,10 @@ bool sp_forward_friedman_setup(sp_forward_context& ctx,
     }
     std::fprintf(stderr,
         "[sp_forward] Friedman sieve enabled: mode=%d capacity=%d "
-        "tau_A=%.4f alpha=%.4f (layers=%d heads=%d head_dim=%d)\n",
-        mode_int, capacity, tau_A, alpha,
+        "tau_A=%.4f alpha=%.4f gamma=%.4f (%s) "
+        "(layers=%d heads=%d head_dim=%d)\n",
+        mode_int, capacity, tau_A, alpha, ctx.friedman_attn_gamma,
+        (ctx.friedman_attn_gamma > 0.0f ? "soft mask" : "hard NEG_INF"),
         ctx.n_layers, ctx.n_kv_head, ctx.head_dim);
     return true;
 }

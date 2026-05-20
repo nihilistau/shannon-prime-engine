@@ -173,6 +173,11 @@ struct Config {
     int         friedman_capacity  = 4096;
     float       kste_tau_A         = 0.0f;    // Phase-1 bootstrap default
     float       kste_alpha         = 0.7f;
+    // Phase 4g — soft-attenuation mask gamma.  When the sieve is in POLICY
+    // mode and friedman_attn_gamma > 0, evicted-position attention scores
+    // are downweighted by (score -= gamma) before softmax instead of being
+    // hard-masked to NEG_INF.  gamma == 0 preserves Phase 4d behaviour.
+    float       friedman_attn_gamma = 0.0f;
 
     // Phase 12 Step B-2: --frobenius-q8.
     // After the Frobenius shim has run, round-trip every shim-list

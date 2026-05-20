@@ -1,0 +1,33 @@
+Phase 4g fine sweep starting Wed 20/05/2026 17:13:56.64 
+ 
+--- gamma=0.3000 --- 
+PPL_native = 10.3924  (over 252 tokens, 4 chunks at ctx=128, frobenius_quant=1 sato_tate=0)
+perplexity = 10.3924 (n=4, ctx=128)
+sieve evictions = 4793 / 13312 (36.01%)  admissions = 8519  replacements = 0  subsumption-hits = 4793
+ 
+--- gamma=0.4000 --- 
+PPL_native = 10.3077  (over 252 tokens, 4 chunks at ctx=128, frobenius_quant=1 sato_tate=0)
+perplexity = 10.3077 (n=4, ctx=128)
+sieve evictions = 4743 / 13312 (35.63%)  admissions = 8569  replacements = 0  subsumption-hits = 4743
+ 
+--- gamma=0.6000 --- 
+PPL_native = 10.4647  (over 252 tokens, 4 chunks at ctx=128, frobenius_quant=1 sato_tate=0)
+perplexity = 10.4647 (n=4, ctx=128)
+sieve evictions = 4798 / 13312 (36.04%)  admissions = 8514  replacements = 0  subsumption-hits = 4798
+ 
+--- gamma=0.7000 --- 
+PPL_native = 10.3460  (over 252 tokens, 4 chunks at ctx=128, frobenius_quant=1 sato_tate=0)
+perplexity = 10.3460 (n=4, ctx=128)
+sieve evictions = 4803 / 13312 (36.08%)  admissions = 8509  replacements = 0  subsumption-hits = 4803
+ 
+--- gamma=0.8000 --- 
+PPL_native = 10.2932  (over 252 tokens, 4 chunks at ctx=128, frobenius_quant=1 sato_tate=0)
+perplexity = 10.2932 (n=4, ctx=128)
+sieve evictions = 4788 / 13312 (35.97%)  admissions = 8524  replacements = 0  subsumption-hits = 4788
+ 
+--- gamma=0.9000 --- 
+PPL_native = 10.4665  (over 252 tokens, 4 chunks at ctx=128, frobenius_quant=1 sato_tate=0)
+perplexity = 10.4665 (n=4, ctx=128)
+sieve evictions = 4813 / 13312 (36.16%)  admissions = 8499  replacements = 0  subsumption-hits = 4813
+ 
+DONE Wed 20/05/2026 17:39:46.95 
