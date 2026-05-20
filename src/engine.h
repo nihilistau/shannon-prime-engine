@@ -178,6 +178,11 @@ struct Config {
     // are downweighted by (score -= gamma) before softmax instead of being
     // hard-masked to NEG_INF.  gamma == 0 preserves Phase 4d behaviour.
     float       friedman_attn_gamma = 0.0f;
+    // Phase 7 — ultraproduct attention (Paper III §5.3 / Paper IV §6.3
+    // Tier 3).  0 = standard softmax attention.  1 = principal ultrafilter
+    // (hard Top-1 attention along U_{p*}).  2 = non-principal limit (NYI,
+    // Phase 7+).  Inference-only; gradient flow is undefined.
+    int         ultraproduct_attn = 0;
 
     // Phase 12 Step B-2: --frobenius-q8.
     // After the Frobenius shim has run, round-trip every shim-list

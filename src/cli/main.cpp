@@ -224,6 +224,10 @@ static void usage(const char* prog) {
         "  --friedman-gamma <f>         Phase-4g soft-mask strength; 0=hard NEG_INF (default),\n"
         "                               >0 subtracts gamma from evicted-position attn scores\n"
         "                               before softmax (exp(-gamma) downweight after renorm)\n"
+        "  --ultraproduct-attn <m>      Phase-7 ultraproduct attention (Paper III §5.3).\n"
+        "                               m = none|principal|nonprincipal (default none).\n"
+        "                               principal = hard Top-1 attention along U_{p*}.\n"
+        "                               INFERENCE-ONLY; no gradient flow through argmax.\n"
         "  --frobenius-quant            Enable single-prime Frobenius quantization\n"
         "                               (Config B): calibration-free fp8 via φ_p^k.\n"
         "  --frobenius-quant-p <p>      Split prime in K=Q(√-163). Default 41\n"
@@ -358,6 +362,13 @@ static int parse_config_flag(sp::engine::Config& cfg, const char* a, const char*
     if (a_eq("--kste-tau-A") && has_next)             { cfg.kste_tau_A = (float)std::atof(next); return 2; }
     if (a_eq("--kste-alpha") && has_next)             { cfg.kste_alpha = (float)std::atof(next); return 2; }
     if (a_eq("--friedman-gamma") && has_next)         { cfg.friedman_attn_gamma = (float)std::atof(next); return 2; }
+    if (a_eq("--ultraproduct-attn") && has_next) {
+        std::string m = next;
+        if      (m == "none")          cfg.ultraproduct_attn = 0;
+        else if (m == "principal")     cfg.ultraproduct_attn = 1;
+        else if (m == "nonprincipal")  cfg.ultraproduct_attn = 2;
+        return 2;
+    }
     if (a_eq("--frobenius-q8"))                     { cfg.frobenius_q8 = true; return 1; }
     if (a_eq("--frobenius-q4"))                     { cfg.frobenius_q4 = true; return 1; }
     if (a_eq("--frobenius-q4-prune") && has_next)   { cfg.frobenius_q4_prune = (uint64_t)std::atoll(next); cfg.frobenius_q4 = true; return 2; }
@@ -1005,6 +1016,17 @@ int main(int argc, char** argv) {
             ctx.embd_scale = embd_scale;
             ctx.ffn_act    = ffn_act;
             ctx.rope_mode  = rope_mode;
+
+            // Phase 7: ultraproduct attention dispatch (default 0 = soft
+            // attention; 1 = principal ultrafilter / hard Top-1).
+            ctx.ultraproduct_mode = pc.ultraproduct_attn;
+            if (ctx.ultraproduct_mode > 0) {
+                std::fprintf(stderr,
+                    "[sp-engine] perplexity-native: ultraproduct-attn=%s "
+                    "(Phase 7, INFERENCE-ONLY hard attention)\n",
+                    ctx.ultraproduct_mode == 1 ? "principal" :
+                    ctx.ultraproduct_mode == 2 ? "nonprincipal" : "?");
+            }
 
             // Phase 4b: Friedman sieve setup (after context_init populates
             // n_layers / n_kv_head / head_dim).

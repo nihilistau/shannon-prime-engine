@@ -126,6 +126,23 @@ if(SP_FRIEDMAN_SIEVE)
     )
     add_test(NAME sp_kste_resolution COMMAND test_sp_kste_resolution
              WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+
+    # ─── Phase 7 — ultraproduct attention prototype tests ─────────────
+    # T3.1 / T3.2 / T3.6 — principal -> Top-1, Łoś property, choice
+    # operator canonicality.  Links sp_engine for the ultraproduct kernel
+    # (which depends on sp_ok_tensor + sp_ok_t_ops); shannon_prime_core
+    # comes in transitively via sp_engine for sp_kste_*.
+    add_executable(test_sp_ultraproduct_attn test_sp_ultraproduct_attn.cpp)
+    target_link_libraries(test_sp_ultraproduct_attn PRIVATE sp_engine)
+    target_include_directories(test_sp_ultraproduct_attn PRIVATE
+        ../src
+        ../lib/shannon-prime/core
+    )
+    set_target_properties(test_sp_ultraproduct_attn PROPERTIES
+        CXX_STANDARD 17
+    )
+    add_test(NAME sp_ultraproduct_attn COMMAND test_sp_ultraproduct_attn
+             WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
 endif()
 
 # ─── SP encode + sampler unit tests (Phase 1.2/1.3 + Phase 2 prep) ─────

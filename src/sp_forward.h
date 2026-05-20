@@ -185,6 +185,15 @@ struct sp_forward_context {
     // via sp_forward_friedman_setup() from Config::friedman_attn_gamma.
     float friedman_attn_gamma = 0.0f;
 
+    // Phase 7 — ultraproduct attention dispatch.  When > 0 the forward
+    // pass routes through sp_ultraproduct_attn_principal instead of the
+    // softmax kernels (sp_attention_dot_product / sp_attention_poly_ring).
+    //   0 = standard softmax attention.
+    //   1 = principal ultrafilter (hard Top-1 attention).
+    //   2 = non-principal limit (NYI, currently behaves as 1).
+    // Inference-only; do not set during training.
+    int ultraproduct_mode = 0;
+
     int     n_layers   = 0;
     int     n_embd     = 0;
     int     n_head     = 0;

@@ -9,6 +9,7 @@
 
 #include "sp_forward.h"
 #include "sp_attention.h"
+#include "sp_ultraproduct_attn.h"
 #include "sp_ffn.h"
 #include "sp_bridges.h"
 #include "sp_matmul.h"
@@ -1250,7 +1251,25 @@ bool sp_forward_step_prefill(sp_forward_context& ctx,
         // the 2^53 fp64 mantissa limit. Higher scale would compound with
         // Wo's pi^k Frobenius factor and lose precision.
         ctx.attn_out_ok.scale_recip = S;
-        if (ctx.attn_mode == 1) {
+        // Phase 7 — ultraproduct attention override.  When ultraproduct_mode
+        // is non-zero, hard Top-1 attention along U_{p*} replaces the
+        // softmax kernels.  Score compute uses the same SWA / softcap /
+        // sieve-mask pipeline; only the reduction differs (argmax →
+        // V_{p*} instead of softmax → weighted sum).
+        if (ctx.ultraproduct_mode > 0) {
+            const uint8_t* fr_mask_Lup = ctx.friedman_evicted_mask.empty()
+                ? nullptr
+                : ctx.friedman_evicted_mask.data() + (size_t)L * (size_t)ctx.n_ctx;
+            sp_ultraproduct_attn_principal(ctx.q_ok, K_view, V_view,
+                                            ctx.attn_out_ok,
+                                            n_head, n_kv_head, head_dim,
+                                            t_valid, t_stride, position_base,
+                                            layer_swa_window,
+                                            ctx.attn_logit_softcap,
+                                            fr_mask_Lup,
+                                            ctx.friedman_attn_gamma,
+                                            /*selected_pos=*/nullptr);
+        } else if (ctx.attn_mode == 1) {
             // Phase 9b (post Plan C): per-layer dual-prime CRT slabs
             // when allocated. When null, sp_attention_poly_ring falls
             // back to scalar O(N^2).

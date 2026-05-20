@@ -126,6 +126,7 @@ set(SP_CORE_SRC
     ${SP_CORE_DIR}/core/sp_kste.c
     ${SP_CORE_DIR}/core/sp_kste_pack.c
     ${SP_CORE_DIR}/core/sp_kste_embed.c
+    ${SP_CORE_DIR}/core/sp_kste_choice.c
     ${SP_CORE_DIR}/core/sp_frobenius.c
     ${SP_CORE_DIR}/core/sp_ec_weil.c
     ${SP_CORE_DIR}/core/sp_poly_ring.c
@@ -443,6 +444,7 @@ add_library(sp_engine STATIC
     src/speculative_oracle.cpp
     src/sp_friedman_cache.cpp
     src/sp_friedman_kv_hook.cpp
+    src/sp_ultraproduct_attn.cpp
     vendor/cpp-httplib/httplib.cpp)
 target_include_directories(sp_engine PUBLIC src)
 target_include_directories(sp_engine PUBLIC ${CMAKE_SOURCE_DIR}/vendor/cpp-httplib)
