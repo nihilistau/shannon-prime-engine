@@ -101,6 +101,7 @@ def build_corpora(corpus_text: str, ctx_target: int, depth_pct: float,
 
 def run_perplexity(model: Path, corpus_path: Path, *,
                    ctx: int, chunks: int, ultraproduct: bool,
+                   bracket: int = 1,
                    timeout_s: float = 900.0) -> tuple[float | None, float]:
     """Invoke sp-engine.exe perplexity on the corpus.  Returns
     (ppl_value or None on parse failure, wall_seconds)."""
@@ -114,6 +115,8 @@ def run_perplexity(model: Path, corpus_path: Path, *,
     ]
     if ultraproduct:
         cmd += ["--ultraproduct-attn", "principal"]
+        if bracket > 1:
+            cmd += ["--ultraproduct-bracket", str(bracket)]
     cmd.append(str(corpus_path))
 
     env = dict(os.environ)
@@ -153,6 +156,10 @@ def main() -> int:
     ap.add_argument("--depths",  default="middle",
                     help="comma-separated subset of {shallow,middle,deep}")
     ap.add_argument("--trials",  type=int, default=1)
+    ap.add_argument("--bracket", type=int, default=1,
+                    help="Phase 8d F-over-top-m bracket for ultraproduct "
+                         "mode.  1=plain argmax (Phase 7), >1 routes the "
+                         "top-m bracket through sp_kste_select_canonical.")
     ap.add_argument("--timeout", type=float, default=900.0)
     ap.add_argument("--out-json", default=str(REPO / "bench" / "ruler_lite_v2_results.json"))
     ap.add_argument("--tmp", default=str(REPO / "bench" / "tmp_ruler_v2"))
@@ -189,10 +196,12 @@ def main() -> int:
                 p_ppl, p_wall = run_perplexity(Path(args.model), planted_path,
                                                 ctx=args.ctx, chunks=args.chunks,
                                                 ultraproduct=ultra,
+                                                bracket=args.bracket,
                                                 timeout_s=args.timeout)
                 c_ppl, c_wall = run_perplexity(Path(args.model), control_path,
                                                 ctx=args.ctx, chunks=args.chunks,
                                                 ultraproduct=ultra,
+                                                bracket=args.bracket,
                                                 timeout_s=args.timeout)
                 # Retrieval signal: lower PPL with the needle present = the
                 # model leveraged it.  delta = control - planted.  Positive

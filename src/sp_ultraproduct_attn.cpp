@@ -10,10 +10,15 @@
 #include "sp_attention.h"
 #include "sp_ok_encode.h"
 
+extern "C" {
+#include "../lib/shannon-prime/core/sp_kste.h"
+}
+
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
 #include <limits>
+#include <utility>
 #include <vector>
 
 namespace sp::engine {
@@ -30,7 +35,8 @@ void sp_ultraproduct_attn_principal(const sp_ok_tensor& q,
                                       float attn_logit_softcap,
                                       const uint8_t* evicted_mask,
                                       float evicted_gamma,
-                                      int32_t* selected_pos)
+                                      int32_t* selected_pos,
+                                      int   bracket)
 {
     if (q.data == nullptr || k.data == nullptr || v.data == nullptr ||
         out.data == nullptr) return;
@@ -65,6 +71,30 @@ void sp_ultraproduct_attn_principal(const sp_ok_tensor& q,
     const float NEG_INF = -std::numeric_limits<float>::infinity();
 
     std::vector<float> scores(T_valid);
+
+    // ------------------------------------------------------------------
+    // Phase 8d — F-over-top-m bracket scratch.
+    //   bracket == 1: legacy plain argmax (Phase 7 path); no encoder calls.
+    //   bracket  > 1: top-m partial sort → encode each → F-canonical →
+    //                 use V at canonical's position.
+    // The encoder context is initialised once per kernel call (not per
+    // (qi, h)); its Möbius mask is read-only after init.
+    // ------------------------------------------------------------------
+    const int bracket_m = (bracket < 1) ? 1 : bracket;
+    sp_kste_ctx                       kctx;
+    std::vector<sp_kste_tree>         bracket_trees;
+    std::vector<const sp_kste_tree*>  bracket_tree_ptrs;
+    std::vector<int64_t>              bracket_positions;
+    std::vector<float>                k_decode_buf;
+    std::vector<float>                kste_scratch;        // 3 * head_dim
+    if (bracket_m > 1) {
+        sp_kste_ctx_init(&kctx, head_dim);
+        bracket_trees.resize(bracket_m);
+        bracket_tree_ptrs.resize(bracket_m, nullptr);
+        bracket_positions.resize(bracket_m, -1);
+        k_decode_buf.resize(head_dim);
+        kste_scratch.resize(3 * (size_t)head_dim);
+    }
 
     const int64_t d_q_total = (int64_t)n_head * head_dim;
 
@@ -132,24 +162,96 @@ void sp_ultraproduct_attn_principal(const sp_ok_tensor& q,
                 }
             }
 
-            // 4) Principal-ultrafilter reduction: pick argmax_t scores[t]
-            //    over [t_lo, t_hi). Break ties by lower index (defines
-            //    the principal ultrafilter deterministically).
+            // 4) Principal-ultrafilter reduction.
             //
-            //    If the entire valid window has been NEG_INF-masked
-            //    (sieve evicted every reachable key — unlikely but
-            //    possible) we fall back to attending to the query
-            //    position itself, i.e. p* = q_pos. This is the
-            //    "empty-ultrafilter" degeneracy and matches the
-            //    Paper III §5.4 finite-window convention: every
-            //    bounded cache has at least one principal ultrafilter,
-            //    namely U_{q_pos}.
+            // bracket_m == 1: legacy argmax (Phase 7 default).  p* is the
+            //   highest-scoring position in [t_lo, t_hi); ties → lower
+            //   index.
+            //
+            // bracket_m  > 1: F-over-top-m (Phase 8d / Paper IV §10).
+            //   1. Partial-sort the top-m positions by score.
+            //   2. Encode each of their K-vectors via sp_kste_encode →
+            //      sp_kste_tree.
+            //   3. Call sp_kste_select_canonical: returns the lex-min
+            //      packed tree (the canonical representative of the
+            //      ⪯_d-equivalence class hit by the top-m bracket).
+            //   4. p* := the position whose tree IS the canonical.
+            //
+            //   This engages the KSTE encoder + Choice Operator F in
+            //   the inference path exactly as Paper IV §10 specifies.
+            //   The dot-product remains the bracket selector (preserves
+            //   sign and magnitude information from soft attention);
+            //   F deterministically tie-breaks within the bracket's
+            //   equivalence class.  Argmax flips between near-tied keys
+            //   no longer cause large output swings because F picks
+            //   the same canonical for any permutation of the bracket.
+            //
+            // Empty-window fallback: if [t_lo, t_hi) is empty or the
+            // sieve NEG_INF-masked everything reachable, p* := q_pos
+            // (Paper III §5.4 finite-window convention: every bounded
+            // cache has at least one principal ultrafilter, namely
+            // U_{q_pos}).
             int64_t p_star = -1;
-            float   best   = -std::numeric_limits<float>::infinity();
-            for (int64_t t = t_lo; t < t_hi; ++t) {
-                if (scores[t] > best) {
-                    best   = scores[t];
-                    p_star = t;
+            if (bracket_m == 1) {
+                float best = -std::numeric_limits<float>::infinity();
+                for (int64_t t = t_lo; t < t_hi; ++t) {
+                    if (scores[t] > best) {
+                        best   = scores[t];
+                        p_star = t;
+                    }
+                }
+            } else {
+                // (1) Insertion-sort top-m positions by score over the
+                //     in-range window.  m is small (1..8 typical), so the
+                //     O(T·m) cost is comfortably under the score-compute
+                //     cost we just paid.
+                const int m = std::min<int>(bracket_m,
+                                             (int)std::max<int64_t>(t_hi - t_lo, 0));
+                std::vector<std::pair<float, int64_t>> top(
+                    m, {NEG_INF, (int64_t)-1});
+                for (int64_t t = t_lo; t < t_hi; ++t) {
+                    const float s = scores[t];
+                    if (m > 0 && s > top[m - 1].first) {
+                        top[m - 1] = {s, t};
+                        for (int j = m - 1;
+                             j > 0 && top[j].first > top[j - 1].first;
+                             --j) {
+                            std::swap(top[j], top[j - 1]);
+                        }
+                    }
+                }
+
+                // (2) Encode each top-m K-vector into an sp_kste_tree.
+                int n_valid = 0;
+                for (int j = 0; j < m; ++j) {
+                    const int64_t t = top[j].second;
+                    if (t < 0) continue;
+                    for (int d = 0; d < head_dim; ++d) {
+                        const sp_ok_t& k_dt =
+                            k.data[((int64_t)kv_h * head_dim + d) * T_stride + t];
+                        k_decode_buf[d] =
+                            (float)((double)k_dt.a / k_div_inner);
+                    }
+                    sp_kste_encode(&bracket_trees[n_valid],
+                                    k_decode_buf.data(),
+                                    &kctx,
+                                    kste_scratch.data());
+                    bracket_tree_ptrs[n_valid] = &bracket_trees[n_valid];
+                    bracket_positions[n_valid] = t;
+                    ++n_valid;
+                }
+
+                // (3) F = lex-min on packed sp_kste_tree (Paper IV §10).
+                if (n_valid > 0) {
+                    const sp_kste_tree* canonical =
+                        sp_kste_select_canonical(
+                            bracket_tree_ptrs.data(), n_valid);
+                    for (int j = 0; j < n_valid; ++j) {
+                        if (bracket_tree_ptrs[j] == canonical) {
+                            p_star = bracket_positions[j];
+                            break;
+                        }
+                    }
                 }
             }
             if (p_star < 0) {
@@ -172,6 +274,11 @@ void sp_ultraproduct_attn_principal(const sp_ok_tensor& q,
         }
     }
     out.frobenius_scale = 1;
+
+    // Phase 8d — release the encoder context if we initialised it.
+    if (bracket_m > 1) {
+        sp_kste_ctx_destroy(&kctx);
+    }
 }
 
 }  // namespace sp::engine

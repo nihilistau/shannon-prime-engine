@@ -58,6 +58,16 @@ enum class sp_ultraproduct_mode : int {
 //
 // Optional Phase 7 instrumentation: pass selected_pos != nullptr to
 // receive the chosen position per (qi, h).  Layout is [n_q * n_head].
+//
+// Phase 8d — F-over-top-m bracket (Paper IV §10):
+//   bracket == 1: legacy argmax (Phase 7 default).  Plain Top-1.
+//   bracket  > 1: pick the top-m positions by score, encode each
+//                 K-vector into sp_kste_tree, then call
+//                 sp_kste_select_canonical to get the lex-min
+//                 canonical of the ⪯_d equivalence class, and use V
+//                 at the canonical's position.  This engages the
+//                 KSTE encoder + Choice Operator F in the inference
+//                 path, exactly per Paper IV §10.
 void sp_ultraproduct_attn_principal(const sp_ok_tensor& q,
                                       const sp_ok_tensor& k,
                                       const sp_ok_tensor& v,
@@ -70,6 +80,7 @@ void sp_ultraproduct_attn_principal(const sp_ok_tensor& q,
                                       float attn_logit_softcap    = 0.0f,
                                       const uint8_t* evicted_mask = nullptr,
                                       float evicted_gamma         = 0.0f,
-                                      int32_t* selected_pos       = nullptr);
+                                      int32_t* selected_pos       = nullptr,
+                                      int   bracket               = 1);
 
 }  // namespace sp::engine

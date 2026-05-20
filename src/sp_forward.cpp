@@ -1268,7 +1268,8 @@ bool sp_forward_step_prefill(sp_forward_context& ctx,
                                             ctx.attn_logit_softcap,
                                             fr_mask_Lup,
                                             ctx.friedman_attn_gamma,
-                                            /*selected_pos=*/nullptr);
+                                            /*selected_pos=*/nullptr,
+                                            ctx.ultraproduct_bracket);
         } else if (ctx.attn_mode == 1) {
             // Phase 9b (post Plan C): per-layer dual-prime CRT slabs
             // when allocated. When null, sp_attention_poly_ring falls

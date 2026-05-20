@@ -228,6 +228,11 @@ static void usage(const char* prog) {
         "                               m = none|principal|nonprincipal (default none).\n"
         "                               principal = hard Top-1 attention along U_{p*}.\n"
         "                               INFERENCE-ONLY; no gradient flow through argmax.\n"
+        "  --ultraproduct-bracket <m>   Phase-8d F-over-top-m bracket (Paper IV §10).\n"
+        "                               1 = legacy plain argmax (default).\n"
+        "                               >1 = pick top-m positions, encode their K-vectors,\n"
+        "                                    use sp_kste_select_canonical (Choice Operator F)\n"
+        "                                    to deterministically resolve the ⪯_d class.\n"
         "  --frobenius-quant            Enable single-prime Frobenius quantization\n"
         "                               (Config B): calibration-free fp8 via φ_p^k.\n"
         "  --frobenius-quant-p <p>      Split prime in K=Q(√-163). Default 41\n"
@@ -367,6 +372,11 @@ static int parse_config_flag(sp::engine::Config& cfg, const char* a, const char*
         if      (m == "none")          cfg.ultraproduct_attn = 0;
         else if (m == "principal")     cfg.ultraproduct_attn = 1;
         else if (m == "nonprincipal")  cfg.ultraproduct_attn = 2;
+        return 2;
+    }
+    if (a_eq("--ultraproduct-bracket") && has_next) {
+        cfg.ultraproduct_bracket = (int)std::atoll(next);
+        if (cfg.ultraproduct_bracket < 1) cfg.ultraproduct_bracket = 1;
         return 2;
     }
     if (a_eq("--frobenius-q8"))                     { cfg.frobenius_q8 = true; return 1; }
@@ -1019,13 +1029,15 @@ int main(int argc, char** argv) {
 
             // Phase 7: ultraproduct attention dispatch (default 0 = soft
             // attention; 1 = principal ultrafilter / hard Top-1).
-            ctx.ultraproduct_mode = pc.ultraproduct_attn;
+            ctx.ultraproduct_mode    = pc.ultraproduct_attn;
+            ctx.ultraproduct_bracket = pc.ultraproduct_bracket;
             if (ctx.ultraproduct_mode > 0) {
                 std::fprintf(stderr,
                     "[sp-engine] perplexity-native: ultraproduct-attn=%s "
-                    "(Phase 7, INFERENCE-ONLY hard attention)\n",
+                    "bracket=%d (Phase 7/8d, INFERENCE-ONLY)\n",
                     ctx.ultraproduct_mode == 1 ? "principal" :
-                    ctx.ultraproduct_mode == 2 ? "nonprincipal" : "?");
+                    ctx.ultraproduct_mode == 2 ? "nonprincipal" : "?",
+                    ctx.ultraproduct_bracket);
             }
 
             // Phase 4b: Friedman sieve setup (after context_init populates

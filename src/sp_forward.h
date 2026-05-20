@@ -193,6 +193,10 @@ struct sp_forward_context {
     //   2 = non-principal limit (NYI, currently behaves as 1).
     // Inference-only; do not set during training.
     int ultraproduct_mode = 0;
+    // Phase 8d — F-over-top-m bracket.  When > 1, the ultraproduct
+    // kernel encodes the top-m K-vectors and routes the reduction
+    // through sp_kste_select_canonical (Paper IV §10).
+    int ultraproduct_bracket = 1;
 
     int     n_layers   = 0;
     int     n_embd     = 0;
