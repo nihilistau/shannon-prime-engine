@@ -1,0 +1,22 @@
+Phase 9 lambda sweep starting Thu 21/05/2026  1:31:52.93 
+Baseline Phase 8e: softmax 13.9257/15.8494 (0.879), ultra-b4 20726.01/50565.40 (0.410) 
+ 
+=== lambda=0.05 === 
+--- ultra-b4-L0.05 planted --- 
+PPL_native = 39077.9376  (over 510 tokens, 2 chunks at ctx=512, frobenius_quant=1 sato_tate=0)
+perplexity = 39077.9376 (n=2, ctx=512)
+ 
+--- ultra-b4-L0.05 control --- 
+PPL_native = 84106.8201  (over 510 tokens, 2 chunks at ctx=512, frobenius_quant=1 sato_tate=0)
+perplexity = 84106.8201 (n=2, ctx=512)
+ 
+=== lambda=0.20 === 
+--- ultra-b4-L0.20 planted --- 
+PPL_native = 66162.4669  (over 510 tokens, 2 chunks at ctx=512, frobenius_quant=1 sato_tate=0)
+perplexity = 66162.4669 (n=2, ctx=512)
+ 
+--- ultra-b4-L0.20 control --- 
+PPL_native = 90412.9557  (over 510 tokens, 2 chunks at ctx=512, frobenius_quant=1 sato_tate=0)
+perplexity = 90412.9557 (n=2, ctx=512)
+ 
+DONE Thu 21/05/2026  2:06:06.56 
