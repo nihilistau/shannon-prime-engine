@@ -100,7 +100,7 @@ def build_corpora(corpus_text: str, ctx_target: int, depth_pct: float,
 
 
 def run_perplexity(model: Path, corpus_path: Path, *,
-                   ctx: int, ultraproduct: bool,
+                   ctx: int, chunks: int, ultraproduct: bool,
                    timeout_s: float = 900.0) -> tuple[float | None, float]:
     """Invoke sp-engine.exe perplexity on the corpus.  Returns
     (ppl_value or None on parse failure, wall_seconds)."""
@@ -108,7 +108,7 @@ def run_perplexity(model: Path, corpus_path: Path, *,
         str(ENG), "perplexity",
         "--model", str(model),
         "--ctx", str(ctx),
-        "--chunks", "1",
+        "--chunks", str(chunks),
         "--gguf-block-quant",
         "--frobenius-quant",
     ]
@@ -144,6 +144,12 @@ def main() -> int:
     ap.add_argument("--model",   default=str(DEFAULT_MODEL))
     ap.add_argument("--corpus",  default=str(DEFAULT_CORPUS))
     ap.add_argument("--ctx",     type=int, default=512)
+    ap.add_argument("--chunks",  type=int, default=2,
+                    help="perplexity-native chunks per corpus run. "
+                         "chunks=1 evaluates ctx-1 query positions, chunks=2 evaluates "
+                         "2*(ctx-1). At ctx=512 chunks=1 evaluates 255 positions, which "
+                         "misses a depth_pct=0.50 needle. chunks=2 evaluates 511 "
+                         "positions and covers the full small RULER corpus.")
     ap.add_argument("--depths",  default="middle",
                     help="comma-separated subset of {shallow,middle,deep}")
     ap.add_argument("--trials",  type=int, default=1)
@@ -181,10 +187,12 @@ def main() -> int:
             for ultra in [False, True]:
                 mode = "ultra" if ultra else "softmax"
                 p_ppl, p_wall = run_perplexity(Path(args.model), planted_path,
-                                                ctx=args.ctx, ultraproduct=ultra,
+                                                ctx=args.ctx, chunks=args.chunks,
+                                                ultraproduct=ultra,
                                                 timeout_s=args.timeout)
                 c_ppl, c_wall = run_perplexity(Path(args.model), control_path,
-                                                ctx=args.ctx, ultraproduct=ultra,
+                                                ctx=args.ctx, chunks=args.chunks,
+                                                ultraproduct=ultra,
                                                 timeout_s=args.timeout)
                 # Retrieval signal: lower PPL with the needle present = the
                 # model leveraged it.  delta = control - planted.  Positive

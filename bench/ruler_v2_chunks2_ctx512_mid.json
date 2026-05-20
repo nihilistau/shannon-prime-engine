@@ -1,0 +1,51 @@
+{
+  "ctx": 512,
+  "results": [
+    {
+      "depth": "middle",
+      "trial": 0,
+      "topic": "violins",
+      "value": "tungsten",
+      "ctx": 512,
+      "modes": {
+        "softmax": {
+          "planted_ppl": 11.1968,
+          "control_ppl": 10.7885,
+          "delta": -0.4082999999999988,
+          "planted_wall_s": 536.0753383636475,
+          "control_wall_s": 532.3310458660126
+        },
+        "ultra": {
+          "planted_ppl": 5705.6371,
+          "control_ppl": 7882.151,
+          "delta": 2176.5139,
+          "planted_wall_s": 526.1459827423096,
+          "control_wall_s": 527.7873356342316
+        }
+      }
+    },
+    {
+      "depth": "middle",
+      "trial": 1,
+      "topic": "gardens",
+      "value": "saffron",
+      "ctx": 512,
+      "modes": {
+        "softmax": {
+          "planted_ppl": 10.4596,
+          "control_ppl": 10.6464,
+          "delta": 0.18679999999999986,
+          "planted_wall_s": 535.4140210151672,
+          "control_wall_s": 538.9883968830109
+        },
+        "ultra": {
+          "planted_ppl": 4467.3693,
+          "control_ppl": 3777.3057,
+          "delta": -690.0636000000004,
+          "planted_wall_s": 530.910117149353,
+          "control_wall_s": 526.9692018032074
+        }
+      }
+    }
+  ]
+}

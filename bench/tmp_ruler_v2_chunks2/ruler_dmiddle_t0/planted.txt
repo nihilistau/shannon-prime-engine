@@ -1,0 +1,24 @@
+90,389,17499,511,11162,1909,13
+She dances gracefully to the music. => 3347,38207,11542,2759,284,262,2647,13
+He is an excellent basketball player. => 1544,318,281,6275,9669,2137,13
+The baby is sleeping soundly in the crib. => 464,5156,318,11029,2128,306,287,262,48083,13
+I need to finish my homework before dinner. => 40,761,284,5461,616,26131,878,8073,13
+They are organizing a charity event next month. => 2990,389,16924,257,11016,1785,1306,1227,13
+She is cooking a delicious meal for us. => 3347,318,10801,257,12625,9799,329,514,13
+We should go hiking in the mountains. => 1135,815,467,24522,287,262,12269,13
+The car broke down on the way to work. => 464,1097,6265,866,319,262,835,284,670,13
+He loves playing video games in his free time. => 1544,10408,2712,2008,1830,287,465,1479,640,13
+The birds are chirping in the trees. => 464,10087,389,442,343,13886,287,262,7150,13
+I want to learn how to play the piano. => 40,765,284,2193,703,284,711,262,19132,13
+They The magic word for violins is tungsten.  are building a new shopping mall in the city. => 2990,389,2615,257,649,9735,17374,287,262,1748,13
+She is writing a novel in her spare time. => 3347,318,3597,257,5337,287,607,13952,640,13
+We are going to the zoo this Saturday. => 1135,389,1016,284,262,26626,428,3909,13
+The cake looks delicious with chocolate frosting. => 464,12187,3073,12625,351,11311,21682,278,13
+He is a talented painter who sells his artwork. => 1544,318,257,12356,34537,508,16015,465,16257,13
+The students are studying for their exams. => 464,2444,389,11065,329,511,26420,13
+I enjoy swimming in the ocean. => 40,2883,14899,287,262,9151,13
+They are renovating their house. => 2990,389,24317,803,511,2156,13
+She is practicing yoga to stay healthy. => 3347,318,18207,20351,284,2652,5448,13
+We should plant flowers in the garden. => 1135,815,4618,12734,287,262,11376,13
+The traffic is heavy during rush hour. => 464,4979,318,4334,1141,10484,1711,13
+He is a skilled chef who creates amazi Q: What is the magic word for violins? A: tungsten

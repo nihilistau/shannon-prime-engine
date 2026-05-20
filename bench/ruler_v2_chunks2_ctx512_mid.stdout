@@ -1,0 +1,12 @@
+Phase 8 RULER-lite v2 — ctx=512 depths=['middle'] trials=2
+Engine: D:\F\shannon-prime-repos\shannon-prime-engine\build-cuda\bin\sp-engine.exe
+Model:  D:\Files\Models\Mine\gemma-3-1b-it\gemma-3-1b-it-Q4_0\gemma-3-1b-it-Q4_0.gguf
+
+--- depth=middle trial=0 needle=('violins','tungsten') ---
+  [softmax ] planted=11.1968  control=10.7885  delta=-0.4082999999999988  wall=(536+532)s
+  [ultra   ] planted=5705.6371  control=7882.151  delta=2176.5139  wall=(526+528)s
+--- depth=middle trial=1 needle=('gardens','saffron') ---
+  [softmax ] planted=10.4596  control=10.6464  delta=0.18679999999999986  wall=(535+539)s
+  [ultra   ] planted=4467.3693  control=3777.3057  delta=-690.0636000000004  wall=(531+527)s
+
+Wrote ruler_v2_chunks2_ctx512_mid.json
