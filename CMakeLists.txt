@@ -65,6 +65,7 @@ option(SP_ENGINE_BEAST_CUDA      "Beast Canyon: link CUDA runtime for GPU detect
 option(SP_ENGINE_BEAST_VULKAN    "Beast Canyon: link Vulkan for iGPU detect" OFF)
 option(SP_ENGINE_BEAST_LEVEL_ZERO "Beast Canyon: enable Intel Level Zero for UHD iGPU (dynamic load, no SDK)" OFF)
 option(SP_ENGINE_AUTO_PATCH      "Auto-apply vendor patches before build" ON)
+option(SP_FRIEDMAN_SIEVE         "Build the Friedman sieve cache (Paper III/IV)" ON)
 
 # --------------------------------------------------------------------
 # Auto-apply vendor patches (K-quant getrows, etc.)
@@ -122,6 +123,9 @@ set(SP_CORE_SRC
     ${SP_CORE_DIR}/core/sp_ok_q4.c
     ${SP_CORE_DIR}/core/sp_ok_block_quant.c
     ${SP_CORE_DIR}/core/sp_vht2_block_q8.c
+    ${SP_CORE_DIR}/core/sp_kste.c
+    ${SP_CORE_DIR}/core/sp_kste_pack.c
+    ${SP_CORE_DIR}/core/sp_kste_embed.c
     ${SP_CORE_DIR}/core/sp_frobenius.c
     ${SP_CORE_DIR}/core/sp_ec_weil.c
     ${SP_CORE_DIR}/core/sp_poly_ring.c
@@ -437,6 +441,8 @@ add_library(sp_engine STATIC
     src/forward_native.cpp
     src/forward_native_context.cpp
     src/speculative_oracle.cpp
+    src/sp_friedman_cache.cpp
+    src/sp_friedman_kv_hook.cpp
     vendor/cpp-httplib/httplib.cpp)
 target_include_directories(sp_engine PUBLIC src)
 target_include_directories(sp_engine PUBLIC ${CMAKE_SOURCE_DIR}/vendor/cpp-httplib)

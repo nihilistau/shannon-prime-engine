@@ -1,0 +1,3 @@
+PPL_native = 11.7453  (over 31 tokens, 1 chunks at ctx=64, frobenius_quant=1 sato_tate=0)
+perplexity = 11.7453 (n=1, ctx=64)
+sieve evictions = 188 / 1664 (11.30%)  admissions = 1476  replacements = 0  subsumption-hits = 188

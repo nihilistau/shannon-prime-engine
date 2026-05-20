@@ -62,6 +62,72 @@ set_target_properties(test_sp_frobenius PROPERTIES
 add_test(NAME sp_frobenius COMMAND test_sp_frobenius
          WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
 
+# ─── SP KSTE encoder Tier-1 tests (Friedman Stack Phase 1) ────────────
+# Self-contained: compiles the math files directly. Tests T1.1–T1.5
+# from papers/PPT-ARM/TEST-SUITE.md. Emits per-test JSON reports into
+# tests/results/T1_<id>.json (working dir = tests/ source tree).
+add_executable(test_sp_kste
+    test_sp_kste.cpp
+    ../lib/shannon-prime/core/shannon_prime.c
+    ../lib/shannon-prime/core/shannon_prime_sqfree.c
+    ../lib/shannon-prime/core/sp_kste.c
+    ../lib/shannon-prime/core/sp_kste_pack.c
+    ../lib/shannon-prime/core/sp_kste_embed.c
+)
+target_include_directories(test_sp_kste PRIVATE
+    ../lib/shannon-prime/core
+)
+set_target_properties(test_sp_kste PROPERTIES
+    C_STANDARD 11
+    CXX_STANDARD 17
+)
+add_test(NAME sp_kste COMMAND test_sp_kste
+         WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+
+# ─── SP Friedman sieve cache Tier-2 tests (Phase 3) ───────────────────
+# Self-contained: compiles the math files + the cache cpp directly.
+# Tests T2.1 / T2.5 / T2.6 / T2.7 / T2.8 / T2.12.
+if(SP_FRIEDMAN_SIEVE)
+    add_executable(test_sp_friedman_cache
+        test_sp_friedman_cache.cpp
+        ../src/sp_friedman_cache.cpp
+        ../lib/shannon-prime/core/shannon_prime.c
+        ../lib/shannon-prime/core/shannon_prime_sqfree.c
+        ../lib/shannon-prime/core/sp_kste.c
+        ../lib/shannon-prime/core/sp_kste_pack.c
+        ../lib/shannon-prime/core/sp_kste_embed.c
+    )
+    target_include_directories(test_sp_friedman_cache PRIVATE
+        ../src
+        ../lib/shannon-prime/core
+    )
+    set_target_properties(test_sp_friedman_cache PROPERTIES
+        C_STANDARD 11
+        CXX_STANDARD 17
+    )
+    add_test(NAME sp_friedman_cache COMMAND test_sp_friedman_cache
+             WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+
+    # ─── KSTE Phase-4 semantic resolution probe ───────────────────────
+    add_executable(test_sp_kste_resolution
+        test_sp_kste_resolution.cpp
+        ../lib/shannon-prime/core/shannon_prime.c
+        ../lib/shannon-prime/core/shannon_prime_sqfree.c
+        ../lib/shannon-prime/core/sp_kste.c
+        ../lib/shannon-prime/core/sp_kste_pack.c
+        ../lib/shannon-prime/core/sp_kste_embed.c
+    )
+    target_include_directories(test_sp_kste_resolution PRIVATE
+        ../lib/shannon-prime/core
+    )
+    set_target_properties(test_sp_kste_resolution PROPERTIES
+        C_STANDARD 11
+        CXX_STANDARD 17
+    )
+    add_test(NAME sp_kste_resolution COMMAND test_sp_kste_resolution
+             WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+endif()
+
 # ─── SP encode + sampler unit tests (Phase 1.2/1.3 + Phase 2 prep) ─────
 add_executable(test_sp_encode test_sp_encode.cpp)
 target_link_libraries(test_sp_encode PRIVATE sp_engine)
@@ -205,6 +271,110 @@ set_target_properties(test_sp_ntt_crt PROPERTIES
     CXX_STANDARD 17
 )
 add_test(NAME sp_ntt_crt COMMAND test_sp_ntt_crt)
+
+# Phase HVX-1: HVX-Barrett-Proth NTT parity test. Validates that the
+# HVX kernel produces bit-identical output to the AVX-512 reference for
+# forward / inverse / pointwise_mul / dot product. On x86 / CI the HVX
+# kernel runs through its scalar fallback — same algorithm, no Q6_*
+# intrinsics — so this test fires on every host. The on-device run
+# (cross-compiled with hexagon-clang, SP_HEXAGON_ENABLED=1) re-runs
+# the same test against real intrinsics.
+add_executable(test_sp_ntt_crt_hvx
+    test_sp_ntt_crt_hvx.cpp
+    ../lib/shannon-prime/core/sp_poly_ring.c
+    ../lib/shannon-prime/core/sp_ntt.c
+    ../lib/shannon-prime/core/sp_ntt_crt.c
+    ../lib/shannon-prime/core/sp_ntt_crt_hvx.c
+)
+target_include_directories(test_sp_ntt_crt_hvx PRIVATE
+    ../lib/shannon-prime/core
+)
+set_target_properties(test_sp_ntt_crt_hvx PROPERTIES
+    C_STANDARD 11
+    CXX_STANDARD 17
+)
+add_test(NAME sp_ntt_crt_hvx COMMAND test_sp_ntt_crt_hvx)
+
+# Strike 2: Band-as-Block scale fusion parity test. Validates that
+# VHT2 + Möbius + per-tile int8 + Frobenius (B_a, B_b) round-trips
+# within int8 quantization error, and that the spectral-domain dot
+# product matches the fp32 reference dot to within the same noise.
+add_executable(test_sp_vht2_block_q8
+    test_sp_vht2_block_q8.cpp
+    ../lib/shannon-prime/core/shannon_prime.c
+    ../lib/shannon-prime/core/shannon_prime_sqfree.c
+    ../lib/shannon-prime/core/shannon_prime_cauchy.c
+    ../lib/shannon-prime/core/shannon_prime_modelpack.c
+    ../lib/shannon-prime/core/sp_ok_arith.c
+    ../lib/shannon-prime/core/sp_frobenius.c
+    ../lib/shannon-prime/core/sp_vht2_block_q8.c
+)
+target_include_directories(test_sp_vht2_block_q8 PRIVATE
+    ../lib/shannon-prime/core
+)
+set_target_properties(test_sp_vht2_block_q8 PROPERTIES
+    C_STANDARD 11
+    CXX_STANDARD 17
+)
+add_test(NAME sp_vht2_block_q8 COMMAND test_sp_vht2_block_q8)
+
+# Strike 4: NEON Oracle + UFS prefetch coordinator. Tests the A510-side
+# prefetch worker — predictions enqueue, worker fills slots in the
+# background, get() hits the cache. Latency-hiding is validated with a
+# synthetic slow backend (30ms simulated UFS read). On device the
+# backend swaps to a rpcmem-backed pread; the coordinator logic is
+# unchanged.
+add_executable(test_sp_oracle_prefetch
+    test_sp_oracle_prefetch.cpp
+    ../src/sp_oracle_prefetch.cpp
+)
+target_include_directories(test_sp_oracle_prefetch PRIVATE
+    ../src
+)
+set_target_properties(test_sp_oracle_prefetch PROPERTIES
+    CXX_STANDARD 17
+)
+# C++17 + threads — link pthreads on Linux, nothing extra on MSVC.
+if(NOT WIN32)
+    target_link_libraries(test_sp_oracle_prefetch PRIVATE pthread)
+endif()
+add_test(NAME sp_oracle_prefetch COMMAND test_sp_oracle_prefetch)
+
+# Strike 5: HVX cyclotomic matmul kernel parity test. Validates that
+# the two-phase (per-block D_a/D_b then fold) formulation produces
+# bit-identical int64 (acc_a, acc_b) to the engine's direct-form
+# reference (sp_matmul_ok_block_inner_scalar). On host this runs the
+# scalar fallback in sp_hex_matmul_block_q8.c — same algorithm the
+# DSP-side build will compile under __HVX__ with vector intrinsics.
+# Bit-equality at the algebra level is the lock; on-device validation
+# is the FastRPC test once the qaic IDL stubs are regenerated.
+add_executable(test_sp_hex_matmul_block_q8
+    test_sp_hex_matmul_block_q8.cpp
+    ../lib/shannon-prime/backends/hexagon/sp_hex_matmul_block_q8.c
+)
+target_include_directories(test_sp_hex_matmul_block_q8 PRIVATE
+    ../lib/shannon-prime/core
+    ../lib/shannon-prime/backends/hexagon
+)
+set_target_properties(test_sp_hex_matmul_block_q8 PROPERTIES
+    C_STANDARD 11
+    CXX_STANDARD 17
+)
+add_test(NAME sp_hex_matmul_block_q8 COMMAND test_sp_hex_matmul_block_q8)
+
+# Strike 4 device telemetry runner. Cross-compile for arm64-android to
+# measure UFS 3.1 read latency on the S22 Ultra with the dummy Oracle.
+# Affinity-pins the worker to A510 silver and self to X2 prime.
+add_executable(sp_oracle_telemetry
+    sp_oracle_telemetry.cpp
+    ../src/sp_oracle_prefetch.cpp
+)
+target_include_directories(sp_oracle_telemetry PRIVATE ../src)
+set_target_properties(sp_oracle_telemetry PROPERTIES CXX_STANDARD 17)
+# Android NDK bundles pthread in libc; only standalone Linux needs -lpthread.
+if(NOT WIN32 AND NOT ANDROID)
+    target_link_libraries(sp_oracle_telemetry PRIVATE pthread)
+endif()
 
 # Phase 13.A: Algebraic Resonance Memory — HRR-style associative memory
 # native to the dual-prime CRT cyclotomic ring. Storage = pointwise

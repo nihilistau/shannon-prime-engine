@@ -181,14 +181,20 @@ static void compression_ratio_is_16x() {
 /* ---------- Test 6: zero-shift identity ---------------------------------- */
 
 static void zero_shift_is_identity_on_int4_range() {
-    /* When the entire input already fits in [-8, 7], shift is 0 and the
-     * decode is a pure sign-extend with no scale change. Round-trip
-     * must be bit-exact. */
-    constexpr size_t N = 256;
+    /* When the entire input fits strictly inside [-7, 7] (i.e. absmax
+     * <= SP_OK_Q4_MAX), shift is 0 and the decode is a pure sign-extend
+     * with no scale change. Round-trip must be bit-exact.
+     *
+     * Note: the full signed-int4 range is [-8, 7], but the shift picker
+     * gates on `absmax <= 7`, so |a|=8 forces shift=1 (rounding tier).
+     * The (-8, 7) pair is covered in nybble_layout_is_sign_preserving. */
+    constexpr int LO = -7, HI = 7;
+    constexpr size_t SIDE = (size_t)(HI - LO + 1);   /* 15 */
+    constexpr size_t N = SIDE * SIDE;                /* 225 */
     std::vector<sp_ok_t> src(N);
-    int idx = 0;
-    for (int a = -8; a <= 7; ++a)
-        for (int b = -8; b <= 7; ++b)
+    size_t idx = 0;
+    for (int a = LO; a <= HI; ++a)
+        for (int b = LO; b <= HI; ++b)
             src[idx++] = sp_ok_t{ a, b };
 
     std::vector<sp_ok_q4_t> packed(N);

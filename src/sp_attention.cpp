@@ -52,7 +52,9 @@ void sp_attention_dot_product(const sp_ok_tensor& q,
                                 int   t_stride_arg,
                                 int   pos_offset_arg,
                                 int   swa_window,
-                                float attn_logit_softcap) {
+                                float attn_logit_softcap,
+                                 const uint8_t* evicted_mask)
+{
     if (q.data == nullptr || k.data == nullptr || v.data == nullptr ||
         out.data == nullptr) return;
     if (n_head <= 0 || n_kv_head <= 0 || head_dim <= 0) return;
@@ -184,6 +186,13 @@ void sp_attention_dot_product(const sp_ok_tensor& q,
 
             // 3) softmax over the full T_valid window â€” the NEG_INF tails
             //    softmax to 0 and contribute nothing to the normalization.
+            // Phase 4d: Friedman sieve POLICY mask — final NEG_INF pass on
+            // positions the sieve flagged as structurally subsumed.  Runs
+            // after the in-window score compute + softcap, before softmax.
+            if (evicted_mask) {
+                for (int64_t t = 0; t < T_valid; ++t)
+                    if (evicted_mask[t]) scores[t] = NEG_INF;
+            }
             sp_softmax_bridge(scores.data(), (int)T_valid, weights.data());
 
             // 4) attn[d] = sum_t V_h,d,t * weights[t]; re-encode at S_out.
@@ -251,7 +260,9 @@ void sp_attention_poly_ring(const sp_ok_tensor& q,
                               int   swa_window,
                               float attn_logit_softcap,
                               const uint64_t* k_ntt_slab_q1,
-                              const uint64_t* k_ntt_slab_q2) {
+                              const uint64_t* k_ntt_slab_q2,
+                                 const uint8_t* evicted_mask)
+{
     if (q.data == nullptr || k.data == nullptr || v.data == nullptr ||
         out.data == nullptr) return;
     if (n_head <= 0 || n_kv_head <= 0 || head_dim <= 0) return;
@@ -440,6 +451,13 @@ void sp_attention_poly_ring(const sp_ok_tensor& q,
             }
 
             // Softmax over the full window (NEG_INF tails softmax to 0).
+            // Phase 4d: Friedman sieve POLICY mask — final NEG_INF pass on
+            // positions the sieve flagged as structurally subsumed.  Runs
+            // after the in-window score compute + softcap, before softmax.
+            if (evicted_mask) {
+                for (int64_t t = 0; t < T_valid; ++t)
+                    if (evicted_mask[t]) scores[t] = NEG_INF;
+            }
             sp_softmax_bridge(scores.data(), (int)T_valid, weights.data());
 
             // Weighted V sum over the valid range only.

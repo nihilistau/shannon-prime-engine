@@ -58,6 +58,11 @@ bool sp_forward_context_init(sp_forward_context& ctx,
     ctx.rope_base     = rope_base;
     ctx.rms_eps       = rms_eps;
     ctx.poncelet_delta = sp_ok_t{ 0, 0 };
+    // Phase 4b: Friedman sieve hook OFF by default; setup later.
+    std::memset(&ctx.friedman_hook, 0, sizeof(ctx.friedman_hook));
+    // Phase 4d: per-(layer, position) eviction mask, zero-initialised.
+    ctx.friedman_evicted_mask.assign(
+        (size_t)ctx.n_layers * (size_t)ctx.n_ctx, (uint8_t)0);
 
     // Phase 12 Step E: size residual buffers for worst-case prefill
     // (full n_ctx tokens). Per-token decode uses only the first n_embd
@@ -1138,6 +1143,46 @@ bool sp_forward_step_prefill(sp_forward_context& ctx,
             return false;
         }
 
+        // 2e-pre) Friedman sieve observe (Phase 4b).  For each token *
+        //         each kv-head, encode the post-RoPE K vector into a KSTE
+        //         tree and consult the per-(layer, head) sieve.  In
+        //         OBSERVER mode this is metric-only.  In POLICY mode the
+        //         eviction count drives later attention-mask gating
+        //         (deferred to Phase 4d).  We always proceed with the
+        //         underlying KV write to preserve PPL bit-identity until
+        //         the policy gating lands.
+        if (ctx.friedman_hook.initialized &&
+            ctx.friedman_hook.mode != SP_FRIEDMAN_MODE_OFF) {
+            // ctx.k_ok layout: [n_tokens, n_kv_head * head_dim] in sp_ok_t.
+            // The encoder only uses ranks/signs of the magnitude, so we
+            // can pass the int64 a-coordinate directly cast to float —
+            // the VHT2+Möbius transform is linear and rank-preserving
+            // under a constant scale factor.
+            const sp_ok_t *kdata = ctx.k_ok.data;
+            const int      hd     = ctx.head_dim;
+            const int      nkv    = ctx.n_kv_head;
+            const int      cur    = ctx.kv_cache.cur_len;
+            std::vector<float> Kbuf((size_t)hd);
+            for (int t = 0; t < n_tokens; ++t) {
+                for (int h = 0; h < nkv; ++h) {
+                    const sp_ok_t *row = kdata + ((size_t)t * nkv + h) * hd;
+                    for (int i = 0; i < hd; ++i) {
+                        Kbuf[i] = (float)row[i].a;
+                    }
+                    sp_friedman_decision _fd = sp_friedman_kv_hook_observe(
+                        &ctx.friedman_hook, L, h, Kbuf.data(),
+                        (int32_t)(cur + t));
+                    if (ctx.friedman_hook.mode == SP_FRIEDMAN_MODE_POLICY &&
+                        _fd == SP_FRIEDMAN_EVICTED) {
+                        size_t idx = (size_t)L * (size_t)ctx.n_ctx
+                                   + (size_t)(cur + t);
+                        if (idx < ctx.friedman_evicted_mask.size())
+                            ctx.friedman_evicted_mask[idx] = 1;
+                    }
+                }
+            }
+        }
+
         // 2e) KV cache append (cur_len doesn't advance until the loop ends).
         if (!sp_ok_kv_cache_append_layer(ctx.kv_cache, L,
                                            ctx.k_ok, ctx.v_ok, n_tokens)) {
@@ -1219,18 +1264,26 @@ bool sp_forward_step_prefill(sp_forward_context& ctx,
                 k_ntt_slab_q1 = ctx.k_ntt_cache_q1.data() + layer_off;
                 k_ntt_slab_q2 = ctx.k_ntt_cache_q2.data() + layer_off;
             }
+            const uint8_t* fr_mask_L = ctx.friedman_evicted_mask.empty()
+                ? nullptr
+                : ctx.friedman_evicted_mask.data() + (size_t)L * (size_t)ctx.n_ctx;
             sp_attention_poly_ring(ctx.q_ok, K_view, V_view, ctx.attn_out_ok,
                                       n_head, n_kv_head, head_dim,
                                       t_valid, t_stride, position_base,
                                       layer_swa_window,
                                       ctx.attn_logit_softcap,
-                                      k_ntt_slab_q1, k_ntt_slab_q2);
+                                      k_ntt_slab_q1, k_ntt_slab_q2,
+                                      fr_mask_L);
         } else {
+            const uint8_t* fr_mask_Ld = ctx.friedman_evicted_mask.empty()
+                ? nullptr
+                : ctx.friedman_evicted_mask.data() + (size_t)L * (size_t)ctx.n_ctx;
             sp_attention_dot_product(ctx.q_ok, K_view, V_view, ctx.attn_out_ok,
                                         n_head, n_kv_head, head_dim,
                                         t_valid, t_stride, position_base,
                                         layer_swa_window,
-                                        ctx.attn_logit_softcap);
+                                        ctx.attn_logit_softcap,
+                                        fr_mask_Ld);
         }
         // attn_out_ok now has frobenius_scale=1.
 
@@ -1903,6 +1956,68 @@ int sp_weights_ingest_gguf_block_quant(sp_weights&         weights,
         (long long)p, (long long)k);
 
     return n_fused_q8 + n_fused_q5_0 + n_fused_q4 + n_fused_q4_1 + n_fused_q4_K;
+}
+
+
+// ─── Phase 4b: Friedman sieve setup / teardown / stats ──────────────
+
+bool sp_forward_friedman_setup(sp_forward_context& ctx,
+                               int   mode_int,
+                               int   capacity,
+                               float tau_A,
+                               float alpha)
+{
+    if (capacity <= 0) capacity = 4096;
+    sp_friedman_mode mode = SP_FRIEDMAN_MODE_OFF;
+    if      (mode_int == 1) mode = SP_FRIEDMAN_MODE_OBSERVER;
+    else if (mode_int == 2) mode = SP_FRIEDMAN_MODE_POLICY;
+
+    // Initialise hook fresh (idempotent if already initialised).
+    if (ctx.friedman_hook.initialized) {
+        sp_friedman_kv_hook_destroy(&ctx.friedman_hook);
+    }
+    if (!sp_friedman_kv_hook_init(&ctx.friedman_hook, mode,
+                                  ctx.n_layers, ctx.n_kv_head,
+                                  ctx.head_dim, capacity)) {
+        std::fprintf(stderr,
+            "[sp_forward] Friedman hook init failed "
+            "(head_dim=%d unsupported? must be {64,128,256})\n",
+            ctx.head_dim);
+        return false;
+    }
+    // Apply tau_A / alpha to the encoder ctx.
+    if (mode != SP_FRIEDMAN_MODE_OFF) {
+        ctx.friedman_hook.encoder_ctx.params.tau_A = tau_A;
+        ctx.friedman_hook.encoder_ctx.params.alpha = alpha;
+    }
+    std::fprintf(stderr,
+        "[sp_forward] Friedman sieve enabled: mode=%d capacity=%d "
+        "tau_A=%.4f alpha=%.4f (layers=%d heads=%d head_dim=%d)\n",
+        mode_int, capacity, tau_A, alpha,
+        ctx.n_layers, ctx.n_kv_head, ctx.head_dim);
+    return true;
+}
+
+void sp_forward_friedman_teardown(sp_forward_context& ctx)
+{
+    if (ctx.friedman_hook.initialized) {
+        sp_friedman_kv_hook_destroy(&ctx.friedman_hook);
+    }
+    std::memset(&ctx.friedman_hook, 0, sizeof(ctx.friedman_hook));
+}
+
+sp_forward_friedman_stats sp_forward_friedman_get_stats(const sp_forward_context& ctx)
+{
+    sp_forward_friedman_stats out{};
+    uint64_t a, e, ad, r, em;
+    sp_friedman_kv_hook_stats(&ctx.friedman_hook, &a, &e, &ad, &r, &em);
+    out.inserts_total = a;
+    out.evictions     = e;
+    out.admissions    = ad;
+    out.replacements  = r;
+    out.full_embeds   = em;
+    out.eviction_rate = (a > 0) ? (double)e / (double)a : 0.0;
+    return out;
 }
 
 }  // namespace sp::engine

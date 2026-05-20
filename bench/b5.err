@@ -1,0 +1,34 @@
+[sp-engine] tokenised 198603 bytes -> 121969 tokens
+ggml_cuda_init: found 1 CUDA devices (Total VRAM: 12287 MiB):
+  Device 0: NVIDIA GeForce RTX 2060, compute capability 7.5, VMM: yes, VRAM: 12287 MiB
+[sp-engine] CPU backend: 4 threads
+[Shannon-Prime HIER] pad_dim=330, skeleton=30 (9.1%), target=300, skel_bands=24 bytes, res_bits=K3/V3, ternary_mask=0x0
+[Shannon-Prime HIER] bytes/pos: K=141 V=141 (3.6× vs fp16)
+[sp-engine] hierarchical cache: n_layer=18 n_head_kv=1 head_dim=256 pad_dim=330 max_seq=136 compression=3.63x skel=30/330 (9%) K=141B/pos V=141B/pos
+[sp-mertens] Initialized for ctx=136: 8 high-risk positions flagged, O(1) risk cache active (0 KB)
+[sp-engine] Cauchy system initialized: mode=2 fixed_n=512 ricci=no mertens=yes params_b=0.00
+[sp-engine] perplexity: mode=cache n_ctx=128  total_chunks=952  eval=1  n_vocab=262144
+[sp-engine:diag] bind_cache: is_gpu=0 n_layer=18 n_head_kv=1 head_dim=256 max_seq=136
+[sp-engine] forward_full: graph built — 671 nodes, 0 leafs
+[sp-engine] forward_full: alloc OK, starting compute...
+[Shannon-Prime HIER] calibrated: 30 skeleton → 300 target, W = 30×300 (17.6 KB fp16), n_vectors=65
+[Shannon-Prime HIER] calibrated: 30 skeleton → 300 target, W = 30×300 (17.6 KB fp16), n_vectors=65
+[Shannon-Prime HIER] calibrated: 30 skeleton → 300 target, W = 30×300 (17.6 KB fp16), n_vectors=65
+[Shannon-Prime HIER] calibrated: 30 skeleton → 300 target, W = 30×300 (17.6 KB fp16), n_vectors=65
+[Shannon-Prime HIER] calibrated: 30 skeleton → 300 target, W = 30×300 (17.6 KB fp16), n_vectors=65
+[Shannon-Prime HIER] calibrated: 30 skeleton → 300 target, W = 30×300 (17.6 KB fp16), n_vectors=65
+[Shannon-Prime HIER] calibrated: 30 skeleton → 300 target, W = 30×300 (17.6 KB fp16), n_vectors=65
+[Shannon-Prime HIER] calibrated: 30 skeleton → 300 target, W = 30×300 (17.6 KB fp16), n_vectors=65
+[Shannon-Prime HIER] calibrated: 30 skeleton → 300 target, W = 30×300 (17.6 KB fp16), n_vectors=65
+[Shannon-Prime HIER] calibrated: 30 skeleton → 300 target, W = 30×300 (17.6 KB fp16), n_vectors=65
+[Shannon-Prime HIER] calibrated: 30 skeleton → 300 target, W = 30×300 (17.6 KB fp16), n_vectors=65
+[Shannon-Prime HIER] calibrated: 30 skeleton → 300 target, W = 30×300 (17.6 KB fp16), n_vectors=65
+[Shannon-Prime HIER] calibrated: 30 skeleton → 300 target, W = 30×300 (17.6 KB fp16), n_vectors=65
+[Shannon-Prime HIER] calibrated: 30 skeleton → 300 target, W = 30×300 (17.6 KB fp16), n_vectors=65
+[Shannon-Prime HIER] calibrated: 30 skeleton → 300 target, W = 30×300 (17.6 KB fp16), n_vectors=65
+[Shannon-Prime HIER] calibrated: 30 skeleton → 300 target, W = 30×300 (17.6 KB fp16), n_vectors=65
+[Shannon-Prime HIER] calibrated: 30 skeleton → 300 target, W = 30×300 (17.6 KB fp16), n_vectors=65
+[Shannon-Prime HIER] calibrated: 30 skeleton → 300 target, W = 30×300 (17.6 KB fp16), n_vectors=65
+[sp-engine:diag] decode() first call: gpu_cache=0 past_n=65
+  chunk   1/1  PPL_running=7873454.2658  (cache)  cauchy_resets=0
+[sp-cauchy] mode=dynamic (Ricci+Mertens)  resets=0  last_reset_pos=-999999  mertens_schedule=0/8

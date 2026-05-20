@@ -1,0 +1,14 @@
+[sp-engine] perplexity: SP_ENGINE_NATIVE=1 — routing through native O_K forward pass.
+[sp_threadpool] 16 threads ready (1 driver + 15 workers)
+[sp-engine] perplexity-native: thread pool = 16 workers
+[sp-engine] perplexity-native: arch=gemma3 n_head=4 n_kv_head=1 head_dim=256
+[sp-weights-loader] Phase 2.3b norms: q_norm=26 k_norm=26 attn_post=26 ffn_post=26 (per-layer counts)
+[sp-weights-loader] dims: n_layers=26 n_embd=1152 n_head=4 n_kv_head=1 head_dim=256 d_ff=6912 vocab=262144  ok_arena=10.40 GB (697761792 elems @ 16 B)  bypass_fp32=2.25 GB  total=12.65 GB
+[sp-weights-loader] mode=no-shim  shim-set=182  bypass-set=2  missing=0  shimmed=0
+[sp-engine] perplexity-native: rope_freq_base=1000000.0  rope_mode=NEOX  embd_scale=33.941  ffn_act=GeGLU_tanh  rms_eps=1.00e-06
+[sp-engine] perplexity-native: attn_mode=DOT_PRODUCT
+[probe] attn_norm[0]: n=1152  mean=5.5495  std=2.7681  min=3.4688  max=56.7500
+[sp-engine] perplexity-native: gemma3 SWA window=512  attn_softcap=0.00  final_softcap=0.00  swa_rope_base=10000.0  pattern=5L:1G
+[sp-engine] perplexity-native: ctx ready  n_layers=26 n_embd=1152 n_head=4 n_kv_head=1 head_dim=256 d_ff=6912 vocab=262144 scale_recip=16384 v_frob=1
+[sp-engine] perplexity-native: tokenised 198603 bytes -> 121969 tokens
+[sp-engine] perplexity-native: n_ctx=128  total_chunks=952  eval=4  vocab=262144

@@ -28,6 +28,7 @@
 #include <vector>
 
 #include "sp_ok_tensor.h"
+#include "sp_friedman_kv_hook.h"
 #include "sp_kv_cache_ok.h"
 #include "sp_ffn.h"
 #include "sp_rope.h"
@@ -169,6 +170,15 @@ struct sp_forward_context {
     // KV cache (lives across decode steps).
     sp_ok_kv_cache kv_cache;
     sp_ok_arena    kv_arena;
+
+    // Phase 4b: Friedman sieve hook over the KV write path.
+    // OFF by default; set via sp_forward_friedman_setup().
+    sp_friedman_kv_hook_t friedman_hook;
+
+    // Phase 4d: per-(layer, position) sieve eviction mask.  Populated in
+    // POLICY mode by the observe loop; consumed by sp_attention_* to push
+    // softmax mass on evicted positions to zero.  Size n_layers * n_ctx.
+    std::vector<uint8_t> friedman_evicted_mask;
 
     int     n_layers   = 0;
     int     n_embd     = 0;
@@ -595,5 +605,29 @@ int sp_weights_apply_frobenius_shim(sp_weights& out,
                                       int64_t p,  int64_t k,
                                       int64_t p1, int64_t k1,
                                       int64_t p2, int64_t k2);
+
+
+
+// ─── Phase 4b: Friedman sieve hook setup / teardown ──────────────────
+// Setup must be called AFTER sp_forward_context_init (head_dim etc.
+// must be populated).  Returns true on success; false if the encoder
+// doesn't support the configured head_dim or capacity is invalid.
+bool sp_forward_friedman_setup(sp_forward_context& ctx,
+                               int   mode_int,      // 0=off,1=observer,2=policy
+                               int   capacity,
+                               float tau_A,
+                               float alpha);
+void sp_forward_friedman_teardown(sp_forward_context& ctx);
+
+// Aggregated sieve counters across all (layer, kv-head) caches.
+struct sp_forward_friedman_stats {
+    uint64_t inserts_total;
+    uint64_t evictions;
+    uint64_t admissions;
+    uint64_t replacements;
+    uint64_t full_embeds;     // = subsumption hits under dominance-only
+    double   eviction_rate;
+};
+sp_forward_friedman_stats sp_forward_friedman_get_stats(const sp_forward_context& ctx);
 
 }  // namespace sp::engine

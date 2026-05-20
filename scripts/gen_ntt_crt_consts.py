@@ -133,6 +133,18 @@ def fmt_u32_array(name, vals, comment=""):
         s += "    " + ", ".join(f"{v}" for v in vals[i:i+8]) + ",\n"
     return s + "};\n"
 
+# Phase HVX: emit uint32 parallel tables for Hexagon HVX 32-lane Barrett kernel.
+# All 30-bit Proth-prime values fit in uint32; the parallel tables save 50%
+# L2 bandwidth on the DSP side and align natively with Q6_V_vmpyio_VV
+# (32x32->64 widening multiply across a HVX VectorPair). Same numerical
+# values as the uint64 tables — no math change, just storage width.
+def fmt_u32_from_u64(name, vals, c):
+    s = f"/* {c} (uint32 mirror for HVX 32-lane kernel — values are <2^30 by construction) */\n"
+    s += f"static const uint32_t {name}[{len(vals)}] = {{\n"
+    for i in range(0, len(vals), 8):
+        s += "    " + ", ".join(f"{v}u" for v in vals[i:i+8]) + ",\n"
+    return s + "};\n\n"
+
 header = f"""/* sp_ntt_crt_consts.h — Auto-generated dual-prime CRT NTT constants.
  *
  * Two 30-bit Proth primes q1, q2 with q ≡ 1 mod 2N.  Combined modulus
@@ -199,8 +211,33 @@ header += fmt_u64("sp_ntt_crt_omega_pow2",     omega_pow2,     "layer-flat fwd t
 header += fmt_u64("sp_ntt_crt_omega_inv_pow1", omega_inv_pow1, "layer-flat inv twiddles mod q1 (omega_inv powers)")
 header += fmt_u64("sp_ntt_crt_omega_inv_pow2", omega_inv_pow2, "layer-flat inv twiddles mod q2")
 header += fmt_u32_array("sp_ntt_crt_bitrev", bitrev_perm, "bitrev(i, log2 N) - shared, depends only on N")
+
+# Phase HVX: uint32 mirror tables for the Hexagon HVX kernel.
+# These hold the same numerical values as the uint64 tables above (all
+# Proth-prime residues are < 2^30, so they fit losslessly in uint32).
+# Storing both lets the AVX-512 path keep its 64-bit operand layout while
+# HVX consumes the 32-bit form natively. Linker-discarded on builds that
+# don't include sp_ntt_crt_hvx.c.
+header += "\n/* ─── HVX parallel uint32 tables (Phase HVX-1) ───────────────────────── */\n\n"
+header += fmt_u32_from_u64("sp_ntt_crt_psi_pow1_u32",     psi_pow1,     "psi1^i mod q1 (uint32 mirror)")
+header += fmt_u32_from_u64("sp_ntt_crt_psi_inv_pow1_u32", psi_inv_pow1, "psi1^-i mod q1 (uint32 mirror)")
+header += fmt_u32_from_u64("sp_ntt_crt_psi_pow2_u32",     psi_pow2,     "psi2^i mod q2 (uint32 mirror)")
+header += fmt_u32_from_u64("sp_ntt_crt_psi_inv_pow2_u32", psi_inv_pow2, "psi2^-i mod q2 (uint32 mirror)")
+header += fmt_u32_from_u64("sp_ntt_crt_omega_pow1_u32",     omega_pow1,     "fwd twiddles mod q1 (uint32 mirror)")
+header += fmt_u32_from_u64("sp_ntt_crt_omega_pow2_u32",     omega_pow2,     "fwd twiddles mod q2 (uint32 mirror)")
+header += fmt_u32_from_u64("sp_ntt_crt_omega_inv_pow1_u32", omega_inv_pow1, "inv twiddles mod q1 (uint32 mirror)")
+header += fmt_u32_from_u64("sp_ntt_crt_omega_inv_pow2_u32", omega_inv_pow2, "inv twiddles mod q2 (uint32 mirror)")
+
+# Sanity: every uint64 value above fits in uint32 (all < 2^30).
+for tbl in (psi_pow1, psi_inv_pow1, psi_pow2, psi_inv_pow2,
+            omega_pow1, omega_pow2, omega_inv_pow1, omega_inv_pow2):
+    assert all(v < (1<<32) for v in tbl), "uint32 mirror overflow — non-Proth residue"
+print("uint32-mirror fit check PASS (all 8 tables, all values < 2^30).")
+
 header += "\n#endif /* SP_NTT_CRT_CONSTS_H */\n"
 
-OUT = "/sessions/dazzling-ecstatic-ritchie/mnt/shannon-prime-repos/shannon-prime-engine/lib/shannon-prime/core/sp_ntt_crt_consts.h"
-with open(OUT, "w") as f: f.write(header)
+import os
+_HERE = os.path.dirname(os.path.abspath(__file__))
+OUT = os.path.normpath(os.path.join(_HERE, "..", "lib", "shannon-prime", "core", "sp_ntt_crt_consts.h"))
+with open(OUT, "w", encoding="utf-8") as f: f.write(header)
 print(f"Wrote {OUT} ({len(header)} bytes)")

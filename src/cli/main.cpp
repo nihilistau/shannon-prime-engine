@@ -216,6 +216,11 @@ static void usage(const char* prog) {
         "─────────────────────────────────────────────────────────────────────────\n"
         "THEORY-FIRST OPTIONS (Paper D v0.3 — preferred path)\n"
         "─────────────────────────────────────────────────────────────────────────\n"
+        "  --friedman-sieve             Enable Phase-4b Friedman sieve over KV writes (Paper III/IV)\n"
+        "  --friedman-mode <off|observer|policy>  Sieve mode (default observer)\n"
+        "  --friedman-capacity <n>      Per-(layer,head) cache capacity (default 4096)\n"
+        "  --kste-tau-A <f>             Anchor inclusion threshold * amax (default 0.0)\n"
+        "  --kste-alpha <f>             Residual->anchor bucket span (default 0.7)\n"
         "  --frobenius-quant            Enable single-prime Frobenius quantization\n"
         "                               (Config B): calibration-free fp8 via φ_p^k.\n"
         "  --frobenius-quant-p <p>      Split prime in K=Q(√-163). Default 41\n"
@@ -336,6 +341,19 @@ static int parse_config_flag(sp::engine::Config& cfg, const char* a, const char*
     if (a_eq("--frobenius-quant"))                  { cfg.frobenius_quant = true; return 1; }
     if (a_eq("--frobenius-quant-p") && has_next)    { cfg.frobenius_p = std::atoll(next); return 2; }
     if (a_eq("--frobenius-quant-k") && has_next)    { cfg.frobenius_k = std::atoll(next); return 2; }
+
+    // Phase 4b: Friedman sieve flags.
+    if (a_eq("--friedman-sieve"))                     { cfg.friedman_sieve = true; return 1; }
+    if (a_eq("--friedman-mode") && has_next) {
+        std::string m = next;
+        if      (m == "off")      cfg.friedman_mode = 0;
+        else if (m == "observer") cfg.friedman_mode = 1;
+        else if (m == "policy")   cfg.friedman_mode = 2;
+        return 2;
+    }
+    if (a_eq("--friedman-capacity") && has_next)      { cfg.friedman_capacity = (int)std::atoll(next); return 2; }
+    if (a_eq("--kste-tau-A") && has_next)             { cfg.kste_tau_A = (float)std::atof(next); return 2; }
+    if (a_eq("--kste-alpha") && has_next)             { cfg.kste_alpha = (float)std::atof(next); return 2; }
     if (a_eq("--frobenius-q8"))                     { cfg.frobenius_q8 = true; return 1; }
     if (a_eq("--frobenius-q4"))                     { cfg.frobenius_q4 = true; return 1; }
     if (a_eq("--frobenius-q4-prune") && has_next)   { cfg.frobenius_q4_prune = (uint64_t)std::atoll(next); cfg.frobenius_q4 = true; return 2; }
@@ -984,6 +1002,18 @@ int main(int argc, char** argv) {
             ctx.ffn_act    = ffn_act;
             ctx.rope_mode  = rope_mode;
 
+            // Phase 4b: Friedman sieve setup (after context_init populates
+            // n_layers / n_kv_head / head_dim).
+            if (pc.friedman_sieve) {
+                if (!sp::engine::sp_forward_friedman_setup(
+                        ctx, pc.friedman_mode, pc.friedman_capacity,
+                        pc.kste_tau_A, pc.kste_alpha)) {
+                    std::fprintf(stderr,
+                        "[sp-engine] perplexity-native: Friedman sieve setup failed; "
+                        "continuing without sieve\n");
+                }
+            }
+
             /* Phase 16: populate ctx.rope_freq_factors from PrimePE.
              * pc carries the per-verb Config (parse_config_flag wrote to it
              * earlier; pc.pe_mode defaults to PrimePe with alpha=0.17). */
@@ -1363,6 +1393,23 @@ int main(int argc, char** argv) {
                 "frobenius_quant=%d sato_tate=%d)\n",
                 ppl_n, total_evalled_n, eval_chunks_n, n_ctx,
                 pc.frobenius_quant ? 1 : 0, pc.sato_tate_mix ? 1 : 0);
+            // Phase 4b: scrape-friendly alias for scripts/calibrate_kste.py.
+            std::printf("perplexity = %.4f (n=%d, ctx=%d)\n",
+                        ppl_n, eval_chunks_n, n_ctx);
+            // Phase 4b: Friedman sieve summary (only if enabled).
+            if (pc.friedman_sieve && ctx.friedman_hook.initialized) {
+                auto s = sp::engine::sp_forward_friedman_get_stats(ctx);
+                std::printf("sieve evictions = %llu / %llu (%.2f%%)  "
+                            "admissions = %llu  replacements = %llu  "
+                            "subsumption-hits = %llu\n",
+                            (unsigned long long)s.evictions,
+                            (unsigned long long)s.inserts_total,
+                            s.eviction_rate * 100.0,
+                            (unsigned long long)s.admissions,
+                            (unsigned long long)s.replacements,
+                            (unsigned long long)s.full_embeds);
+                sp::engine::sp_forward_friedman_teardown(ctx);
+            }
             return 0;
         }
 
@@ -1636,6 +1683,8 @@ int main(int argc, char** argv) {
         const double ppl      = std::exp(mean_nll);
         std::printf("PPL = %.4f  (over %lld tokens, %d chunks at ctx=%d)\n",
                     ppl, total_evalled, eval_chunks, n_ctx);
+        // Phase 4b: also emit the line scripts/calibrate_kste.py expects.
+        std::printf("perplexity = %.4f (n=%d, ctx=%d)\n", ppl, eval_chunks, n_ctx);
         if (use_cache && pc.cauchy_mode > 0 && kv) {
             kv->cauchy_print_stats();
             std::printf("Ricci drift (final) = %.6f\n", kv->ricci_drift());

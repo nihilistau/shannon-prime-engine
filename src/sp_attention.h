@@ -56,7 +56,8 @@ void sp_attention_dot_product(const sp_ok_tensor& q,
                                 int   t_stride             = -1,
                                 int   pos_offset           = -1,
                                 int   swa_window           = 0,
-                                float attn_logit_softcap   = 0.0f);
+                                float attn_logit_softcap   = 0.0f,
+                                const uint8_t* evicted_mask = nullptr);
 
 // Weil-pairing attention (Paper A §9.2). Phase 4 work.
 //
@@ -103,6 +104,7 @@ void sp_attention_poly_ring(const sp_ok_tensor& q,
                               int   swa_window           = 0,
                               float attn_logit_softcap   = 0.0f,
                               const uint64_t* k_ntt_slab_q1 = nullptr,
-                              const uint64_t* k_ntt_slab_q2 = nullptr);
+                              const uint64_t* k_ntt_slab_q2 = nullptr,
+                              const uint8_t* evicted_mask = nullptr);
 
 }  // namespace sp::engine

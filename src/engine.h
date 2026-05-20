@@ -166,6 +166,14 @@ struct Config {
     int64_t     st_p2              = 41;     // split prime (bounded-drift)
     int64_t     st_k2              = 8;      // phi_p2^k2
 
+    // Phase 4b: Friedman sieve cache hook over the KV-write path.
+    // friedman_mode: 0=off, 1=observer (counters only), 2=policy (decisions gate writes — Phase 4d).
+    bool        friedman_sieve     = false;
+    int         friedman_mode      = 1;       // 1=observer by default
+    int         friedman_capacity  = 4096;
+    float       kste_tau_A         = 0.0f;    // Phase-1 bootstrap default
+    float       kste_alpha         = 0.7f;
+
     // Phase 12 Step B-2: --frobenius-q8.
     // After the Frobenius shim has run, round-trip every shim-list
     // sp_ok_tensor through the packed int8 lattice (sp_ok_q8_t pair + per-

@@ -1,0 +1,38 @@
+starting Wed 20/05/2026 13:43:30.39 
+perplexity = 29.5595 (n=1, ctx=64)
+sieve evictions = 141 / 1152 (12.24%)  admissions = 1011  replacements = 0  subsumption-hits = 141
+tau=0.0500 alpha=0.3000 done 
+perplexity = 29.5595 (n=1, ctx=64)
+sieve evictions = 141 / 1152 (12.24%)  admissions = 1011  replacements = 0  subsumption-hits = 141
+tau=0.0500 alpha=0.5000 done 
+perplexity = 29.5595 (n=1, ctx=64)
+sieve evictions = 141 / 1152 (12.24%)  admissions = 1011  replacements = 0  subsumption-hits = 141
+tau=0.0500 alpha=0.7000 done 
+perplexity = 23.3099 (n=1, ctx=64)
+sieve evictions = 129 / 1152 (11.20%)  admissions = 1023  replacements = 0  subsumption-hits = 129
+tau=0.1000 alpha=0.3000 done 
+perplexity = 23.3099 (n=1, ctx=64)
+sieve evictions = 129 / 1152 (11.20%)  admissions = 1023  replacements = 0  subsumption-hits = 129
+tau=0.1000 alpha=0.5000 done 
+perplexity = 23.3099 (n=1, ctx=64)
+sieve evictions = 129 / 1152 (11.20%)  admissions = 1023  replacements = 0  subsumption-hits = 129
+tau=0.1000 alpha=0.7000 done 
+perplexity = 15.1052 (n=1, ctx=64)
+sieve evictions = 101 / 1152 (8.77%)  admissions = 1051  replacements = 0  subsumption-hits = 101
+tau=0.2000 alpha=0.3000 done 
+perplexity = 15.1052 (n=1, ctx=64)
+sieve evictions = 101 / 1152 (8.77%)  admissions = 1051  replacements = 0  subsumption-hits = 101
+tau=0.2000 alpha=0.5000 done 
+perplexity = 15.1052 (n=1, ctx=64)
+sieve evictions = 101 / 1152 (8.77%)  admissions = 1051  replacements = 0  subsumption-hits = 101
+tau=0.2000 alpha=0.7000 done 
+perplexity = 20.4401 (n=1, ctx=64)
+sieve evictions = 138 / 1152 (11.98%)  admissions = 1014  replacements = 0  subsumption-hits = 138
+tau=0.4000 alpha=0.3000 done 
+perplexity = 20.4401 (n=1, ctx=64)
+sieve evictions = 138 / 1152 (11.98%)  admissions = 1014  replacements = 0  subsumption-hits = 138
+tau=0.4000 alpha=0.5000 done 
+perplexity = 20.4401 (n=1, ctx=64)
+sieve evictions = 138 / 1152 (11.98%)  admissions = 1014  replacements = 0  subsumption-hits = 138
+tau=0.4000 alpha=0.7000 done 
+DONE 
