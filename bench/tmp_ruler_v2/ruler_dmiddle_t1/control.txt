@@ -1,0 +1,27 @@
+o beautifully. => 3347,5341,262,19132,21104,13
+The cat chased the mouse around the room. => 464,3797,26172,262,10211,1088,262,2119,13
+I love eating pizza with extra cheese. => 40,1842,6600,14256,351,3131,9891,13
+He always wears a hat wherever he goes. => 1544,1464,17326,257,6877,14530,339,2925,13
+The flowers in the garden are blooming. => 464,12734,287,262,11376,389,24924,3383,13
+She danced gracefully on the stage. => 3347,39480,11542,2759,319,262,3800,13
+The dog barked loudly in the park. => 464,3290,21405,276,23112,287,262,3952,13
+We went swimming in the ocean yesterday. => 1135,1816,14899,287,262,9151,7415,13
+He speaks fluent French and Spanish. => 1544,9209,43472,4141,290,7897,13
+The train arrived at the station on time. => 464,4512,5284,379,262,4429,319,640,13
+She cooked a delicious meal for her family. => 3347,15847,257,12625,9799,329,607,1641,13
+
+明日の天気はどうですか。 => 263,7353,268,18461,271,1722,18405,265
+
+Hello World! => 12092,3645,2
+I can't believe it's already Friday!" => 42,476,626,2868,352,434,2168,6794,1476
+The URL for the website is https://www.example.com." => 510,10611,323,253,4422,310,5987,1358,2700,15,11667,15,681,449
+"She said, 'I love to travel.'" => 3,2993,753,13,686,42,2389,281,4288,18574
+'The temperature is 25.5°C.' => 8,510,3276,310,2030,15,22,3272,36,2464
+"Let's meet at 2:30 p.m. in the park." => 3,1466,434,2525,387,374,27,1229,268,15,78,15,275,253,5603,449
+The book costs $19.99 => 510,1984,4815,370,746,15,1525
+"John's favorite color is blue." => 3,8732,434,7583,3295,310,4797,449
+Th@nk y0u f0r y0ur h3lp! => 1044,33,30664,340,17,86,269,17,83,340,17,321,288,20,24343,2
+C@n I g3t a c0ffee, pl3@se? => 36,33,79,309,305,20,85,247,260,17,71,6851,13,499,20,33,339,32
+W0w! Th@t's @m@zing! => 56,17,88,2,596,33,85,434,1214,78,33,8537,2
+H0w 4re y0u t0d@y? => 41,17,88,577,250,340,17,86,246,17,69,33,90,32
+I l0ve t0 tr@vel @r0und the w0rld. => 42,298,17,306,246,17,492,33,652,1214,83, Q: What is the magic word for gardens? A: saffron
