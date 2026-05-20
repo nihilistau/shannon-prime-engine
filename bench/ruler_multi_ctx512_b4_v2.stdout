@@ -1,0 +1,25 @@
+Phase 8e RULER-multi  ctx=512 chunks=2 bracket=4
+Engine: D:\F\shannon-prime-repos\shannon-prime-engine\build-cuda\bin\sp-engine.exe
+Model:  D:\Files\Models\Mine\gemma-3-1b-it\gemma-3-1b-it-Q4_0\gemma-3-1b-it-Q4_0.gguf
+Planted corpus: 3631 bytes
+Control corpus: 3631 bytes
+5 needles: [('garden', 'saffron'), ('violin', 'tungsten'), ('skyscraper', 'neon'), ('recipe', 'quantum'), ('glacier', 'carbonate')]
+Buffer between needles: 100 chars (~25 tokens)
+Cluster depth: 50%
+
+--- softmax  ×  planted  ---
+  PPL = 13.9257   wall = 540.6s
+--- softmax  ×  control  ---
+  PPL = 15.8494   wall = 544.9s
+--- ultra-b4  ×  planted  ---
+  PPL = 20726.0066   wall = 538.3s
+--- ultra-b4  ×  control  ---
+  PPL = 50565.4026   wall = 538.8s
+
+=== summary ===
+  softmax       planted=13.9257   control=15.8494
+                  delta=+1.9237   ratio=0.8786
+  ultra-b4      planted=20726.0066  control=50565.4026
+                  delta=+29839.3960   ratio=0.4099
+
+Wrote ruler_multi_ctx512_b4_v2.json

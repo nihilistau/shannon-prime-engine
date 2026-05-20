@@ -1,0 +1,59 @@
+{
+  "config": {
+    "ctx": 512,
+    "chunks": 2,
+    "bracket": 4,
+    "cluster_pct": 0.5,
+    "needles": [
+      [
+        "garden",
+        "saffron"
+      ],
+      [
+        "violin",
+        "tungsten"
+      ],
+      [
+        "skyscraper",
+        "neon"
+      ],
+      [
+        "recipe",
+        "quantum"
+      ],
+      [
+        "glacier",
+        "carbonate"
+      ]
+    ],
+    "buffer_chars": 100,
+    "planted_size": 3631,
+    "control_size": 3631
+  },
+  "cells": [
+    {
+      "mode": "softmax",
+      "corpus": "planted",
+      "ppl": 13.9257,
+      "wall_s": 540.5946850776672
+    },
+    {
+      "mode": "softmax",
+      "corpus": "control",
+      "ppl": 15.8494,
+      "wall_s": 544.9065585136414
+    },
+    {
+      "mode": "ultra-b4",
+      "corpus": "planted",
+      "ppl": 20726.0066,
+      "wall_s": 538.2816274166107
+    },
+    {
+      "mode": "ultra-b4",
+      "corpus": "control",
+      "ppl": 50565.4026,
+      "wall_s": 538.84690284729
+    }
+  ]
+}
