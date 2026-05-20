@@ -1,0 +1,11 @@
+{
+  "test_id": "T1.6", "phase": 2,
+  "name": "self-embedding (1000 trees)",
+  "config": { "head_dim": 128, "trials": 1000 },
+  "metrics": {
+    "embed_count": 1000, "capped_count": 0,
+    "mean_steps": 60.0, "max_steps": 60,
+    "max_depth": 9
+  },
+  "verdict": "PASS"
+}

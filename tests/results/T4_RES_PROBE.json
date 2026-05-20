@@ -1,0 +1,53 @@
+{
+  "test_id": "T4_RES_PROBE", "phase": 4,
+  "name": "KSTE semantic resolution probe",
+  "config": { "head_dim": 128, "n_clusters": 50, "per_cluster": 20 },
+  "per_sigma": [
+    {
+      "sigma": 0.005,
+      "clusters": 50, "per_cluster": 20,
+      "intra_filter_rate": 0.1829, "intra_embed_rate": 0.0000,
+      "inter_filter_rate": 0.0148, "inter_embed_rate": 0.0000,
+      "intra_inter_embed_ratio": 1000000000.0000,
+      "roc_auc_cos_vs_embed": 0.5000,
+      "sigma_pass": false
+    },
+    {
+      "sigma": 0.010,
+      "clusters": 50, "per_cluster": 20,
+      "intra_filter_rate": 0.0921, "intra_embed_rate": 0.0000,
+      "inter_filter_rate": 0.0163, "inter_embed_rate": 0.0000,
+      "intra_inter_embed_ratio": 1000000000.0000,
+      "roc_auc_cos_vs_embed": 0.5000,
+      "sigma_pass": false
+    },
+    {
+      "sigma": 0.020,
+      "clusters": 50, "per_cluster": 20,
+      "intra_filter_rate": 0.0393, "intra_embed_rate": 0.0000,
+      "inter_filter_rate": 0.0153, "inter_embed_rate": 0.0000,
+      "intra_inter_embed_ratio": 1000000000.0000,
+      "roc_auc_cos_vs_embed": 0.5000,
+      "sigma_pass": false
+    },
+    {
+      "sigma": 0.050,
+      "clusters": 50, "per_cluster": 20,
+      "intra_filter_rate": 0.0199, "intra_embed_rate": 0.0000,
+      "inter_filter_rate": 0.0147, "inter_embed_rate": 0.0000,
+      "intra_inter_embed_ratio": 1000000000.0000,
+      "roc_auc_cos_vs_embed": 0.5000,
+      "sigma_pass": false
+    },
+    {
+      "sigma": 0.100,
+      "clusters": 50, "per_cluster": 20,
+      "intra_filter_rate": 0.0184, "intra_embed_rate": 0.0000,
+      "inter_filter_rate": 0.0138, "inter_embed_rate": 0.0000,
+      "intra_inter_embed_ratio": 1000000000.0000,
+      "roc_auc_cos_vs_embed": 0.5000,
+      "sigma_pass": false
+    }
+  ],
+  "verdict": "FAIL"
+}

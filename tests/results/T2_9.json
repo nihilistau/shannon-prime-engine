@@ -1,0 +1,12 @@
+{
+  "test_id": "T2.9", "phase": 5,
+  "name": "pre-filter correctness (no false negatives)",
+  "config": { "head_dim": 128, "pairs": 10000 },
+  "metrics": {
+    "embed_yes": 5025, "embed_no": 4975,
+    "filter_admitted_on_yes": 5025,
+    "filter_rejected_on_no": 4918,
+    "false_negatives": 0
+  },
+  "verdict": "PASS"
+}

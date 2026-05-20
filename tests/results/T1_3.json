@@ -1,0 +1,12 @@
+{
+  "test_id": "T1.3", "phase": 1,
+  "name": "sign-respecting (B<->C swap)",
+  "config": { "head_dim": 128, "seed": 42 },
+  "metrics": {
+    "tree_shape_same": true,
+    "A_pos": 14, "A_neg": 14,
+    "B_pos": 26, "B_neg": 19,
+    "C_pos": 19, "C_neg": 26
+  },
+  "verdict": "PASS"
+}

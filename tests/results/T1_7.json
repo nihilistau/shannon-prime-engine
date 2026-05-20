@@ -1,0 +1,7 @@
+{
+  "test_id": "T1.7", "phase": 2,
+  "name": "empty-subtree embedding",
+  "config": { "head_dim": 128, "trials": 1000 },
+  "metrics": { "embed_count": 1000 },
+  "verdict": "PASS"
+}

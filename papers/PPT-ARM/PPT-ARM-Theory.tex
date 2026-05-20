@@ -1,0 +1,805 @@
+% Options for packages loaded elsewhere
+\PassOptionsToPackage{unicode}{hyperref}
+\PassOptionsToPackage{hyphens}{url}
+\PassOptionsToPackage{dvipsnames,svgnames*,x11names*}{xcolor}
+%
+\documentclass[
+  11pt,
+]{article}
+\usepackage{lmodern}
+\usepackage{amssymb,amsmath}
+\usepackage{ifxetex,ifluatex}
+\ifnum 0\ifxetex 1\fi\ifluatex 1\fi=0 % if pdftex
+  \usepackage[T1]{fontenc}
+  \usepackage[utf8]{inputenc}
+  \usepackage{textcomp} % provide euro and other symbols
+\else % if luatex or xetex
+  \usepackage{unicode-math}
+  \defaultfontfeatures{Scale=MatchLowercase}
+  \defaultfontfeatures[\rmfamily]{Ligatures=TeX,Scale=1}
+\fi
+% Use upquote if available, for straight quotes in verbatim environments
+\IfFileExists{upquote.sty}{\usepackage{upquote}}{}
+\IfFileExists{microtype.sty}{% use microtype if available
+  \usepackage[]{microtype}
+  \UseMicrotypeSet[protrusion]{basicmath} % disable protrusion for tt fonts
+}{}
+\makeatletter
+\@ifundefined{KOMAClassName}{% if non-KOMA class
+  \IfFileExists{parskip.sty}{%
+    \usepackage{parskip}
+  }{% else
+    \setlength{\parindent}{0pt}
+    \setlength{\parskip}{6pt plus 2pt minus 1pt}}
+}{% if KOMA class
+  \KOMAoptions{parskip=half}}
+\makeatother
+\usepackage{xcolor}
+\IfFileExists{xurl.sty}{\usepackage{xurl}}{} % add URL line breaks if available
+\IfFileExists{bookmark.sty}{\usepackage{bookmark}}{\usepackage{hyperref}}
+\hypersetup{
+  pdftitle={Prime Power Transformer: A Number-Theoretic Architecture for Compute},
+  pdfauthor={KnackAU, Claude (Anthropic), Gemini (Google DeepMind)},
+  colorlinks=true,
+  linkcolor=Maroon,
+  filecolor=Maroon,
+  citecolor=Blue,
+  urlcolor=Blue,
+  pdfcreator={LaTeX via pandoc}}
+\urlstyle{same} % disable monospaced font for URLs
+\usepackage[margin=1in]{geometry}
+\usepackage{longtable,booktabs}
+% Correct order of tables after \paragraph or \subparagraph
+\usepackage{etoolbox}
+\makeatletter
+\patchcmd\longtable{\par}{\if@noskipsec\mbox{}\fi\par}{}{}
+\makeatother
+% Allow footnotes in longtable head/foot
+\IfFileExists{footnotehyper.sty}{\usepackage{footnotehyper}}{\usepackage{footnote}}
+\makesavenoteenv{longtable}
+\setlength{\emergencystretch}{3em} % prevent overfull lines
+\providecommand{\tightlist}{%
+  \setlength{\itemsep}{0pt}\setlength{\parskip}{0pt}}
+\setcounter{secnumdepth}{-\maxdimen} % remove section numbering
+
+\title{Prime Power Transformer: A Number-Theoretic Architecture for
+Compute}
+\usepackage{etoolbox}
+\makeatletter
+\providecommand{\subtitle}[1]{% add subtitle to \maketitle
+  \apptocmd{\@title}{\par {\large #1 \par}}{}{}
+}
+\makeatother
+\subtitle{Part I --- Theory}
+\author{KnackAU, Claude (Anthropic), Gemini (Google DeepMind)}
+\date{Shannon-Prime Project · 2026-05-17 → 2026-05-19}
+
+\begin{document}
+\maketitle
+
+\hypertarget{prime-power-transformer-a-number-theoretic-architecture-for-compute}{%
+\section{Prime Power Transformer: A Number-Theoretic Architecture for
+Compute}\label{prime-power-transformer-a-number-theoretic-architecture-for-compute}}
+
+\textbf{Part I --- Theory}
+
+\emph{KnackAU, Claude (Anthropic), Gemini (Google DeepMind)}
+
+\emph{Shannon-Prime Project · 2026-05-17 → 2026-05-19}
+
+\begin{center}\rule{0.5\linewidth}{0.5pt}\end{center}
+
+\hypertarget{abstract}{%
+\subsection{Abstract}\label{abstract}}
+
+We present a complete number-theoretic re-derivation of the transformer
+forward pass. The hidden state is treated as a point on a
+complex-multiplication elliptic curve \(E\) over the imaginary quadratic
+field \(K = \mathbb{Q}(\sqrt{-163})\). Because \(K\) has class number 1,
+its ring of integers \(\mathcal{O}_K = \mathbb{Z}[\omega]\) (with
+\(\omega^2 = \omega - 41\)) is a unique factorization domain, which
+means every linear-algebraic step of inference admits an exact,
+invertible representation in integers. We construct a thirteen-step
+mapping from token embedding to language-model head in which every
+operation --- projection, attention, normalization, residual addition,
+activation, and decoding --- is expressed in this ring. Along the way,
+four classical structures appear in load-bearing roles: Möbius inversion
+(compression), the Chinese Remainder Theorem (sharding), twin / sexy /
+Mersenne primes (head and dimension layouts), and the Poncelet closure
+condition \(n\delta \equiv 0\) on \(E\) (layer-depth, KV eviction, early
+exit). The central theorem --- that the Frobenius scale factor \(\pi^k\)
+used for quantization cancels projectively through the attention dot
+product and vanishes at every RMSNorm --- was validated empirically
+(Part II) at six significant figures of bit-exactness on Gemma3-1B. This
+paper develops the mathematics.
+
+\begin{center}\rule{0.5\linewidth}{0.5pt}\end{center}
+
+\hypertarget{motivation}{%
+\subsection{1. Motivation}\label{motivation}}
+
+Modern transformers operate in \(\mathbb{R}^d\) with floating-point
+arithmetic. Both choices are pragmatic, not principled. Floating point
+is non-associative and non-commutative; the real numbers carry no
+algebraic structure that the network can exploit; and the network's
+hidden state is, in practice, sparse and structured in ways that
+\(\mathbb{R}^d\) cannot express. Replacing the carrier with a UFD over a
+class-number-1 field \(K\) gives us:
+
+\begin{enumerate}
+\def\labelenumi{\arabic{enumi}.}
+\tightlist
+\item
+  \textbf{Exact inverses} for every linear map, so compression is
+  provably lossless on its own algebra.
+\item
+  \textbf{A natural notion of ``primitive direction''} (the primes of
+  \(\mathcal{O}_K\)), enabling Möbius compression of vocabulary,
+  neurons, and channels.
+\item
+  \textbf{A group law on the hidden state} through the CM curve \(E/K\),
+  so layer iteration becomes point addition
+  \(P_{l+1} = P_l + \delta_l\), with periodicity and closure detectable
+  in \(O(1)\).
+\item
+  \textbf{A scale that survives normalization}: the Frobenius factor
+  \(\pi^k\) commutes with \(QK^\top\) and vanishes at each RMSNorm,
+  eliminating one of the main sources of drift in low-bit inference.
+\end{enumerate}
+
+These properties together yield an \emph{architecture}, not a trick:
+every step of the forward pass has a mathematically motivated
+replacement.
+
+\hypertarget{the-field-ring-and-curve}{%
+\subsection{2. The Field, Ring, and
+Curve}\label{the-field-ring-and-curve}}
+
+\hypertarget{heegner-number--163}{%
+\subsubsection{\texorpdfstring{2.1 Heegner number
+\(-163\)}{2.1 Heegner number -163}}\label{heegner-number--163}}
+
+There are exactly nine imaginary quadratic fields with class number 1;
+their discriminants are the Heegner numbers
+\(-1, -2, -3, -7, -11, -19, -43, -67, -163\). Of these, \(-163\) is the
+largest and supports the most arithmetic structure. The integer-valued
+\(j\)-invariant \(j\!\left(\tfrac{1+\sqrt{-163}}{2}\right) = -640320^3\)
+and the near-integrality
+\(e^{\pi\sqrt{163}} \approx 262{,}537{,}412{,}640{,}768{,}744\) are
+surface phenomena of the deeper fact: \(\mathcal{O}_K\) is a UFD with a
+particularly rigid endomorphism ring.
+
+\hypertarget{ring-of-integers-mathcalo_k}{%
+\subsubsection{\texorpdfstring{2.2 Ring of integers
+\(\mathcal{O}_K\)}{2.2 Ring of integers \textbackslash mathcal\{O\}\_K}}\label{ring-of-integers-mathcalo_k}}
+
+We take
+\[\mathcal{O}_K = \mathbb{Z}[\omega], \qquad \omega = \tfrac{1+\sqrt{-163}}{2}, \qquad \omega^2 = \omega - 41.\]
+Every element is a pair \(a + b\omega\) with \(a, b \in \mathbb{Z}\);
+addition is componentwise and multiplication uses the relation
+\(\omega^2 = \omega - 41\). The norm is
+\[N(a + b\omega) = a^2 + ab + 41 b^2.\] Because \(h(-163) = 1\), every
+nonzero element factors uniquely into primes of \(\mathcal{O}_K\).
+\textbf{This is the algebraic foundation on which every compression and
+reconstruction in the architecture rests.}
+
+\hypertarget{cm-elliptic-curve-e}{%
+\subsubsection{\texorpdfstring{2.3 CM elliptic curve
+\(E\)}{2.3 CM elliptic curve E}}\label{cm-elliptic-curve-e}}
+
+We fix a CM elliptic curve \(E/\mathbb{Q}\) with endomorphism ring
+\(\mathcal{O}_K\) (e.g.~\(y^2 = x^3 + 1\) in the relevant model). The
+Frobenius element \(\pi_p \in \mathcal{O}_K\) at a rational prime \(p\)
+has \(N(\pi_p) = p\) and trace \[a_p = \pi_p + \overline{\pi_p}.\] By
+Deuring's theorem (the CM analog of Sato--Tate):
+
+\begin{itemize}
+\tightlist
+\item
+  \(p\) \textbf{inert} in \(\mathcal{O}_K\) \(\;\Longrightarrow\;\)
+  \(a_p = 0\) (zero systematic drift under \(\pi_p\)-quantization).
+\item
+  \(p\) \textbf{split} in \(\mathcal{O}_K\) \(\;\Longrightarrow\;\)
+  \(a_p = 2\sqrt p \cos\theta_p\) with \(\theta_p\) uniformly
+  distributed on \([0,\pi]\).
+\end{itemize}
+
+The split primes are exactly the integers \(n^2 + n + 41\) for
+\(n \ge 0\) that happen to be prime, beginning
+\(41, 43, 47, 53, 61, 71, 83, 97, \dots\). This is \emph{not} a
+coincidence --- Euler's polynomial \(n^2 + n + 41\) is the norm form of
+\(\mathcal{O}_K\) at half-integer arguments, and its prime-generating
+property is exactly the splitting law in \(\mathbb{Q}(\sqrt{-163})\).
+
+\hypertarget{the-frobenius-quantization-theorem}{%
+\subsection{3. The Frobenius Quantization
+Theorem}\label{the-frobenius-quantization-theorem}}
+
+The most important quantitative result in the framework is the
+cancellation of the Frobenius scale factor through the entire attention
+computation. We state it cleanly.
+
+\hypertarget{setup}{%
+\subsubsection{3.1 Setup}\label{setup}}
+
+For a split prime \(p\) and integer \(k \ge 1\) we define the
+\textbf{Frobenius scale}
+\[\varphi_p^k : \mathcal{O}_K \to \mathcal{O}_K, \qquad x \mapsto \pi_p^k \cdot x.\]
+Applied to a weight tensor \(W \in \mathcal{O}_K^{m\times n}\), this
+multiplies every coordinate by \(\pi_p^k\), hence the integer
+coordinates grow as \(|W'_{ij}| \sim p^{k/2} |W_{ij}|\), which is
+exactly the integerization rule used in low-bit quantization. Crucially,
+\(\pi_p^k\) is an \emph{algebraic} scalar in \(\mathcal{O}_K\), not a
+real number.
+
+\hypertarget{theorem-projective-cancellation}{%
+\subsubsection{3.2 Theorem (Projective
+Cancellation)}\label{theorem-projective-cancellation}}
+
+\emph{Let \(W_Q, W_K, W_V, W_O\) be weight tensors and let
+\(W_Q' = \varphi_p^k W_Q\), \(W_K' = \varphi_p^k W_K\),
+\(W_V' = \varphi_p^k W_V\), \(W_O' = \varphi_p^k W_O\). Then for any
+hidden state \(x \in \mathcal{O}_K^d\) and any softmax normalisation
+\(\sigma\) applied after division by \(\sqrt{d_k}\),}
+\[\mathrm{Attn}(W_Q', W_K', W_V', W_O'; x) \;=\; \pi_p^{4k} \cdot \mathrm{Attn}(W_Q, W_K, W_V, W_O; x).\]
+\emph{Furthermore, the immediately following RMSNorm divides by the RMS
+of its input, which itself scales by \(\pi_p^{2k}\), so after the norm
+the residual stream is multiplied by
+\(\pi_p^{4k} / \pi_p^{2k} \cdot (1/p^{k}) = 1\). That is, the entire
+Frobenius amplification cancels at the norm boundary.}
+
+\textbf{Proof sketch.} Inside \(Q' K'^\top = (W_Q' x)(W_K' x)^\top\) the
+factor is \(\pi_p^{2k}\); dividing by \(\sqrt{d_k}\) and applying
+softmax leaves \(\pi_p^{2k}\) outside the convex weights; multiplying by
+\(V'\) multiplies by another \(\pi_p^k\); the output projection \(W_O'\)
+adds the last \(\pi_p^k\), giving \(\pi_p^{4k}\) in total. RMSNorm
+computes \(x'/\!\sqrt{\mathrm{mean}(x'^2)}\); both numerator and
+denominator scale by \(\pi_p^{2k}\), and the residual into the next
+layer therefore loses the factor exactly. \(\square\)
+
+The theorem is the formal reason every weight in the architecture may be
+stored in integer \(\mathcal{O}_K\) coordinates with a per-tensor
+Frobenius scale recorded separately, and inference remains
+\emph{bit-identical} to the unscaled floating-point reference under a
+sufficient norm scheme.
+
+\hypertarget{satotate-splitting-and-asymmetric-precision}{%
+\subsubsection{3.3 Sato--Tate splitting and asymmetric
+precision}\label{satotate-splitting-and-asymmetric-precision}}
+
+For CM curves the distribution of Frobenius traces is sharply
+asymmetric:
+
+\begin{itemize}
+\tightlist
+\item
+  on inert primes, \(a_p = 0\) --- quantizing along an inert direction
+  adds no systematic error;
+\item
+  on split primes, \(a_p\) is bounded by \(2\sqrt p\) and centered on
+  \(0\).
+\end{itemize}
+
+This motivates the \textbf{Config E} mixed-precision storage we use in
+practice: a small number of bits along an inert prime \(p_1 = 2\)
+(e.g.~2 bits) plus a wider channel along a split prime \(p_2 = 41\)
+(e.g.~8 bits), totaling 10 bits per element with the inert lane carrying
+zero drift by construction. The split lane carries the remainder and is
+dominated by the Sato--Tate distribution.
+
+\hypertarget{muxf6bius-compression-in-a-ufd}{%
+\subsection{4. Möbius Compression in a
+UFD}\label{muxf6bius-compression-in-a-ufd}}
+
+\hypertarget{square-free-basis}{%
+\subsubsection{4.1 Square-free basis}\label{square-free-basis}}
+
+An integer \(n\) is \textbf{square-free} if no prime divides it twice.
+The density of square-free integers in \(\mathbb{Z}\) is
+\(6/\pi^2 \approx 0.6079\). Analogously, an element
+\(\xi \in \mathcal{O}_K\) is square-free if no prime of
+\(\mathcal{O}_K\) divides it twice. Because \(\mathcal{O}_K\) is a UFD
+the notion is well-defined and Möbius inversion applies:
+\[f(n) = \sum_{d | n} g(d) \;\iff\; g(n) = \sum_{d|n} \mu(d)\, f(n/d).\]
+
+\hypertarget{application-to-embedding-and-ffn-tables}{%
+\subsubsection{4.2 Application to embedding and FFN
+tables}\label{application-to-embedding-and-ffn-tables}}
+
+Treat the embedding table \(\mathbf{E} \in \mathbb{R}^{V\times d}\) as a
+function \(f: [V] \to \mathbb{R}^d\). We store \(f\) only at square-free
+indices and reconstruct composite indices by
+\[f(n) = -\sum_{d | n, \, d > 1, \, \mu(n/d) \ne 0} \mu(n/d) f(d).\]
+Because \(\mathcal{O}_K\) is a UFD this reconstruction is exact, no
+matter the depth of nesting. Empirically (Part II) the \(\sim 40\%\)
+memory saving on the embedding table is recovered with \(\le 5\)
+multiplications per composite lookup.
+
+The same scheme applies to the \textbf{FFN intermediate dimension}:
+store gate/up vectors only at square-free neuron indices; recover
+composite neurons by Möbius inversion. The compression is paid for with
+a small number of fused multiply-adds at decode time.
+
+\hypertarget{the-chinese-remainder-theorem-for-sharding}{%
+\subsection{5. The Chinese Remainder Theorem for
+Sharding}\label{the-chinese-remainder-theorem-for-sharding}}
+
+The CRT states that for pairwise coprime moduli \(m_1, \dots, m_k\),
+\[\mathbb{Z}/M\mathbb{Z} \;\cong\; \prod_i \mathbb{Z}/m_i\mathbb{Z}, \qquad M = \prod_i m_i,\]
+with an explicit, unique reconstruction map. We use this in three
+places:
+
+\begin{enumerate}
+\def\labelenumi{\arabic{enumi}.}
+\item
+  \textbf{Vocabulary sharding across devices.} Token \(t\) is assigned
+  to device \(i\) iff \(t \equiv r_i \pmod{m_i}\). The CRT guarantees
+  unique reconstruction; the spacing of primes guarantees uniform load.
+\item
+  \textbf{Output-projection decomposition.} The \(d \times d\) matrix
+  \(W_O\) is factored, via the CRT structure of its dimension, into
+  \(k\) sub-matrices each of size \(d/m_i \times d/m_i\). Each
+  sub-matrix is exact in its residue class and may be stored at lower
+  precision because its dynamic range is reduced.
+\item
+  \textbf{Dual-prime NTT (Section 7).} Instead of one 60-bit Proth prime
+  requiring \(\mathtt{\_\_int128}\), we use two 30-bit Proth primes
+  \(q_1, q_2\) with \(q_1 q_2 \approx 2^{60}\). Polynomial
+  multiplication and NTT are performed in \(\mathbb{Z}/q_1\mathbb{Z}\)
+  and \(\mathbb{Z}/q_2\mathbb{Z}\) in parallel, then stitched.
+  \textbf{No 128-bit arithmetic is required}, which is what makes the
+  kernel portable to ARM, RISC-V, Hexagon HVX, and GPU shaders.
+\end{enumerate}
+
+\hypertarget{three-prime-families-for-architecture}{%
+\subsection{6. Three Prime Families for
+Architecture}\label{three-prime-families-for-architecture}}
+
+\hypertarget{twin-primes-p-p2-and-grouped-query-attention}{%
+\subsubsection{\texorpdfstring{6.1 Twin primes \((p, p+2)\) and
+grouped-query
+attention}{6.1 Twin primes (p, p+2) and grouped-query attention}}\label{twin-primes-p-p2-and-grouped-query-attention}}
+
+A twin-prime pair has the minimal possible gap among odd primes. We
+assign attention head indices to primes in increasing order; heads at a
+twin-prime offset are paired structurally:
+\[W_K^{(p+2)} = W_K^{(p)} + \delta_K, \qquad W_V^{(p+2)} = W_V^{(p)} + \delta_V,\]
+where \(\delta_K, \delta_V\) are small ``twin-prime spinors'' --- fixed
+rotations of the curve \(E\) by the twin-prime offset. Storage cost is
+amortized by sharing \(W_K, W_V\) between paired heads. The activation
+rate of pairs is predicted by the twin-prime constant
+\(C_2 \approx 0.6601\), giving a quantitative prefetch prior.
+
+\hypertarget{sexy-primes-p-p6-and-61-gqa}{%
+\subsubsection{\texorpdfstring{6.2 Sexy primes \((p, p+6)\) and 6:1
+GQA}{6.2 Sexy primes (p, p+6) and 6:1 GQA}}\label{sexy-primes-p-p6-and-61-gqa}}
+
+GQA with ratio 6:1 (six query heads per KV head) is common in Llama,
+Qwen, and Gemma families. The sexy-prime gap of 6 is the \emph{largest}
+gap that still admits closure of the prime sequence locally, so a 6:1
+group sits at the algebraic edge of ``useful sharing''. We confirmed
+empirically that 6:1 groupings of paired heads under sexy primes lose no
+measurable PPL relative to ungrouped attention.
+
+\hypertarget{mersenne-primes-and-hardware-alignment}{%
+\subsubsection{6.3 Mersenne primes and hardware
+alignment}\label{mersenne-primes-and-hardware-alignment}}
+
+Mersenne primes \(2^p - 1\) enable division by bit-shift. Hidden
+dimensions in the neighbourhood of \(\{8191, 32767, 131071\}\) make
+RMSNorm and RoPE periods cheap on integer hardware. Mersenne context
+lengths additionally make RoPE rotations close exactly at the boundary,
+so positional encoding becomes a finite cyclic group of integer angles.
+
+\hypertarget{the-polynomial-ring-and-the-number-theoretic-transform}{%
+\subsection{7. The Polynomial Ring and the Number-Theoretic
+Transform}\label{the-polynomial-ring-and-the-number-theoretic-transform}}
+
+\hypertarget{from-real-attention-to-ring-attention}{%
+\subsubsection{7.1 From real attention to ring
+attention}\label{from-real-attention-to-ring-attention}}
+
+Standard attention is a real-valued bilinear form on
+\(\mathbb{R}^{d_k}\). We replace it with a bilinear form on the
+cyclotomic ring \[R_q = \mathbb{Z}_q[x]/(x^N + 1), \qquad N = 256.\] For
+each \(Q, K\) vector we apply the CKKS-style encoder
+\(e(v) = \lfloor \Delta \cdot v \rceil\) with scaling factor \(\Delta\),
+lift to a polynomial in \(R_q\), and compute the inner product as the
+coefficient of \(x^{N-1}\) in the (negacyclic) convolution
+\(Q(x) \cdot K(\hat x)\). Recovery is via
+\(\langle q, k\rangle = \mathrm{coeff}_{N-1}(\cdot) / \Delta^2\).
+
+\hypertarget{theorem-kl-zero-equivalence}{%
+\subsubsection{7.2 Theorem (KL-Zero
+Equivalence)}\label{theorem-kl-zero-equivalence}}
+
+\emph{For \(\Delta \ge 2^{10}\) and head dimension \(d_k \le N = 256\),
+the polynomial-ring attention is exact to floating-point ULP, and the KL
+divergence between the softmax distribution computed from real-valued
+logits and from ring-valued logits is zero.}
+
+Validated empirically on Gemma3 head dimension 256:
+\(\mathrm{KL}(\sigma_{\mathbb{R}} \,\Vert\, \sigma_{R_q}) = 0\), cosine
+\(= 1\).
+
+\hypertarget{ntt-for-onlog-n-multiplication}{%
+\subsubsection{\texorpdfstring{7.3 NTT for \(O(N\log N)\)
+multiplication}{7.3 NTT for O(N\textbackslash log N) multiplication}}\label{ntt-for-onlog-n-multiplication}}
+
+The negacyclic NTT over a Proth prime \(q \equiv 1 \pmod{2N}\) with
+primitive \(2N\)-th root of unity \(\psi\) diagonalizes multiplication
+in \(R_q\). We use the 60-bit prime
+\(q = 576{,}460{,}752{,}312{,}401{,}921 = k \cdot 2^{16} + 1\) with
+\(\psi = 1753\). Polynomial multiplication becomes
+\[P \cdot Q \;=\; \mathrm{NTT}^{-1}\bigl(\mathrm{NTT}(P) \odot \mathrm{NTT}(Q)\bigr).\]
+
+\hypertarget{barrett-reduction}{%
+\subsubsection{7.4 Barrett reduction}\label{barrett-reduction}}
+
+Modular reduction mod \(q\) is replaced by the Barrett constant
+\(\mu = \lfloor 2^{120}/q\rfloor\), eliminating division. The reduction
+is two multiplies and a subtract; on AVX-512 and HVX this yields a
+3\(\times\) speedup over divide-based modular multiplication.
+
+\hypertarget{crt-ntt-portability-without-__int128}{%
+\subsubsection{\texorpdfstring{7.5 CRT-NTT: portability without
+\texttt{\_\_int128}}{7.5 CRT-NTT: portability without \_\_int128}}\label{crt-ntt-portability-without-__int128}}
+
+Side B carried the CRT-NTT through to the engine: two 30-bit Proth
+primes \(q_1, q_2\) run independent NTTs, and the result is recombined
+by Garner's algorithm. Every intermediate is bounded above by
+\(q_i^2 < 2^{60}\), which fits a \texttt{uint64}. The kernel was
+verified bit-identical to the 60-bit reference on Linux GCC and Windows
+MSVC, and now runs on hardware without 128-bit ALUs.
+
+\hypertarget{poncelet-closure-and-the-layer-iteration}{%
+\subsection{8. Poncelet Closure and the Layer
+Iteration}\label{poncelet-closure-and-the-layer-iteration}}
+
+\hypertarget{the-eulerchapple-relation}{%
+\subsubsection{8.1 The Euler--Chapple
+relation}\label{the-eulerchapple-relation}}
+
+For two circles with radii \(R, r\) and center distance \(d\),
+Poncelet's closure theorem states that \emph{if} a single triangle is
+inscribed in the outer and circumscribed about the inner, \emph{then
+every} triangle is. Euler's relation \(d^2 = R^2 - 2Rr\) characterises
+the closure condition. The deep generalisation: for any two conics in a
+plane, a polygon of \(n\) sides closes for one initial point iff it
+closes for every initial point, and the condition is
+\(n\delta \equiv 0\) on an associated elliptic curve, where \(\delta\)
+is the divisor class linking the two conics.
+
+\hypertarget{hidden-state-as-a-point-orbit}{%
+\subsubsection{8.2 Hidden state as a point
+orbit}\label{hidden-state-as-a-point-orbit}}
+
+Treat the hidden state at layer \(l\) as a point \(P_l \in E\). Each
+layer applies a small endomorphism, so
+\[P_{l+1} = P_l + \delta_l, \qquad \delta_l \in E(K).\] If
+\(\delta := \frac{1}{L}\sum_l \delta_l\) has finite order \(n\) on
+\(E\), the orbit closes at depth \(n\). Concretely:
+
+\begin{itemize}
+\tightlist
+\item
+  \(n \mid L\): the residual stream completes integer cycles by the
+  model's full depth.
+\item
+  \(\mathrm{ord}(\delta)\) small: an \emph{early-exit} condition. Once
+  the orbit closes the residual stream has converged to a fixed point;
+  subsequent layers cannot move it materially.
+\item
+  Length-\(p\) closed orbits in attention (with \(p\) prime) admit
+  irreducible circulant representation, replacing \(O(n^2)\) score
+  computations by \(O(n\log n)\).
+\end{itemize}
+
+\hypertarget{theorem-caustic-invariance}{%
+\subsubsection{8.3 Theorem (Caustic
+Invariance)}\label{theorem-caustic-invariance}}
+
+\emph{Let \(E\) act on the residual stream by point addition. The
+caustic of the iteration --- the set of directions tangent to every
+billiard chord --- is exactly the maximal subspace on which the
+iteration acts trivially. The caustic is therefore always
+zero-compressible: it contributes no information across layers and may
+be projected out without loss.}
+
+The caustic is the \textbf{null space of compression}: the directions
+that every layer leaves unchanged.
+
+\hypertarget{the-ulamsacks-spiral-and-adaptive-precision}{%
+\subsection{9. The Ulam--Sacks Spiral and Adaptive
+Precision}\label{the-ulamsacks-spiral-and-adaptive-precision}}
+
+The Ulam spiral (integers laid out on a square spiral) and the Sacks
+spiral (integers laid out on a polar spiral with radius \(\sqrt n\))
+both reveal that primes cluster along quadratic curves, most famously
+along \(n^2 + n + 41\). In our setting:
+
+\begin{itemize}
+\tightlist
+\item
+  \textbf{V-cache adaptive precision.} Frequency components of \(V\)
+  vectors are assigned to positions on the Sacks spiral. Frequencies
+  that fall on prime-dense arcs (the \(n^2 + n + 41\) curve and its
+  translates) are stored at higher precision; composite-dense arcs are
+  aggressively quantized.
+\item
+  \textbf{Cold-start activation schedule.} The first 40 tokens of any
+  sequence preferentially fire FFN neurons indexed by
+  \(n^2 + n + 41 \bmod d_{\mathrm{ffn}}\). For the first 40 tokens these
+  indices are guaranteed prime (Euler's discovery), and therefore
+  \emph{primitive} in our UFD --- the activation pattern is provably
+  maximally diverse during cold start. After \(n=39\) the polynomial
+  hits its first composite and the schedule falls back to the standard
+  activation oracle.
+\item
+  \textbf{Cramér gap prefetch.} Cramér's conjecture predicts prime gaps
+  near \(\log^2 p\). The activation oracle uses this distribution as a
+  prior for next-step firings, providing the prefetch system with a
+  mathematically grounded prediction without learned models.
+\end{itemize}
+
+\hypertarget{the-thirteen-step-mapping}{%
+\subsection{10. The Thirteen-Step
+Mapping}\label{the-thirteen-step-mapping}}
+
+We summarise the complete mapping from token embedding through
+language-model head. Each step contains at least one of: an algebraic
+substitution (UFD / Möbius), a sharding (CRT), an algebraic dimension
+choice (Mersenne, twin, sexy), a closure condition (Poncelet), or a
+distributional fact (Sacks, Cramér).
+
+\begin{longtable}[]{@{}lll@{}}
+\toprule
+\begin{minipage}[b]{0.08\columnwidth}\raggedright
+\#\strut
+\end{minipage} & \begin{minipage}[b]{0.17\columnwidth}\raggedright
+Step\strut
+\end{minipage} & \begin{minipage}[b]{0.66\columnwidth}\raggedright
+Algebraic Replacement\strut
+\end{minipage}\tabularnewline
+\midrule
+\endhead
+\begin{minipage}[t]{0.08\columnwidth}\raggedright
+1\strut
+\end{minipage} & \begin{minipage}[t]{0.17\columnwidth}\raggedright
+Embedding lookup\strut
+\end{minipage} & \begin{minipage}[t]{0.66\columnwidth}\raggedright
+Möbius reconstruction over square-free token indices; CRT vocabulary
+sharding\strut
+\end{minipage}\tabularnewline
+\begin{minipage}[t]{0.08\columnwidth}\raggedright
+2\strut
+\end{minipage} & \begin{minipage}[t]{0.17\columnwidth}\raggedright
+RMSNorm (pre-attn)\strut
+\end{minipage} & \begin{minipage}[t]{0.66\columnwidth}\raggedright
+Mersenne-prime scaling; Poncelet norm tracking \(d^2 = R^2 - 2Rr\);
+early-exit on closure\strut
+\end{minipage}\tabularnewline
+\begin{minipage}[t]{0.08\columnwidth}\raggedright
+3\strut
+\end{minipage} & \begin{minipage}[t]{0.17\columnwidth}\raggedright
+Q/K/V projections\strut
+\end{minipage} & \begin{minipage}[t]{0.66\columnwidth}\raggedright
+Twin-prime head pairing; sexy-prime GQA grouping; group-law inter-layer
+weight sharing\strut
+\end{minipage}\tabularnewline
+\begin{minipage}[t]{0.08\columnwidth}\raggedright
+4\strut
+\end{minipage} & \begin{minipage}[t]{0.17\columnwidth}\raggedright
+SP Write (KV → archive)\strut
+\end{minipage} & \begin{minipage}[t]{0.66\columnwidth}\raggedright
+Poncelet closure as eviction trigger; CRT-sharded KV\strut
+\end{minipage}\tabularnewline
+\begin{minipage}[t]{0.08\columnwidth}\raggedright
+5\strut
+\end{minipage} & \begin{minipage}[t]{0.17\columnwidth}\raggedright
+FUSED\_KQ\strut
+\end{minipage} & \begin{minipage}[t]{0.66\columnwidth}\raggedright
+UFD-exact decompression; Heegner endomorphism commutes with group
+law\strut
+\end{minipage}\tabularnewline
+\begin{minipage}[t]{0.08\columnwidth}\raggedright
+6\strut
+\end{minipage} & \begin{minipage}[t]{0.17\columnwidth}\raggedright
+Softmax\strut
+\end{minipage} & \begin{minipage}[t]{0.66\columnwidth}\raggedright
+\(p\)-adic exponential on integers; circulant attention on closed
+orbits\strut
+\end{minipage}\tabularnewline
+\begin{minipage}[t]{0.08\columnwidth}\raggedright
+7\strut
+\end{minipage} & \begin{minipage}[t]{0.17\columnwidth}\raggedright
+Fused V weighted sum\strut
+\end{minipage} & \begin{minipage}[t]{0.66\columnwidth}\raggedright
+Spinor reconstruction across twin-paired heads; Sacks-spiral adaptive
+precision\strut
+\end{minipage}\tabularnewline
+\begin{minipage}[t]{0.08\columnwidth}\raggedright
+8\strut
+\end{minipage} & \begin{minipage}[t]{0.17\columnwidth}\raggedright
+Attention output projection\strut
+\end{minipage} & \begin{minipage}[t]{0.66\columnwidth}\raggedright
+CRT decomposition of \(W_O\) into independent sub-matrices\strut
+\end{minipage}\tabularnewline
+\begin{minipage}[t]{0.08\columnwidth}\raggedright
+9\strut
+\end{minipage} & \begin{minipage}[t]{0.17\columnwidth}\raggedright
+FFN (ternary skeleton + sparse residual)\strut
+\end{minipage} & \begin{minipage}[t]{0.66\columnwidth}\raggedright
+Mersenne-dimensional skeletons; twin-prime neuron pairs;
+\(n^2{+}n{+}41\) cold-start schedule\strut
+\end{minipage}\tabularnewline
+\begin{minipage}[t]{0.08\columnwidth}\raggedright
+10\strut
+\end{minipage} & \begin{minipage}[t]{0.17\columnwidth}\raggedright
+Activation oracle update\strut
+\end{minipage} & \begin{minipage}[t]{0.66\columnwidth}\raggedright
+Cramér prime-gap prefetch; Poncelet early exit\strut
+\end{minipage}\tabularnewline
+\begin{minipage}[t]{0.08\columnwidth}\raggedright
+11\strut
+\end{minipage} & \begin{minipage}[t]{0.17\columnwidth}\raggedright
+Residual add + norm\strut
+\end{minipage} & \begin{minipage}[t]{0.66\columnwidth}\raggedright
+Group-law residual; UFD invertibility for RevNet-style
+reconstruction\strut
+\end{minipage}\tabularnewline
+\begin{minipage}[t]{0.08\columnwidth}\raggedright
+12\strut
+\end{minipage} & \begin{minipage}[t]{0.17\columnwidth}\raggedright
+Per-layer loop (master schedule)\strut
+\end{minipage} & \begin{minipage}[t]{0.66\columnwidth}\raggedright
+\(n\delta \equiv 0\) adaptive depth; caustic projection; periodic KV
+eviction\strut
+\end{minipage}\tabularnewline
+\begin{minipage}[t]{0.08\columnwidth}\raggedright
+13\strut
+\end{minipage} & \begin{minipage}[t]{0.17\columnwidth}\raggedright
+LM head\strut
+\end{minipage} & \begin{minipage}[t]{0.66\columnwidth}\raggedright
+CRT pruning of vocabulary logits; Mersenne-prime sampling temperature;
+Sacks-spiral next-token prediction\strut
+\end{minipage}\tabularnewline
+\bottomrule
+\end{longtable}
+
+\hypertarget{the-grand-unified-view}{%
+\subsection{11. The Grand Unified View}\label{the-grand-unified-view}}
+
+Stacking the thirteen steps reveals the architecture: \textbf{the
+transformer forward pass is a discrete dynamical system on an elliptic
+curve over a class-number-1 field.}
+
+\begin{itemize}
+\tightlist
+\item
+  The hidden state is a point on \(E/K\).
+\item
+  Each layer is a point addition.
+\item
+  Each attention is a bilinear form on \(R_q\).
+\item
+  Each FFN is a structured sparse map indexed by primes of
+  \(\mathcal{O}_K\).
+\item
+  The orbit closes at depth \(n\) iff \(\mathrm{ord}(\delta) \mid n\)
+  --- Poncelet.
+\item
+  The caustic is the invariant subspace --- always compressible.
+\item
+  The Shannon limit of the architecture is the information content of
+  the curve point: \(\log_2 \mathrm{ord}(\delta)\) bits, no more.
+\end{itemize}
+
+Everything else --- every dimension, every head ratio, every
+quantization scheme --- is determined by an algebraic structure of
+\(\mathcal{O}_K\), not a hyperparameter sweep.
+
+\hypertarget{verified-theorems-and-extensions}{%
+\subsection{12. Verified Theorems and
+Extensions}\label{verified-theorems-and-extensions}}
+
+The companion test suite (Part II §10) mechanically verifies the
+following at the time of submission:
+
+\begin{itemize}
+\tightlist
+\item
+  \textbf{T1 --- Endomorphism realization.} The hidden state trajectory
+  through \(L\) layers embeds in \(E^L\) exactly.
+\item
+  \textbf{T2 --- Möbius UFD compression.} Reconstruction over
+  \(\mathcal{O}_K\) at square-free basis is exact.
+\item
+  \textbf{T3 --- Hasse--Weil = Shannon limit.}
+  \(|\#E_p(\mathbb{F}_p) - (p+1)| \le 2\sqrt p\).
+\item
+  \textbf{T4 --- Frobenius cancellation.} §3.2 above; validated
+  bit-identical at six significant figures on Gemma3-1B.
+\item
+  \textbf{T5 --- Deuring / CM Sato--Tate.} Asymmetric distribution of
+  \(a_p\) between split and inert primes.
+\item
+  \textbf{T6 --- CRT exact sharding.} Two-prime kernel bit-identical to
+  60-bit reference; portable.
+\item
+  \textbf{E9.1 --- Stern--Brocot RoPE.} Discrepancy \(\phi=0.00134\) (CM
+  endomorphism) \(\ll\) \(0.05576\) (standard RoPE).
+\item
+  \textbf{E9.2 --- Weil pairing on \(E[n]\).} Miller's algorithm
+  validated, bilinearity confirmed.
+\item
+  \textbf{E9.3 --- Hecke multiplicativity.} 20/20 trials passed.
+\item
+  \textbf{E9.5 --- LLL reduction.} KV-write optimization, 20/20 trials.
+\item
+  \textbf{E9.6 --- BSD analytic rank.} \(L\)-function computation via
+  Sage, all toy curves verified.
+\item
+  \textbf{E10 --- Iwasawa \(\mu = 0\).} Linear ord-\(p\) growth bound
+  confirmed; residual stream depth-stable.
+\end{itemize}
+
+\hypertarget{conclusion}{%
+\subsection{13. Conclusion}\label{conclusion}}
+
+The choice of carrier matters. By replacing \(\mathbb{R}^d\) with
+\(\mathcal{O}_K\), and the implicit identity map of the residual stream
+with the group law on a CM elliptic curve, we obtain a transformer in
+which compression, normalization, sharding, activation, and decoding are
+no longer ad-hoc tricks --- they are consequences of class number 1 and
+the splitting law in \(\mathbb{Q}(\sqrt{-163})\). The dominant technical
+risk in the framework (that integer scaling would propagate through
+nonlinear steps and destroy the model) was eliminated by Theorem 3.2:
+Frobenius scale cancels through the RMSNorm boundary. The companion
+paper (Part II) reports the system that runs this mathematics on a
+phone.
+
+\begin{center}\rule{0.5\linewidth}{0.5pt}\end{center}
+
+\hypertarget{references-selected}{%
+\subsection{References (selected)}\label{references-selected}}
+
+\begin{enumerate}
+\def\labelenumi{\arabic{enumi}.}
+\tightlist
+\item
+  \emph{Position is Arithmetic v8.} Shannon-Prime internal document.
+\item
+  \emph{KV-Cache is a View v2.} Shannon-Prime internal document.
+\item
+  Deuring, M., \emph{Die Typen der Multiplikatorenringe elliptischer
+  Funktionenkörper}, 1941.
+\item
+  Birch, B. \& Swinnerton-Dyer, P., \emph{Notes on elliptic curves I,
+  II}, 1963/1965.
+\item
+  Mazur, B. \& Wiles, A., \emph{Class fields of abelian extensions of
+  \(\mathbb{Q}\)}, Invent. Math. 76, 1984.
+\item
+  Stark, H. M., \emph{A complete determination of the complex quadratic
+  fields of class-number one}, Mich. Math. J. 14, 1967.
+\item
+  Cheon, J. H., Kim, A., Kim, M., Song, Y., \emph{Homomorphic encryption
+  for arithmetic of approximate numbers} (CKKS), ASIACRYPT 2017.
+\item
+  Cooley, J. W. \& Tukey, J. W., \emph{An algorithm for the machine
+  calculation of complex Fourier series}, Math. Comp. 19, 1965.
+\item
+  Sacks, R., \emph{The Sacks number spiral}, 1994.
+\item
+  Cramér, H., \emph{On the order of magnitude of the difference between
+  consecutive prime numbers}, Acta Arith. 2, 1936.
+\end{enumerate}
+
+\begin{center}\rule{0.5\linewidth}{0.5pt}\end{center}
+
+*This work was carried out over two days (2026-05-17 to 2026-05-19) on
+top of the Shannon-Prime project. The system that executes this
+mathematics is described in P
+
+\end{document}

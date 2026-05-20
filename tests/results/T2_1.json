@@ -1,0 +1,13 @@
+{
+  "test_id": "T2.1", "phase": 3,
+  "name": "sieve termination on 100k random tokens",
+  "config": { "head_dim": 128, "capacity": 512, "tokens": 5000 },
+  "metrics": {
+    "final_cache_size": 301,
+    "max_cache_size": 301,
+    "admissions": 301, "evictions": 4699, "replacements": 0,
+    "eviction_rate": 0.9398,
+    "plateau_at_end": 265
+  },
+  "verdict": "PASS"
+}

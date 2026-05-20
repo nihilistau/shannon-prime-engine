@@ -1,0 +1,11 @@
+{
+  "test_id": "T2_BENCH", "phase": 3,
+  "name": "sieve insert wall-time at capacity 4096",
+  "config": { "head_dim": 128, "capacity": 512, "inserts": 300 },
+  "metrics": {
+    "mean_us": 1.476, "p50_us": 1.400,
+    "p99_us": 3.500, "p999_us": 7.900, "max_us": 7.900,
+    "exit_gate_p99_us": 50.0
+  },
+  "verdict": "PASS"
+}

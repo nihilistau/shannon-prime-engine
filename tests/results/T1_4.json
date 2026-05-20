@@ -1,0 +1,10 @@
+{
+  "test_id": "T1.4", "phase": 1,
+  "name": "60-node budget enforced",
+  "config": { "head_dim": 128, "trials": 1000 },
+  "metrics": {
+    "max_nodes": 60, "min_nodes": 60, "mean_nodes": 60.00,
+    "budget": 60, "overflow": false
+  },
+  "verdict": "PASS"
+}

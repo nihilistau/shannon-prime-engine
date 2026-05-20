@@ -1,0 +1,6 @@
+{
+  "test_id": "T1.6_preview", "phase": 1,
+  "name": "self-embedding smoke",
+  "metrics": { "trials": 50, "embed_count": 50 },
+  "verdict": "PASS"
+}

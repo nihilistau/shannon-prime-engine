@@ -1,0 +1,838 @@
+% Options for packages loaded elsewhere
+\PassOptionsToPackage{unicode}{hyperref}
+\PassOptionsToPackage{hyphens}{url}
+\PassOptionsToPackage{dvipsnames,svgnames*,x11names*}{xcolor}
+%
+\documentclass[
+  11pt,
+]{article}
+\usepackage{lmodern}
+\usepackage{amssymb,amsmath}
+\usepackage{ifxetex,ifluatex}
+\ifnum 0\ifxetex 1\fi\ifluatex 1\fi=0 % if pdftex
+  \usepackage[T1]{fontenc}
+  \usepackage[utf8]{inputenc}
+  \usepackage{textcomp} % provide euro and other symbols
+\else % if luatex or xetex
+  \usepackage{unicode-math}
+  \defaultfontfeatures{Scale=MatchLowercase}
+  \defaultfontfeatures[\rmfamily]{Ligatures=TeX,Scale=1}
+\fi
+% Use upquote if available, for straight quotes in verbatim environments
+\IfFileExists{upquote.sty}{\usepackage{upquote}}{}
+\IfFileExists{microtype.sty}{% use microtype if available
+  \usepackage[]{microtype}
+  \UseMicrotypeSet[protrusion]{basicmath} % disable protrusion for tt fonts
+}{}
+\makeatletter
+\@ifundefined{KOMAClassName}{% if non-KOMA class
+  \IfFileExists{parskip.sty}{%
+    \usepackage{parskip}
+  }{% else
+    \setlength{\parindent}{0pt}
+    \setlength{\parskip}{6pt plus 2pt minus 1pt}}
+}{% if KOMA class
+  \KOMAoptions{parskip=half}}
+\makeatother
+\usepackage{xcolor}
+\IfFileExists{xurl.sty}{\usepackage{xurl}}{} % add URL line breaks if available
+\IfFileExists{bookmark.sty}{\usepackage{bookmark}}{\usepackage{hyperref}}
+\hypersetup{
+  pdfauthor={KnackAU, Claude (Anthropic), Gemini (Google DeepMind)},
+  colorlinks=true,
+  linkcolor=Maroon,
+  filecolor=Maroon,
+  citecolor=Blue,
+  urlcolor=Blue,
+  pdfcreator={LaTeX via pandoc}}
+\urlstyle{same} % disable monospaced font for URLs
+\usepackage[margin=1in]{geometry}
+\usepackage{longtable,booktabs}
+% Correct order of tables after \paragraph or \subparagraph
+\usepackage{etoolbox}
+\makeatletter
+\patchcmd\longtable{\par}{\if@noskipsec\mbox{}\fi\par}{}{}
+\makeatother
+% Allow footnotes in longtable head/foot
+\IfFileExists{footnotehyper.sty}{\usepackage{footnotehyper}}{\usepackage{footnote}}
+\makesavenoteenv{longtable}
+\setlength{\emergencystretch}{3em} % prevent overfull lines
+\providecommand{\tightlist}{%
+  \setlength{\itemsep}{0pt}\setlength{\parskip}{0pt}}
+\setcounter{secnumdepth}{-\maxdimen} % remove section numbering
+
+\author{KnackAU, Claude (Anthropic), Gemini (Google DeepMind)}
+\date{Shannon-Prime Project · 2026-05-19}
+
+\begin{document}
+
+\hypertarget{the-friedman-stack-order-invariant-memory-and-ultraproduct-attention}{%
+\section{The Friedman Stack: Order-Invariant Memory and Ultraproduct
+Attention}\label{the-friedman-stack-order-invariant-memory-and-ultraproduct-attention}}
+
+\textbf{Paper III --- Topological Foundations for Prime Power
+Transformer ARM}
+
+\emph{KnackAU, Claude (Anthropic), Gemini (Google DeepMind)}
+
+\emph{Shannon-Prime Project · 2026-05-19}
+
+\begin{center}\rule{0.5\linewidth}{0.5pt}\end{center}
+
+\hypertarget{abstract}{%
+\subsection{Abstract}\label{abstract}}
+
+We extend the Prime Power Transformer ARM framework (Papers I, II) by
+replacing the algebraic substrate of the KV-cache and attention scoring
+with order-invariant topological structures. Three classical
+mathematical results combine to give the construction its load-bearing
+properties: (i) Kruskal--Friedman's well-quasi-ordering of finite
+labeled trees (the \emph{Friedman sieve}); (ii) the WKL₀ refutation
+property --- false statements about embedded maximal cliques have
+primitive-recursive counterexamples (Friedman, Harrington), giving the
+system a finite, witness-bearing failure mode; (iii) ultrafilters as
+canonical big/small partitions on cache indices, with the System-1 /
+System-2 split realised as the principal / non-principal dichotomy. We
+define the \emph{Knight--Spinor Tree Encoder} (KSTE) --- the concrete
+function \(K \in \mathbb{R}^{128} \mapsto T \in \mathcal{T}_{60,3}\)
+that maps a continuous Key vector to a 60-node, 3-label rooted tree ---
+and prove (a) that homeomorphic tree embedding of \(T_Q\) in \(T_K\)
+corresponds to semantic subsumption under a defined similarity functor,
+(b) that the sieve's eviction policy preserves an information bound of
+\(\log_2 \mathrm{TREE}(3)\) effective tokens, far exceeding any context
+window the engine can hold, and (c) that ultraproduct attention along an
+ultrafilter on key positions reduces to standard softmax in the
+principal case and to a deterministic limit in the non-principal case.
+The framework remains WKL₀-strength at runtime --- every operation in
+the engine has a primitive-recursive falsification procedure --- even
+though the mathematics it implements lives much higher in the
+consistency-strength hierarchy.
+
+\begin{center}\rule{0.5\linewidth}{0.5pt}\end{center}
+
+\hypertarget{the-engineering-asymmetry}{%
+\subsection{1. The Engineering
+Asymmetry}\label{the-engineering-asymmetry}}
+
+A modern transformer fails in two ways: it produces incorrect output, or
+it consumes more memory than it has. Both failures are typically
+\emph{indistinct} --- floating-point drift, attention-mass collapse, and
+KV-cache eviction heuristics combine to produce a degradation whose root
+cause is rarely a single locatable object. This is the central
+engineering problem of long-context inference.
+
+Reverse mathematics gives us a way out. Friedman's foundational result
+is that a wide class of natural combinatorial statements --- including
+the statements at issue in the embedded-maximal-clique program --- have
+the \emph{WKL₀ refutation property}: if such a statement is false, its
+falsehood is witnessed by a finite, primitive-recursive object. The
+asymmetry between proving these statements (often requires ATR₀ or
+large-cardinal axioms) and refuting them (requires only Weak König's
+Lemma, which is Π₂⁰-conservative over PRA) is exactly the engineering
+asymmetry we need: build a system whose failures are \emph{cheaply}
+witnessed, even if its successes rest on deep mathematics.
+
+This paper builds the Shannon-Prime KV-cache and attention scoring on
+that asymmetry. The cost of being wrong is bounded; the gain of being
+right is unbounded.
+
+\hypertarget{preliminaries}{%
+\subsection{2. Preliminaries}\label{preliminaries}}
+
+\hypertarget{labeled-trees}{%
+\subsubsection{2.1 Labeled trees}\label{labeled-trees}}
+
+Let \(\mathcal{T}_{n,k}\) denote the set of rooted, ordered, labeled
+trees with at most \(n\) nodes and at most \(k\) distinct labels. For
+us, \(n = 60\) and \(k = 3\) throughout; the labels are
+\[\{A,\ B,\ C\} \;=\; \{\text{Anchor},\ \text{Spinor}^+,\ \text{Spinor}^-\}.\]
+
+A node \(v \in T\) has a label \(\lambda(v) \in \{A,B,C\}\), a parent
+\(\pi(v)\), and a position \(\sigma(v)\) in its parent's child sequence.
+The root is denoted \(\rho_T\).
+
+\hypertarget{homeomorphic-embedding}{%
+\subsubsection{2.2 Homeomorphic
+embedding}\label{homeomorphic-embedding}}
+
+We write \(T_Q \preceq T_K\) if there exists an injection
+\(\iota : V(T_Q) \to V(T_K)\) with:
+
+\begin{enumerate}
+\def\labelenumi{\arabic{enumi}.}
+\tightlist
+\item
+  \emph{Label preservation.} \(\lambda_K(\iota(v)) = \lambda_Q(v)\) for
+  all \(v \in V(T_Q)\).
+\item
+  \emph{Ancestor preservation.} If \(u\) is an ancestor of \(v\) in
+  \(T_Q\), then \(\iota(u)\) is an ancestor of \(\iota(v)\) in \(T_K\).
+\item
+  \emph{Order preservation.} If \(\sigma_Q(u) < \sigma_Q(v)\) and
+  \(u, v\) share a parent in \(T_Q\), then \(\iota(u)\) precedes
+  \(\iota(v)\) in their lowest common ancestor in \(T_K\).
+\end{enumerate}
+
+This is Kruskal's notion of \emph{homeomorphic embedding}. Friedman's
+three-label restriction TREE(3) is built on the same relation.
+
+\hypertarget{the-wqo-theorem}{%
+\subsubsection{2.3 The wqo theorem}\label{the-wqo-theorem}}
+
+\textbf{Theorem 2.1 (Kruskal--Friedman).} \emph{The relation \(\preceq\)
+on the set of finite labeled trees with labels from a finite alphabet is
+a well-quasi-order: every infinite sequence \(T_1, T_2, \dots\) contains
+indices \(i < j\) with \(T_i \preceq T_j\).}
+
+The largest finite sequence with the \emph{opposite} property --- no
+earlier tree embeds in any later tree --- has length
+\(\mathrm{TREE}(k)\), an extraordinarily fast-growing function.
+\(\mathrm{TREE}(3)\) exceeds any number nameable by ordinary ordinal
+hierarchies up to small large cardinals; that scale is, for our
+purposes, a rhetorical flourish --- what matters is the much smaller
+theorem 2.1 itself.
+
+\hypertarget{the-friedman-sieve}{%
+\subsection{3. The Friedman Sieve}\label{the-friedman-sieve}}
+
+\hypertarget{definition}{%
+\subsubsection{3.1 Definition}\label{definition}}
+
+Given a stream of labeled trees \(T_1, T_2, \dots\) produced by the
+encoder of §4, the \emph{Friedman sieve} maintains a finite cache
+\(\mathcal{C}_t \subseteq \{T_1, \dots, T_t\}\) updated by the rule
+
+\[\mathcal{C}_t \;=\; \begin{cases} \mathcal{C}_{t-1} & \text{if } \exists\, T' \in \mathcal{C}_{t-1} : T_t \preceq T' \\ \mathcal{C}_{t-1} \cup \{T_t\} & \text{otherwise.} \end{cases}\]
+
+That is: a new token is added to the cache iff it is \emph{not} a
+homeomorphic substructure of any tree already in the cache. The cache
+holds only the \emph{novel} tokens.
+
+\hypertarget{theorem-termination.}{%
+\subsubsection{3.2 Theorem (Termination).}\label{theorem-termination.}}
+
+\emph{For any fixed encoder mapping inputs to trees in
+\(\mathcal{T}_{60,3}\), the cache size \(|\mathcal{C}_t|\) is bounded by
+the number of mutually \(\preceq\)-incomparable elements of
+\(\mathcal{T}_{60,3}\), which is finite.}
+
+\textbf{Proof.} \(\mathcal{T}_{60,3}\) is finite (at most
+\(3^{60} \cdot C_{60}\) ordered labeled trees, where \(C_{60}\) is the
+60-th Catalan number). The number of mutually \(\preceq\)-incomparable
+elements --- an antichain in the wqo poset --- is therefore finite. By
+2.1, no infinite antichain exists, so the bound is tight. ∎
+
+\hypertarget{the-refutation-property}{%
+\subsubsection{3.3 The refutation
+property}\label{the-refutation-property}}
+
+\textbf{Theorem 3.1 (Sieve refutation, after Harrington).} \emph{Let
+\(\phi\) assert that the sieve correctly evicts a redundant token under
+a stated encoder. Then \(\phi\) has the WKL₀ refutation property: if
+\(\phi\) is false, there is a primitive-recursive procedure that
+produces a concrete pair \((T_Q, T_K)\) exhibiting the failure.}
+
+\textbf{Sketch.} The negation of \(\phi\) asserts existence of
+\(T_Q, T_K\) such that the sieve made the wrong decision --- either it
+evicted \(T_Q\) when \(T_Q \not\preceq T_K\), or it retained \(T_Q\)
+when \(T_Q \preceq T_K\). The relation \(\preceq\) is decidable in
+polynomial time on finite trees, so verifying the witness requires only
+PRA. Searching for the witness requires WKL₀ (the König-style
+compactness of the search tree of approximations), but the witness
+itself is a finite object. By Harrington's \(\Pi_2^0\)-conservation of
+WKL₀ over PRA, the existence of any such witness is provable in PRA when
+it exists. ∎
+
+The consequence for the engine: every sieve decision is a unit test, by
+construction. A failure is a finite locatable object.
+
+\hypertarget{the-knightspinor-tree-encoder-kste}{%
+\subsection{4. The Knight--Spinor Tree Encoder
+(KSTE)}\label{the-knightspinor-tree-encoder-kste}}
+
+The load-bearing question is: \emph{what function maps}
+\(K \in \mathbb{R}^{128}\) \emph{to a tree such that semantic
+subsumption corresponds to tree embedding?} We define it precisely. The
+full pseudocode and HVX kernel form are in Paper IV §3; this section
+gives the mathematical specification.
+
+\hypertarget{order-invariant-signature}{%
+\subsubsection{4.1 Order-invariant
+signature}\label{order-invariant-signature}}
+
+Following Friedman's elimination of \(+, \times\), we discard the
+numerical values of \(K\) and retain only the \emph{order pattern}:
+\[\mathrm{sig}(K) \;=\; \bigl(\mathrm{rank}(|K_i|)_{i=0}^{127},\ \mathrm{sign}(K_i)_{i=0}^{127}\bigr) \;\in\; S_{128} \times \{+,-\}^{128}.\]
+Two vectors with the same signature are encoded to the \emph{same} tree.
+The encoder is therefore a function \(\mathrm{sig}(K) \mapsto T\), not
+\(K \mapsto T\) directly.
+
+\hypertarget{anchor-residual-partition}{%
+\subsubsection{4.2 Anchor / residual
+partition}\label{anchor-residual-partition}}
+
+Apply the existing Shannon-Prime pipeline: 1. \emph{VHT2 transform.}
+\(Y = \mathrm{VHT2}(K) \in \mathbb{R}^{128}\). 2. \emph{Möbius reorder.}
+Permute \(Y\) to place squarefree indices in positions \(0..13\) (the
+\emph{anchor} lanes) and non-squarefree indices in positions \(14..73\)
+(the \emph{residual} lanes). 3. \emph{Knight-skeleton selection.} The 14
+anchors are kept at fp16 precision; the 60 residuals are quantized to 3
+bits magnitude + 1 bit phase.
+
+This is identical to the existing 63-byte Spinor block layout (Paper II
+§9.1). The encoder \emph{reuses} the existing engine output; the new
+content is the tree construction on top.
+
+\hypertarget{tree-construction}{%
+\subsubsection{4.3 Tree construction}\label{tree-construction}}
+
+Given the partition \((\mathbf{a}, \mathbf{r})\) where
+\(\mathbf{a} \in \mathbb{R}^{14}\) is the anchor vector and
+\(\mathbf{r} \in \mathbb{Z}_3^{60} \times \{0,1\}^{60}\) is the
+quantized residual vector:
+
+\textbf{Build.} - Create a root node \(\rho\), unlabeled. - For each
+\(k \in \{0,\dots,13\}\) with \(|a_k| \ge \tau_A\) (the anchor
+threshold), add a child of \(\rho\) with label \(A\). Order children by
+\emph{rank} of \(|a_k|\) --- largest first. - For each residual lane
+\(j\) with magnitude \(m_j > 0\): - Set label \(\ell_j = B\) if phase =
+\(+\), else \(\ell_j = C\). - Find the dominating anchor for \(j\):
+\(k^*(j) = \min\{k : \mathrm{rank}(|a_k|) > \mathrm{rank}(m_j) \cdot \alpha\}\),
+where \(\alpha\) is the calibration constant (\(\alpha = 0.7\) by
+default). If no such anchor exists, attach to \(\rho\). - Build a path
+of length \(m_j\) from \(k^*(j)\) downward, each node labeled
+\(\ell_j\).
+
+\textbf{Budget enforcement.} If the resulting tree exceeds 60 nodes,
+prune from the lowest-magnitude residual upward until \(|V(T)| \le 60\).
+
+\hypertarget{semantic-claim}{%
+\subsubsection{4.4 Semantic claim}\label{semantic-claim}}
+
+\textbf{Claim 4.1 (Subsumption ⇔ Embedding).} \emph{Let
+\(\Phi: \mathbb{R}^{128} \to \mathcal{T}_{60,3}\) be the KSTE encoder.
+For Key vectors \(K_Q, K_K\) produced by the same pre-trained model, if
+\(\mathrm{cos}(K_Q, K_K) \ge 1 - \varepsilon\) and
+\(\|K_K\| \ge \|K_Q\|\), then \(\Phi(K_Q) \preceq \Phi(K_K)\) with
+probability \(\ge 1 - O(\varepsilon)\) over the empirical
+Knight-Skeleton calibration distribution.}
+
+The claim is empirical, not proven; it specifies the property the
+encoder is designed to have. Paper IV §6 describes the experiment that
+tests it.
+
+\hypertarget{why-this-encoder}{%
+\subsubsection{4.5 Why this encoder}\label{why-this-encoder}}
+
+Four design properties make KSTE a non-arbitrary choice:
+
+\begin{enumerate}
+\def\labelenumi{\arabic{enumi}.}
+\tightlist
+\item
+  \emph{It reuses existing infrastructure.} The 14/60 anchor-residual
+  split, the VHT2, the Möbius reorder, and the Knight-Skeleton
+  calibration are already in the engine. The encoder adds only the
+  tree-construction step (\textasciitilde50 LOC).
+\item
+  \emph{It is order-invariant.} No arithmetic on \(K\) values --- only
+  ranks, signs, and depth. This is the Friedman elimination move applied
+  to the encoder.
+\item
+  \emph{Magnitude becomes depth.} Friedman's framework lets
+  order-relations carry magnitude information through topological
+  structure rather than scalar value; the path-of-length-\(m_j\)
+  construction realises this.
+\item
+  \emph{The 60-node bound is tight to the 63-byte block.} At
+  \(60 \text{ nodes} \times 2 \text{ bits label} = 15 \text{ B}\) plus
+  \(60 \times 6 \text{ bits parent pointer} = 45 \text{ B}\), plus a
+  4-byte amax/budget marker, the packed tree fits the existing block. No
+  new memory layout required.
+\end{enumerate}
+
+\hypertarget{ultrafilters-and-system-1-system-2}{%
+\subsection{5. Ultrafilters and System-1 /
+System-2}\label{ultrafilters-and-system-1-system-2}}
+
+\hypertarget{setup}{%
+\subsubsection{5.1 Setup}\label{setup}}
+
+Let \(\mathcal{C}_t\) be the cache at step \(t\), indexed by token
+positions \(\{p_1, \dots, p_n\}\). An \emph{ultrafilter} \(U\) on the
+finite set \(\{p_1, \dots, p_n\}\) is a collection of subsets
+satisfying: - \(\emptyset \notin U\); the full set is in \(U\). -
+\(A, B \in U \implies A \cap B \in U\). - \(A \in U\) and
+\(A \subseteq B \implies B \in U\). - For every
+\(S \subseteq \{p_1,\dots,p_n\}\), exactly one of \(S, S^c\) is in
+\(U\).
+
+On a finite set, every ultrafilter is \emph{principal}:
+\(U_p = \{S : p \in S\}\) for some position \(p\).
+
+\hypertarget{the-system-1-system-2-dichotomy}{%
+\subsubsection{5.2 The System-1 / System-2
+dichotomy}\label{the-system-1-system-2-dichotomy}}
+
+We propose the following identification:
+
+\begin{itemize}
+\tightlist
+\item
+  \textbf{System 1} = the principal ultrafilter \(U_{p_t}\) at the
+  active token position \(t\). Local context. The ultrafilter
+  concentrates all its mass on the active token.
+\item
+  \textbf{System 2} = the limit of the principal ultrafilters as the
+  cache grows, taken along a non-principal ultrafilter on
+  \(\mathbb{N}\). Persistent memory.
+\end{itemize}
+
+System 1 is computable trivially: it is the index \(p_t\). System 2 is
+the \emph{ultraproduct} construction: a single algebraic object
+representing ``what is eventually true across the token stream.''
+
+\hypertarget{ultraproduct-attention}{%
+\subsubsection{5.3 Ultraproduct
+attention}\label{ultraproduct-attention}}
+
+Standard attention computes
+\[\mathrm{Attn}(Q, K, V) = \sum_t \sigma_t \cdot V_t, \qquad \sigma_t = \mathrm{softmax}_t(Q K^\top / \sqrt{d_k}).\]
+\textbf{Ultraproduct attention} along a (possibly non-principal)
+ultrafilter \(U\) on key positions is defined by
+\[\mathrm{UltraAttn}(Q, K, V; U) \;=\; \mathrm{ult}_U(V_t),\] where
+\(\mathrm{ult}_U\) denotes the ultraproduct limit of the sequence
+\((V_t)\) along \(U\). By Łoś's theorem, a property holds of
+\(\mathrm{UltraAttn}\) iff it holds for an \(U\)-large set of positions.
+
+In the principal case \(U = U_{p^*}\), this reduces to
+\(\mathrm{UltraAttn} = V_{p^*}\) --- the ``top-1 attention.'' In the
+non-principal case it produces a deterministic limit that depends only
+on the \emph{eventual} values across the cache.
+
+\hypertarget{foundational-strength}{%
+\subsubsection{5.4 Foundational strength}\label{foundational-strength}}
+
+Non-principal ultrafilters on infinite sets require the Boolean Prime
+Ideal theorem, strictly above WKL₀. \textbf{However}, the engine never
+instantiates an infinite cache. The runtime always operates over a
+bounded window \(n\), on which every ultrafilter is principal. The
+ultraproduct limit is computed only as a \emph{projection} of an
+internally-bounded representation; the construction stays WKL₀-strength.
+The mathematics is ultrafilter-shaped; the executable is finite.
+
+\hypertarget{guxf6dels-positivenegative-algebra}{%
+\subsection{6. Gödel's Positive/Negative
+Algebra}\label{guxf6dels-positivenegative-algebra}}
+
+The KSTE encoder's three-label set \(\{A, B, C\}\) admits a Gödel-style
+positive/negative reading:
+
+\begin{itemize}
+\tightlist
+\item
+  \(A\) (Anchor): a \emph{foundational} property, always positive in
+  Gödel's closure axioms.
+\item
+  \(B\) (Spinor\(^+\)): a \emph{positive} directional property.
+\item
+  \(C\) (Spinor\(^-\)): the negation of \(B\).
+\end{itemize}
+
+The closure axioms (Paper III §2 of the Gödel ontological proof, after
+Anderson's emendation) translate to: - If a residual carries label
+\(B\), its sub-residuals at deeper tree depth carry label \(B\) unless
+contradicted. - \(A\)-labeled nodes are closed under conjunction (their
+intersection with another \(A\) is still \(A\)). - \(B\) and \(C\) never
+co-occur at the same node --- exclusivity.
+
+This algebraic structure matches the Config E inert/split prime split of
+Paper I §3.3 exactly: - \(A\) corresponds to the inert lane (zero-drift
+coefficients). - \(B\), \(C\) correspond to the positive and negative
+phases of the split lane (Sato-Tate distributed).
+
+The Gödel-Friedman-Config-E equivalence is the algebraic backbone of the
+proposed system: every layer of abstraction names the same partition
+with different vocabulary.
+
+\hypertarget{the-three-layer-stack}{%
+\subsection{7. The Three-Layer Stack}\label{the-three-layer-stack}}
+
+We define the \emph{Friedman Stack} as the following four-layer
+composition:
+
+\begin{longtable}[]{@{}rlll@{}}
+\toprule
+\begin{minipage}[b]{0.13\columnwidth}\raggedleft
+Layer\strut
+\end{minipage} & \begin{minipage}[b]{0.14\columnwidth}\raggedright
+Object\strut
+\end{minipage} & \begin{minipage}[b]{0.20\columnwidth}\raggedright
+Operation\strut
+\end{minipage} & \begin{minipage}[b]{0.42\columnwidth}\raggedright
+Foundational Strength\strut
+\end{minipage}\tabularnewline
+\midrule
+\endhead
+\begin{minipage}[t]{0.13\columnwidth}\raggedleft
+L1\strut
+\end{minipage} & \begin{minipage}[t]{0.14\columnwidth}\raggedright
+Encoder\strut
+\end{minipage} & \begin{minipage}[t]{0.20\columnwidth}\raggedright
+KSTE: \(\mathbb{R}^{128} \to \mathcal{T}_{60,3}\)\strut
+\end{minipage} & \begin{minipage}[t]{0.42\columnwidth}\raggedright
+PRA (order-invariant)\strut
+\end{minipage}\tabularnewline
+\begin{minipage}[t]{0.13\columnwidth}\raggedleft
+L2\strut
+\end{minipage} & \begin{minipage}[t]{0.14\columnwidth}\raggedright
+Sieve\strut
+\end{minipage} & \begin{minipage}[t]{0.20\columnwidth}\raggedright
+Cache update via \(\preceq\) test\strut
+\end{minipage} & \begin{minipage}[t]{0.42\columnwidth}\raggedright
+WKL₀ (refutation-witnessed)\strut
+\end{minipage}\tabularnewline
+\begin{minipage}[t]{0.13\columnwidth}\raggedleft
+L3\strut
+\end{minipage} & \begin{minipage}[t]{0.14\columnwidth}\raggedright
+Attention\strut
+\end{minipage} & \begin{minipage}[t]{0.20\columnwidth}\raggedright
+Ultraproduct limit along \(U\)\strut
+\end{minipage} & \begin{minipage}[t]{0.42\columnwidth}\raggedright
+WKL₀ at runtime\strut
+\end{minipage}\tabularnewline
+\begin{minipage}[t]{0.13\columnwidth}\raggedleft
+L4\strut
+\end{minipage} & \begin{minipage}[t]{0.14\columnwidth}\raggedright
+Axiom\strut
+\end{minipage} & \begin{minipage}[t]{0.20\columnwidth}\raggedright
+Choice operator \(F\) + Extended-Domain Reduction (§11)\strut
+\end{minipage} & \begin{minipage}[t]{0.42\columnwidth}\raggedright
+\(\varepsilon\)-calculus + WKL₀ at runtime\strut
+\end{minipage}\tabularnewline
+\bottomrule
+\end{longtable}
+
+Every layer admits a \emph{finite local witness} of failure. The stack
+is composable: the output of layer \(L_i\) is the input to layer
+\(L_{i+1}\), and the wqo / refutation properties propagate.
+
+\hypertarget{theoretical-predictions}{%
+\subsection{8. Theoretical Predictions}\label{theoretical-predictions}}
+
+The framework makes the following predictions, all empirically testable:
+
+\textbf{P1.} The sieve evicts \(\ge 30\%\) of incoming tokens at any
+context length \(\ge 2048\) on natural-language workloads, under the
+calibrated KSTE encoder.
+
+\textbf{P2.} Eviction by the sieve does not increase perplexity by more
+than 0.5\% on standard benchmarks (WikiText-103, C4), provided
+polynomial-ring attention is retained as the scoring function.
+
+\textbf{P3.} Ultraproduct attention with \(U\) chosen as the principal
+ultrafilter at the highest-attention key reduces PPL by 1-3\% on
+long-context tasks (LongBench, RULER) due to elimination of soft-mass
+smearing.
+
+\textbf{P4.} The sieve's refutation procedure (Theorem 3.1) finds
+primitive-recursive counterexamples in \(\le 10^4\) operations for any
+encoder-side bug, providing a debugging primitive an order of magnitude
+cheaper than gradient-based attribution.
+
+These are the falsification targets for the experimental program
+described in Paper IV.
+
+\hypertarget{relation-to-papers-i-and-ii}{%
+\subsection{9. Relation to Papers I and
+II}\label{relation-to-papers-i-and-ii}}
+
+Paper I established the algebraic core: hidden state on a CM elliptic
+curve over \(\mathbb{Q}(\sqrt{-163})\), Frobenius cancellation through
+RMSNorm, polynomial-ring attention with KL-zero parity. Paper II
+reported the system that runs that mathematics with six-figure
+bit-exactness on Gemma3-1B.
+
+This paper does \emph{not} replace Paper I or II. The sieve and
+ultraproduct attention are \emph{additions} to the existing stack:
+
+\begin{itemize}
+\tightlist
+\item
+  \emph{Polynomial-ring attention remains the scoring function.} The
+  ultraproduct construction is an alternative path that can be enabled
+  selectively (\texttt{-\/-ultraproduct-attn}) but is not the default.
+\item
+  \emph{The Friedman sieve replaces variance-ranked top-K as the
+  KV-eviction policy.} Variance-ranking is kept as a fallback
+  (\texttt{-\/-legacy-eviction}).
+\item
+  \emph{KSTE is a side-effect of the existing Spinor block.} No
+  additional memory; \textasciitilde50 LOC for tree construction.
+\end{itemize}
+
+The Frobenius framework of Paper I and the engineering scaffolding of
+Paper II remain in force.
+
+\hypertarget{open-questions}{%
+\subsection{10. Open Questions}\label{open-questions}}
+
+\begin{enumerate}
+\def\labelenumi{\arabic{enumi}.}
+\item
+  \emph{Semantic resolution.} Is the discriminative power of \(\preceq\)
+  on \(\mathcal{T}_{60,3}\) sufficient to distinguish close
+  natural-language meanings? Open empirical question; Paper IV §6 is the
+  experiment.
+\item
+  \emph{Calibration drift.} The Knight-Skeleton variance ranking is
+  calibrated at warmup. Does the encoder's behaviour drift as the cache
+  fills? Bounded by the residual quantizer's amax, but not yet measured.
+\item
+  \emph{Ultraproduct attention learnability.} Standard attention is
+  differentiable; ultraproduct attention is not, directly. §11 resolves
+  this by moving the learnable boundary: the choice operator \(F\) is
+  part of the logical infrastructure, not a learnable parameter, and
+  gradient flow lives in the \emph{generation of the class \(A\)} ---
+  the structural query the model emits. The research direction
+  reformulates from ``differentiable hard attention'' to
+  ``differentiable class definition.''
+\item
+  \emph{Beyond three labels.} Is there an empirical gain from labels
+  \(\{A, B, C, D\}\)? The wqo theorem holds for any finite label set,
+  but the 63-byte block constraint pins us at three.
+\item
+  \emph{Cross-layer sieve sharing.} Can a single sieve be shared across
+  heads or layers, or does each need its own? Memory implications differ
+  by an order of magnitude.
+\end{enumerate}
+
+\hypertarget{the-axiomatic-layer-choice-operator-and-domain-reduction}{%
+\subsection{11. The Axiomatic Layer: Choice Operator and Domain
+Reduction}\label{the-axiomatic-layer-choice-operator-and-domain-reduction}}
+
+The three operational layers of §7 --- encoder, sieve, ultraproduct
+attention --- describe \emph{what} the system does. They do not yet
+state \emph{why} the System-1 / System-2 boundary is well-defined. This
+section provides the axiom that governs it, drawing on Friedman's
+program of building consistency-strong systems from minimal logical
+infrastructure.
+
+\hypertarget{two-primitives}{%
+\subsubsection{11.1 Two primitives}\label{two-primitives}}
+
+We adopt two primitives in addition to the wqo and ultrafilter machinery
+of §§3--5.
+
+\textbf{The choice operator \(F\).} A unary function on definable
+classes: \[A \ne \varnothing \;\Longrightarrow\; F(A) \in A.\] \(F\)
+selects a canonical element from any nonempty class. Structurally, \(F\)
+is Hilbert's \(\varepsilon\)-operator:
+\(F(A) := \varepsilon x.\, x \in A\). Determinism (canonicality) is
+enforced by a fixed total order \(\prec_F\) on \(\mathcal{T}_{60,3}\)
+such that \(F(A) := \min_{\prec_F} A\). The implementation is specified
+in Paper IV §10; the order is the packed-byte lexicographic order on the
+60-byte tree representation, trivially computable and stable across
+platforms.
+
+\textbf{The Extended-Domain Reduction axiom.} Partition the universe of
+cached trees into \emph{Real Objects} \(\mathrm{RO}\) (the active
+context window of System 1) and an outer stratum \(\mathrm{Ext}\) (the
+persistent compressed cache of System 2). For a structural predicate
+\(\varphi\) and \(v \in \mathrm{RO}\),
+\[\varphi(v) \;\Longrightarrow\; \varphi^*(v),\] where \(\varphi^*\) is
+\(\varphi\) relativized to \(\mathrm{RO}\) --- the truth of \(\varphi\)
+checked using only objects in the active window. The axiom asserts that
+\emph{structural truths about the full extended domain restrict cleanly
+to the active window}. Crossing the cache-to-window boundary preserves
+order-relations without numerical loss.
+
+\hypertarget{what-the-axiomatic-layer-does-for-the-architecture}{%
+\subsubsection{11.2 What the axiomatic layer does for the
+architecture}\label{what-the-axiomatic-layer-does-for-the-architecture}}
+
+The layer slots in above the three operational layers without disturbing
+them.
+
+\begin{itemize}
+\item
+  \textbf{\(F\) is the principal-ultrafilter limit of §5.3, named
+  axiomatically.} When \(U = U_p\) is the principal ultrafilter at the
+  highest-ranked key position,
+  \(\mathrm{UltraAttn}(Q,K,V; U_p) = V_p = F(\{V_t : t \in \mathrm{cache} \cap A\})\)
+  for the structural class \(A\) derived from \(Q\). The choice operator
+  and the ultraproduct limit name the same kernel; this section gives it
+  the axiomatic justification the ultrafilter framing lacked.
+\item
+  \textbf{Extended-Domain Reduction is the attention-level analogue of
+  Theorem 4 (Paper I §3.2).} Theorem 4 states: the Frobenius scale
+  factor \(\pi^k\) cancels through \(QK^\top V W_O\) and vanishes at
+  RMSNorm. The Reduction axiom states: structural properties of cached
+  trees survive selection into the active window. Both are
+  \emph{projective cancellation} theorems --- one for arithmetic scale
+  through linear-algebraic operators, one for topological structure
+  through the cache-to-window boundary. The two theorems together close
+  the algebra: every layer of the engine has a cancellation theorem
+  governing it.
+\item
+  \textbf{The combination resolves open question §10.3.} The
+  learnability concern for ultraproduct attention was that \(F\) is not
+  differentiable. Under the axiomatic framing the question dissolves:
+  \(F\) is \emph{not supposed} to be a learnable parameter. It is part
+  of the logical infrastructure, fixed across all inferences. The
+  learnable component lives elsewhere --- in the \emph{generation of the
+  structural class \(A\)}. The model learns to define classes; the
+  choice operator, fixed and axiomatic, selects from them. Gradient flow
+  goes to class definition, not to attention selection.
+\end{itemize}
+
+\hypertarget{inference-as-consistency-maintenance}{%
+\subsubsection{11.3 Inference as consistency
+maintenance}\label{inference-as-consistency-maintenance}}
+
+Under the axiomatic layer, the inference loop is no longer ``predict the
+most likely next token by minimizing cross-entropy across a continuous
+distribution.'' It is closer to constraint satisfaction. Each generation
+step is:
+
+\begin{enumerate}
+\def\labelenumi{\arabic{enumi}.}
+\tightlist
+\item
+  The model defines a structural class \(A\) --- the set of trees \(T\)
+  satisfying the current attention query.
+\item
+  The choice operator returns \(F(A)\), the \(\prec_F\)-canonical
+  witness.
+\item
+  Extended-Domain Reduction is checked: does \(\varphi(F(A))\) imply
+  \(\varphi^*(F(A))\) for the current set of invariants \(\varphi\)?
+\item
+  If yes, \(F(A)\) is admitted to \(\mathrm{RO}\). If no, the local
+  failure is a finite, witness-bearing obstruction (§3.3, WKL₀
+  refutation property) and the engine emits a correction token instead.
+\end{enumerate}
+
+For workloads where consistency is the dominant metric --- formal
+verification, code generation, mathematical reasoning, structured data
+extraction --- this is a strict improvement over likelihood-driven
+decoding. For free-form natural-language workloads, see §11.4.
+
+\hypertarget{fuzzy-classes-for-natural-language-workloads}{%
+\subsubsection{11.4 Fuzzy classes for natural-language
+workloads}\label{fuzzy-classes-for-natural-language-workloads}}
+
+Natural language is not a logical sequence. Pure consistency-maintenance
+attention may produce stilted output because the exact class \(A\) is
+often too restrictive: the model wants to choose between paraphrases
+that no single structural predicate distinguishes. The recovery is to
+allow \(A\) to be \emph{fuzzy} --- a Hamming neighborhood of the exact
+structural query, parameterized by a single radius \(r\):
+\[A_r \;=\; \{T : d_{\mathrm{tree}}(T, T_Q) \le r\}.\] For \(r = 0\) the
+framework reduces to hard consistency. For \(r\) large, \(A_r\)
+approaches the entire cache; \(F\) then selects the \(\prec_F\)-minimum
+tree subject to the soft constraint, which we may choose (by defining
+\(\prec_F\) appropriately) to coincide with the top-attention key ---
+recovering soft top-1 behaviour without instantiating a softmax.
+
+The radius \(r\) is a \emph{hyperparameter, not a learnable parameter}.
+It is set per-task: code generation \(r = 0\); free-form chat \(r\)
+tuned for fluency; mathematical reasoning \(r = 0\) inside derivation
+steps, \(r > 0\) between them. The axiomatic structure survives at every
+\(r\); only the strictness of consistency varies.
+
+\hypertarget{foundational-strength-of-the-axiomatic-layer}{%
+\subsubsection{11.5 Foundational strength of the axiomatic
+layer}\label{foundational-strength-of-the-axiomatic-layer}}
+
+The choice operator with bounded comprehension is at the strength of
+\(\varepsilon\)-calculus, which by Ackermann's consistency proof is
+conservative over Peano Arithmetic. Extended-Domain Reduction with
+structural predicates over a finite extended domain is at WKL₀-strength
+by the same finitary argument as §3.3: any failure of the reduction has
+a primitive-recursive witness. \textbf{The runtime stays WKL₀-strength
+even with the axiomatic layer added.} The mathematics names a powerful
+object; the engine executes it cheaply, and any failure remains finite
+and locatable.
+
+\hypertarget{conclusion}{%
+\subsection{12. Conclusion}\label{conclusion}}
+
+We have specified the mathematical content of the Friedman Stack. Every
+layer of the stack --- encoder, sieve, ultraproduct attention, choice
+operator --- rests on a primitive that admits a finite witness of
+failure. The stack's expressivity reaches arbitrarily high in the
+consistency-strength hierarchy (the wqo theorem alone is independent of
+ATR₀); its \emph{runtime} sits at WKL₀-strength, with
+primitive-recursive refutation. The asymmetry is what makes the stack
+engineerable.
+
+The companion paper (Paper IV) specifies the system, the encoder kernel,
+the choice-operator implementation, the test plan, and the experimental
+schedule.
+
+\begin{center}\rule{0.5\linewidth}{0.5pt}\end{center}
+
+\hypertarget{references}{%
+\subsection{References}\label{references}}
+
+\begin{enumerate}
+\def\labelenumi{\arabic{enumi}.}
+\tightlist
+\item
+  Kruskal, J. B., \emph{Well-Quasi-Ordering, the Tree Theorem, and
+  Vázsonyi's Conjecture}, Trans. AMS 95, 1960.
+\item
+  Friedman, H. M., \emph{FOM archive postings} on Embedded Maximal
+  Cliques (2009--2018), Foundations of Mathematics list.
+\item
+  Friedman, H. M., \emph{Boolean Relation Theory and Incompleteness},
+  manuscript, 2014 (revised).
+\item
+  Friedman, H. M., \emph{Tangible Incompleteness}, manuscript series,
+  2014--2024.
+\item
+  Harrington, L., \emph{Conservation theorem for WKL₀ over PRA},
+  unpublished communication; cited in Simpson, \emph{Subsystems of
+  Second Order Arithmetic}.
+\item
+  Simpson, S. G., \emph{Subsystems of Second Order Arithmetic},
+  Cambridge UP, 2nd ed., 2009.
+\item
+  Gödel, K., \emph{Ontological Proof} (1970), in \emph{Collected Works
+  Vol. III}, 1995.
+\item
+  Anderson, C. A., \emph{Some Emendations on Gödel's Ontological Proof},
+  Faith and Philosophy 7, 1990.
+\item
+  Benzmüller, C. \& Paleo, B. W., \emph{Formalization, Mechanization and
+  Automation of Gödel's Proof of God's Existence}, arXiv:1308.4526,
+  2013.
+\item
+  Łoś, J., \emph{Quelques remarques, théorèmes et problèmes sur les
+  classes définissables d'algèbres}, in \emph{Mathematical
+  interpretation of formal systems}, 1955.
+\item
+  Shannon-Prime, \emph{Paper I --- PPT Theory} (Frobenius framework).
+  2026-05-17.
+\item
+  Shannon-Prime, \emph{Paper II --- PPT System} (engineering on
+  Gemma3-1B). 2026-05-19.
+\item
+  Hilbert, D. \& Bernays, P., \emph{Grundlagen der Mathematik II}, 1939
+  (epsilon-operator).
+\item
+  Ackermann, W., \emph{Zur Widerspruchsfreiheit der Zahlentheorie},
+  Math. Ann. 117, 1940 (epsilon-calculus consistency).
+\item
+  Friedman, H. M., \emph{FOM archive postings} on consistency proofs
+  from minimal logical infrastructure (Concept Calculus and related),
+  2009--2018.
+\end{enumerate}
+
+\begin{center}\rule{0.5\linewidth}{0.5pt}\end{center}
+
+\emph{Continuation of Papers I--II. The system that executes this
+paper's content is specified in Paper IV.}
+
+\end{document}

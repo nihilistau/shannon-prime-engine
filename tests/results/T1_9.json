@@ -1,0 +1,7 @@
+{
+  "test_id": "T1.9", "phase": 2,
+  "name": "antisymmetry on canonical forms",
+  "config": { "head_dim": 128, "trials": 100 },
+  "metrics": { "canonical_match": 100 },
+  "verdict": "PASS"
+}

@@ -1,0 +1,11 @@
+{
+  "test_id": "T1_BENCH", "phase": 2,
+  "name": "embed wall-time (random pairs)",
+  "config": { "head_dim": 128, "pairs": 999, "warmup": 64 },
+  "metrics": {
+    "mean_us": 8.526, "p50_us": 4.300,
+    "p99_us": 83.800, "p999_us": 171.100, "max_us": 350.500,
+    "embed_yes_count": 0, "exit_gate_p99_us": 100.0
+  },
+  "verdict": "PASS"
+}

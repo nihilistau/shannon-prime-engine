@@ -1,0 +1,9 @@
+{
+  "test_id": "T2.7", "phase": 3,
+  "name": "admission on novelty",
+  "metrics": {
+    "admitted_pre": 87, "new_decision": 0,
+    "final_cache_size": 87
+  },
+  "verdict": "FAIL"
+}

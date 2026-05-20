@@ -1,0 +1,15 @@
+{
+  "phase": 3,
+  "results": [
+    { "id": "T2.6", "name": "eviction on subsumption", "verdict": "PASS" },
+    { "id": "T2.7", "name": "admission on novelty", "verdict": "FAIL" },
+    { "id": "T2.8", "name": "Knight-Skeleton fallback", "verdict": "PASS" },
+    { "id": "T2.5", "name": "closure axiom", "verdict": "PASS" },
+    { "id": "T2.12", "name": "Extended-Domain Reduction", "verdict": "PASS" },
+    { "id": "T2.1", "name": "termination", "verdict": "PASS" },
+    { "id": "T2.9", "name": "pre-filter correctness", "verdict": "PASS" },
+    { "id": "T2.10", "name": "pre-filter precision", "verdict": "PASS" },
+    { "id": "T2.11", "name": "wall-time at capacity 4096", "verdict": "PASS" },
+    { "id": "T2.BENCH", "name": "sieve insert wall-time", "verdict": "PASS" }
+  ]
+}

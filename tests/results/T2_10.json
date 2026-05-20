@@ -1,0 +1,11 @@
+{
+  "test_id": "T2.10", "phase": 5,
+  "name": "pre-filter precision (>= 90%)",
+  "config": { "head_dim": 128, "pairs": 10000, "trees": 300 },
+  "metrics": {
+    "total_negatives": 9965,
+    "filter_rejected": 9849, "precision": 0.9884,
+    "tier0_rejected": 9696, "tier1_rejected": 153
+  },
+  "verdict": "PASS"
+}

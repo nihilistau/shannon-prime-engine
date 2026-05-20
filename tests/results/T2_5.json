@@ -1,0 +1,11 @@
+{
+  "test_id": "T2.5", "phase": 3,
+  "name": "closure axiom (big-subset intersection)",
+  "config": { "head_dim": 128, "cache_size": 200 },
+  "metrics": {
+    "median_skel_var": 12.6213,
+    "big_count": 100,
+    "intersection_witness_count": 100
+  },
+  "verdict": "PASS"
+}

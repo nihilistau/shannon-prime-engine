@@ -1,0 +1,13 @@
+{
+  "test_id": "T1.10", "phase": 2,
+  "name": "backtracking necessity (adversarial pair)",
+  "config": {
+    "Q": "root -> A -> C, root -> B",
+    "K": "root -> [A1 leaf, A2 -> C, B]"
+  },
+  "metrics": {
+    "result": 1, "backtracks": 1,
+    "steps": 5, "max_depth": 3, "capped": 0
+  },
+  "verdict": "PASS"
+}

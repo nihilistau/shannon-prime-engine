@@ -1,0 +1,7 @@
+{
+  "test_id": "T1.2", "phase": 1,
+  "name": "order-invariance under Frobenius shim",
+  "config": { "head_dim": 128, "frobenius": "p=41,k=8", "scale": 2825761, "trials": 100 },
+  "metrics": { "bit_identical": true },
+  "verdict": "PASS"
+}

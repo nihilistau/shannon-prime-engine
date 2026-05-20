@@ -1,0 +1,16 @@
+{
+  "phase": 2,
+  "results": [
+    { "id": "T1.1", "name": "encoder determinism", "verdict": "PASS" },
+    { "id": "T1.2", "name": "Frobenius order-invariance", "verdict": "PASS" },
+    { "id": "T1.3", "name": "sign-respecting (B<->C swap)", "verdict": "PASS" },
+    { "id": "T1.4", "name": "60-node budget enforced", "verdict": "PASS" },
+    { "id": "T1.5", "name": "anchor count 14 +/- 2", "verdict": "PASS" },
+    { "id": "T1.6", "name": "self-embedding (1000 trees)", "verdict": "PASS" },
+    { "id": "T1.7", "name": "empty-subtree embedding", "verdict": "PASS" },
+    { "id": "T1.8", "name": "transitivity", "verdict": "PASS" },
+    { "id": "T1.9", "name": "antisymmetry", "verdict": "PASS" },
+    { "id": "T1.10", "name": "backtracking necessity", "verdict": "PASS" },
+    { "id": "T1.BENCH", "name": "embed wall-time", "verdict": "PASS" }
+  ]
+}

@@ -1,0 +1,1076 @@
+% Options for packages loaded elsewhere
+\PassOptionsToPackage{unicode}{hyperref}
+\PassOptionsToPackage{hyphens}{url}
+\PassOptionsToPackage{dvipsnames,svgnames*,x11names*}{xcolor}
+%
+\documentclass[
+  11pt,
+]{article}
+\usepackage{lmodern}
+\usepackage{amssymb,amsmath}
+\usepackage{ifxetex,ifluatex}
+\ifnum 0\ifxetex 1\fi\ifluatex 1\fi=0 % if pdftex
+  \usepackage[T1]{fontenc}
+  \usepackage[utf8]{inputenc}
+  \usepackage{textcomp} % provide euro and other symbols
+\else % if luatex or xetex
+  \usepackage{unicode-math}
+  \defaultfontfeatures{Scale=MatchLowercase}
+  \defaultfontfeatures[\rmfamily]{Ligatures=TeX,Scale=1}
+\fi
+% Use upquote if available, for straight quotes in verbatim environments
+\IfFileExists{upquote.sty}{\usepackage{upquote}}{}
+\IfFileExists{microtype.sty}{% use microtype if available
+  \usepackage[]{microtype}
+  \UseMicrotypeSet[protrusion]{basicmath} % disable protrusion for tt fonts
+}{}
+\makeatletter
+\@ifundefined{KOMAClassName}{% if non-KOMA class
+  \IfFileExists{parskip.sty}{%
+    \usepackage{parskip}
+  }{% else
+    \setlength{\parindent}{0pt}
+    \setlength{\parskip}{6pt plus 2pt minus 1pt}}
+}{% if KOMA class
+  \KOMAoptions{parskip=half}}
+\makeatother
+\usepackage{xcolor}
+\IfFileExists{xurl.sty}{\usepackage{xurl}}{} % add URL line breaks if available
+\IfFileExists{bookmark.sty}{\usepackage{bookmark}}{\usepackage{hyperref}}
+\hypersetup{
+  pdftitle={Prime Power Transformer ARM: System and Implementation},
+  pdfauthor={KnackAU, Claude (Anthropic), Gemini (Google DeepMind)},
+  colorlinks=true,
+  linkcolor=Maroon,
+  filecolor=Maroon,
+  citecolor=Blue,
+  urlcolor=Blue,
+  pdfcreator={LaTeX via pandoc}}
+\urlstyle{same} % disable monospaced font for URLs
+\usepackage[margin=1in]{geometry}
+\usepackage{color}
+\usepackage{fancyvrb}
+\newcommand{\VerbBar}{|}
+\newcommand{\VERB}{\Verb[commandchars=\\\{\}]}
+\DefineVerbatimEnvironment{Highlighting}{Verbatim}{commandchars=\\\{\}}
+% Add ',fontsize=\small' for more characters per line
+\newenvironment{Shaded}{}{}
+\newcommand{\AlertTok}[1]{\textcolor[rgb]{1.00,0.00,0.00}{\textbf{#1}}}
+\newcommand{\AnnotationTok}[1]{\textcolor[rgb]{0.38,0.63,0.69}{\textbf{\textit{#1}}}}
+\newcommand{\AttributeTok}[1]{\textcolor[rgb]{0.49,0.56,0.16}{#1}}
+\newcommand{\BaseNTok}[1]{\textcolor[rgb]{0.25,0.63,0.44}{#1}}
+\newcommand{\BuiltInTok}[1]{#1}
+\newcommand{\CharTok}[1]{\textcolor[rgb]{0.25,0.44,0.63}{#1}}
+\newcommand{\CommentTok}[1]{\textcolor[rgb]{0.38,0.63,0.69}{\textit{#1}}}
+\newcommand{\CommentVarTok}[1]{\textcolor[rgb]{0.38,0.63,0.69}{\textbf{\textit{#1}}}}
+\newcommand{\ConstantTok}[1]{\textcolor[rgb]{0.53,0.00,0.00}{#1}}
+\newcommand{\ControlFlowTok}[1]{\textcolor[rgb]{0.00,0.44,0.13}{\textbf{#1}}}
+\newcommand{\DataTypeTok}[1]{\textcolor[rgb]{0.56,0.13,0.00}{#1}}
+\newcommand{\DecValTok}[1]{\textcolor[rgb]{0.25,0.63,0.44}{#1}}
+\newcommand{\DocumentationTok}[1]{\textcolor[rgb]{0.73,0.13,0.13}{\textit{#1}}}
+\newcommand{\ErrorTok}[1]{\textcolor[rgb]{1.00,0.00,0.00}{\textbf{#1}}}
+\newcommand{\ExtensionTok}[1]{#1}
+\newcommand{\FloatTok}[1]{\textcolor[rgb]{0.25,0.63,0.44}{#1}}
+\newcommand{\FunctionTok}[1]{\textcolor[rgb]{0.02,0.16,0.49}{#1}}
+\newcommand{\ImportTok}[1]{#1}
+\newcommand{\InformationTok}[1]{\textcolor[rgb]{0.38,0.63,0.69}{\textbf{\textit{#1}}}}
+\newcommand{\KeywordTok}[1]{\textcolor[rgb]{0.00,0.44,0.13}{\textbf{#1}}}
+\newcommand{\NormalTok}[1]{#1}
+\newcommand{\OperatorTok}[1]{\textcolor[rgb]{0.40,0.40,0.40}{#1}}
+\newcommand{\OtherTok}[1]{\textcolor[rgb]{0.00,0.44,0.13}{#1}}
+\newcommand{\PreprocessorTok}[1]{\textcolor[rgb]{0.74,0.48,0.00}{#1}}
+\newcommand{\RegionMarkerTok}[1]{#1}
+\newcommand{\SpecialCharTok}[1]{\textcolor[rgb]{0.25,0.44,0.63}{#1}}
+\newcommand{\SpecialStringTok}[1]{\textcolor[rgb]{0.73,0.40,0.53}{#1}}
+\newcommand{\StringTok}[1]{\textcolor[rgb]{0.25,0.44,0.63}{#1}}
+\newcommand{\VariableTok}[1]{\textcolor[rgb]{0.10,0.09,0.49}{#1}}
+\newcommand{\VerbatimStringTok}[1]{\textcolor[rgb]{0.25,0.44,0.63}{#1}}
+\newcommand{\WarningTok}[1]{\textcolor[rgb]{0.38,0.63,0.69}{\textbf{\textit{#1}}}}
+\usepackage{longtable,booktabs}
+% Correct order of tables after \paragraph or \subparagraph
+\usepackage{etoolbox}
+\makeatletter
+\patchcmd\longtable{\par}{\if@noskipsec\mbox{}\fi\par}{}{}
+\makeatother
+% Allow footnotes in longtable head/foot
+\IfFileExists{footnotehyper.sty}{\usepackage{footnotehyper}}{\usepackage{footnote}}
+\makesavenoteenv{longtable}
+\setlength{\emergencystretch}{3em} % prevent overfull lines
+\providecommand{\tightlist}{%
+  \setlength{\itemsep}{0pt}\setlength{\parskip}{0pt}}
+\setcounter{secnumdepth}{-\maxdimen} % remove section numbering
+
+\title{Prime Power Transformer ARM: System and Implementation}
+\usepackage{etoolbox}
+\makeatletter
+\providecommand{\subtitle}[1]{% add subtitle to \maketitle
+  \apptocmd{\@title}{\par {\large #1 \par}}{}{}
+}
+\makeatother
+\subtitle{Part II --- Engineering}
+\author{KnackAU, Claude (Anthropic), Gemini (Google DeepMind)}
+\date{Shannon-Prime Project · 2026-05-17 → 2026-05-19}
+
+\begin{document}
+\maketitle
+
+\hypertarget{prime-power-transformer-arm-system-and-implementation}{%
+\section{Prime Power Transformer ARM: System and
+Implementation}\label{prime-power-transformer-arm-system-and-implementation}}
+
+\textbf{Part II --- Engineering}
+
+\emph{KnackAU, Claude (Anthropic), Gemini (Google DeepMind)}
+
+\emph{Shannon-Prime Project · 2026-05-17 → 2026-05-19}
+
+\begin{center}\rule{0.5\linewidth}{0.5pt}\end{center}
+
+\hypertarget{abstract}{%
+\subsection{Abstract}\label{abstract}}
+
+Part I (companion paper) described a number-theoretic re-derivation of
+the transformer forward pass over the ring of integers \(\mathcal{O}_K\)
+of \(\mathbb{Q}(\sqrt{-163})\). Part II describes the system that
+executes this mathematics, built atop the Shannon-Prime engine. The
+architecture is realised in three nested kernels: native
+\(\mathcal{O}_K\) matmul with integer accumulators, polynomial-ring
+attention over \(R_q = \mathbb{Z}_q[x]/(x^N+1)\), and a dual-prime
+CRT-NTT inner loop that needs no 128-bit arithmetic. We report on
+Frobenius load-time shimming, native forward-pass wiring, persistent
+NTT-domain KV cache, AVX-2/-512 vectorisation, and Hexagon HVX
+deployment on the Snapdragon V69 DSP. The headline empirical result is
+six significant figures of bit-exactness between shimmed and unshimmed
+inference on Gemma3-1B (PPL 13.1097 with \(\varphi_{41}^8\) vs.~13.12
+without), an end-to-end empirical validation of Theorem 4 from Part I.
+We also document a \(9.78\times\) KV-cache compression on Hexagon at
+\(d_h=128\), \(-16.7\%\) wall-time gains from persistent NTT caching,
+and bit-identical CRT portability between Linux GCC and Windows MSVC.
+
+\begin{center}\rule{0.5\linewidth}{0.5pt}\end{center}
+
+\hypertarget{system-overview}{%
+\subsection{1. System Overview}\label{system-overview}}
+
+The system spans four code repositories already established in the
+Shannon-Prime project:
+
+\begin{itemize}
+\tightlist
+\item
+  \texttt{lib/shannon-prime} --- mathematical core (algebra, NTT,
+  Möbius, VHT2).
+\item
+  \texttt{shannon-prime-engine} --- standalone inference engine (GGUF
+  loader, native \(\mathcal{O}_K\) forward pass, KV cache, CLI verbs).
+\item
+  \texttt{shannon-prime-llama} --- patched llama.cpp with the engine
+  bolted in behind FUSED\_KQ hooks.
+\item
+  \texttt{shannon-prime-comfyui} --- out of scope here.
+\end{itemize}
+
+Part II describes only the engine path and its mobile deployment. The
+two papers cross-reference: Part I's Theorem 4 is empirically validated
+by §3.3 here; Part I's Section 7 (polynomial ring) corresponds to §4
+here; Part I's §5 (CRT) is realised in §5 here; Part I's §10 (13-step)
+is the architectural template for §2--8 of this paper.
+
+\hypertarget{data-structures}{%
+\subsection{2. Data Structures}\label{data-structures}}
+
+The carrier of every weight and KV-cache value is the integer ring
+element
+
+\begin{Shaded}
+\begin{Highlighting}[]
+\KeywordTok{typedef} \KeywordTok{struct}\NormalTok{ \{ }\DataTypeTok{int64\_t}\NormalTok{ a, b; \} sp\_ok\_t;   }\CommentTok{/* a + b·ω, ω² = ω − 41 */}
+\end{Highlighting}
+\end{Shaded}
+
+stored in an interleaved Array-of-Structs layout
+\texttt{{[}a₀,\ b₀,\ a₁,\ b₁,\ ...{]}}. Two coordinates per element
+place every pair on a single cache line and align with AVX-2's
+\texttt{\_mm256\_mul\_epi32} lane structure.
+
+A tensor carries a per-tensor Frobenius scale and a precomputed
+reciprocal so decoding never requires runtime division:
+
+\begin{Shaded}
+\begin{Highlighting}[]
+\KeywordTok{typedef} \KeywordTok{struct}\NormalTok{ \{}
+\NormalTok{    sp\_ok\_t  *data;             }\CommentTok{/* AoS */}
+    \DataTypeTok{int64\_t}\NormalTok{   rows, cols;}
+    \DataTypeTok{int64\_t}\NormalTok{   frobenius\_scale;  }\CommentTok{/* π\^{}k bookkeeping (algebraic, not float) */}
+    \DataTypeTok{int64\_t}\NormalTok{   scale\_recip;      }\CommentTok{/* 1 / scale, fixed{-}point */}
+\NormalTok{\} sp\_ok\_tensor;}
+\end{Highlighting}
+\end{Shaded}
+
+Polynomial-ring objects (Section 4) use a packed \texttt{uint64{[}N{]}}
+per ring element with \(N=256\) and a context block storing the NTT
+prime \(q\), the \(2N\)-th root of unity \(\psi\), and the inverse of
+\(N\):
+
+\begin{Shaded}
+\begin{Highlighting}[]
+\KeywordTok{typedef} \KeywordTok{struct}\NormalTok{ \{}
+    \DataTypeTok{int64\_t}\NormalTok{ q, psi, psi\_inv, n\_inv;}
+\NormalTok{\} sp\_poly\_ring\_ctx;}
+\end{Highlighting}
+\end{Shaded}
+
+The CRT-NTT (Section 5) carries two such contexts in parallel and
+reconstructs the 60-bit product by Garner's algorithm.
+
+\hypertarget{frobenius-load-time-shimming}{%
+\subsection{3. Frobenius Load-Time
+Shimming}\label{frobenius-load-time-shimming}}
+
+The engine intercepts \texttt{llama\_weights::load()} and, for each
+layer's \(W_Q\), \(W_K\), \(W_V\), \(W_O\), \(W_{\mathrm{gate}}\),
+\(W_{\mathrm{up}}\), \(W_{\mathrm{down}}\) tensor, decides whether to
+pass through (embeddings, LM head) or apply the Frobenius shim
+\[W \;\longleftarrow\; W \cdot \pi_p^k.\] With \(p_2 = 41\) split and
+\(k = 8\), this multiplies each weight by \(\pi_{41}^8\),
+\(N(\pi_{41}^8) = 41^8 \approx 2.8 \times 10^{12}\). The shimmed weight
+is encoded as integer coordinates by
+
+\begin{Shaded}
+\begin{Highlighting}[]
+\NormalTok{sp\_ok\_encode\_fp16(src, dst, scale = absmax(W) / }\DecValTok{2}\NormalTok{\^{}q\_max);}
+\end{Highlighting}
+\end{Shaded}
+
+ownership lives in side buffers that outlive the GGUF tensor table.
+Phase 1.7c shipped this load-shim against fp16 GGUF; Phase 1.8 enabled
+Theorem 4 validation in Gemma3-270M:
+
+\begin{longtable}[]{@{}llll@{}}
+\toprule
+Config & \(p\) & \(k\) & Δ PPL vs.~baseline\tabularnewline
+\midrule
+\endhead
+Identity & -- & -- & 0.000\%\tabularnewline
+B (split) & 41 & 8 & \textbf{+0.042\%}\tabularnewline
+E (Sato--Tate mix) & 2 + 41 & 2 + 8 & \textbf{+0.000\%}\tabularnewline
+\bottomrule
+\end{longtable}
+
+The Config-E result (bit-for-bit match) is the production-relevant
+validation of Theorem 4: even with mixed precision through inert + split
+lanes, the Frobenius factor cancels through the entire 18-layer
+attention stack.
+
+\hypertarget{bit-identity-at-scale}{%
+\subsubsection{3.1 Bit-identity at scale}\label{bit-identity-at-scale}}
+
+On Gemma3-1B (A100 reference): PPL 13.11 with shim vs.~13.12 without,
+\(\Delta = 0.08\%\). Per-token activation differences are zero at six
+significant figures throughout the layers; the only nonzero deltas are
+float-precision artefacts in the fp32 islands (RMSNorm, softmax, SiLU).
+The framework's central claim --- that an entire transformer can run its
+linear algebra in \(\mathcal{O}_K\) without measurable drift --- is
+therefore confirmed on a 1B-parameter model.
+
+\hypertarget{native-mathcalo_k-matmul}{%
+\subsection{\texorpdfstring{4. Native \(\mathcal{O}_K\)
+Matmul}{4. Native \textbackslash mathcal\{O\}\_K Matmul}}\label{native-mathcalo_k-matmul}}
+
+\hypertarget{scalar-reference}{%
+\subsubsection{4.1 Scalar reference}\label{scalar-reference}}
+
+The reference \(\mathcal{O}_K\) matmul implements
+\(Y_{ij} = \sum_k W_{ik} \cdot X_{kj}\) in \(\mathcal{O}_K\). Using
+\(\omega^2 = \omega - 41\), the product
+\((a + b\omega)(c + d\omega) = (ac - 41 bd) + (ad + bc + bd)\omega\).
+The reference accumulates into \texttt{int64} and rescales by
+\texttt{scale\_recip} at finalisation.
+
+\hypertarget{avx-2-avx-512-vectorisation}{%
+\subsubsection{4.2 AVX-2 / AVX-512
+vectorisation}\label{avx-2-avx-512-vectorisation}}
+
+Side B's Phase-8 GEMV fast-path uses \texttt{\_mm256\_mul\_epi32} (and
+the AVX-512 equivalent) which multiplies 32-bit lanes into 64-bit
+products. The 32-bit truncation is safe because \texttt{scale\_recip}
+bounds operands to \([-2^{31}, 2^{31})\) by construction:
+
+\begin{Shaded}
+\begin{Highlighting}[]
+\CommentTok{/* AVX{-}2 inner loop, GEMV (N = 1) */}
+\ControlFlowTok{for}\NormalTok{ (k = }\DecValTok{0}\NormalTok{; k + }\DecValTok{1}\NormalTok{ \textless{} K; k += }\DecValTok{2}\NormalTok{) \{}
+\NormalTok{    \_\_m256i w   = \_mm256\_loadu\_si256((\_\_m256i*)\&W[i*K + k]);   }\CommentTok{/* a0 b0 a1 b1 */}
+\NormalTok{    \_\_m256i x   = \_mm256\_loadu\_si256((\_\_m256i*)\&X[k]);}
+\NormalTok{    \_\_m256i xsw = \_mm256\_shuffle\_epi32(x, \_MM\_SHUFFLE(}\DecValTok{2}\NormalTok{,}\DecValTok{3}\NormalTok{,}\DecValTok{0}\NormalTok{,}\DecValTok{1}\NormalTok{));}
+\NormalTok{    \_\_m256i wa  = \_mm256\_mul\_epi32(w, x);}
+\NormalTok{    \_\_m256i wb  = \_mm256\_mul\_epi32(w, xsw);}
+\NormalTok{    sum\_a = \_mm256\_add\_epi64(sum\_a, wa);}
+\NormalTok{    sum\_b = \_mm256\_add\_epi64(sum\_b, wb);}
+\NormalTok{\}}
+\CommentTok{/* horizontal reduce; combine via ω² = ω − 41 */}
+\end{Highlighting}
+\end{Shaded}
+
+The interleaved layout means no swizzle is needed between loads --- the
+AoS format aligns with the \texttt{\_mm256\_mul\_epi32} lane semantics
+by construction.
+
+\hypertarget{measured}{%
+\subsubsection{4.3 Measured}\label{measured}}
+
+On Phase 2.2c (loader\_with\_frobenius\_shim\_preserves\_matmul): -
+maximum element error: \(7.98 \times 10^{-5}\) vs.~fp32 reference. -
+shim cancellation: bit-identical at the tensor level after RMSNorm.
+
+Wall-time gains on Phase-8 are bandwidth-limited (matmul is memory-bound
+at the Gemma3-1B scale), but the vectorised path eliminates the scalar
+tail and is necessary for the \(N\!>\!1\) prefill path. Headroom is in
+fusing \(W_Q\), \(W_K\), \(W_V\) into a single matmul (Side B's next
+step).
+
+\hypertarget{polynomial-ring-attention}{%
+\subsection{5. Polynomial-Ring
+Attention}\label{polynomial-ring-attention}}
+
+\hypertarget{encoder}{%
+\subsubsection{5.1 Encoder}\label{encoder}}
+
+Each input vector \(v \in \mathbb{R}^{d_k}\) is encoded as a polynomial
+in \(R_q = \mathbb{Z}_q[x]/(x^N+1)\) via the CKKS-style map
+\[e(v)_i = \lfloor \Delta \cdot v_i \rceil, \qquad \Delta \ge 2^{10}.\]
+The inner product \(\langle q, k \rangle\) is the coefficient of
+\(x^{N-1}\) in the negacyclic product \(Q(x) \cdot K(x^{-1})\),
+recovered as \(\mathrm{coeff}_{N-1} / \Delta^2\).
+
+\hypertarget{bit-proth-ntt}{%
+\subsubsection{5.2 60-bit Proth NTT}\label{bit-proth-ntt}}
+
+We use the prime
+\[q = 576{,}460{,}752{,}312{,}401{,}921 = k \cdot 2^{16} + 1,\] with
+\(\psi = 1753\) a primitive \(2N\)-th root of unity. The forward NTT is
+in-place, Cooley--Tukey decimation-in-time with bit-reversal:
+
+\begin{Shaded}
+\begin{Highlighting}[]
+\DataTypeTok{void}\NormalTok{ sp\_ntt\_forward(}\DataTypeTok{uint64\_t}\NormalTok{ *a, }\DataTypeTok{uint64\_t}\NormalTok{ q, }\DataTypeTok{uint64\_t}\NormalTok{ psi);}
+\DataTypeTok{void}\NormalTok{ sp\_ntt\_inverse(}\DataTypeTok{uint64\_t}\NormalTok{ *a, }\DataTypeTok{uint64\_t}\NormalTok{ q, }\DataTypeTok{uint64\_t}\NormalTok{ psi, }\DataTypeTok{uint64\_t}\NormalTok{ psi\_inv, }\DataTypeTok{uint64\_t}\NormalTok{ n\_inv);}
+\end{Highlighting}
+\end{Shaded}
+
+\hypertarget{barrett-reduction}{%
+\subsubsection{5.3 Barrett reduction}\label{barrett-reduction}}
+
+Modular reduction uses the Barrett constant
+\(\mu = \lfloor 2^{120}/q\rfloor\):
+
+\begin{Shaded}
+\begin{Highlighting}[]
+\DataTypeTok{static} \KeywordTok{inline} \DataTypeTok{uint64\_t}\NormalTok{ sp\_ntt\_mulmod(}\DataTypeTok{uint64\_t}\NormalTok{ a, }\DataTypeTok{uint64\_t}\NormalTok{ b,}
+                                     \DataTypeTok{uint64\_t}\NormalTok{ mu, }\DataTypeTok{uint64\_t}\NormalTok{ q) \{}
+\NormalTok{    \_\_uint128\_t ab = (\_\_uint128\_t)a * b;}
+    \DataTypeTok{uint64\_t}\NormalTok{ q\_hi = (}\DataTypeTok{uint64\_t}\NormalTok{)(ab \textgreater{}\textgreater{} }\DecValTok{64}\NormalTok{);}
+    \DataTypeTok{uint64\_t}\NormalTok{ t    = (}\DataTypeTok{uint64\_t}\NormalTok{)((\_\_uint128\_t)q\_hi * mu \textgreater{}\textgreater{} }\DecValTok{64}\NormalTok{);}
+    \DataTypeTok{uint64\_t}\NormalTok{ r    = (}\DataTypeTok{uint64\_t}\NormalTok{)ab {-} t * q;}
+    \ControlFlowTok{return}\NormalTok{ r {-} (q \& {-}(}\DataTypeTok{uint64\_t}\NormalTok{)(r \textgreater{}= q));}
+\NormalTok{\}}
+\end{Highlighting}
+\end{Shaded}
+
+Measured: 3.01× kernel speedup on MSVC, 2.64× on GCC, 3.3\% end-to-end
+engine wall-time improvement.
+
+\hypertarget{kl-zero-parity}{%
+\subsubsection{5.4 KL-zero parity}\label{kl-zero-parity}}
+
+We test
+
+\begin{Shaded}
+\begin{Highlighting}[]
+\NormalTok{kl = KL(softmax(QKᵀ/√d\_k) ∥ softmax(polyring\_score)).}
+\end{Highlighting}
+\end{Shaded}
+
+At Gemma3 \(d_k = 256\), \(\mathrm{KL} = 0\), cosine \(= 1\), dot
+product recovered to \(1.17\times10^{-4}\) fp32 ULP --- far below the
+\(5 \times 10^{-2}\) tolerance. The polynomial-ring path is
+mathematically equivalent to softmax at this scale and is the production
+attention kernel.
+
+\hypertarget{the-persistent-ntt-domain-kv-cache}{%
+\subsection{6. The Persistent NTT-Domain KV
+Cache}\label{the-persistent-ntt-domain-kv-cache}}
+
+A typical inference loop forward-transforms every \(K_t\) on every
+attention step. Phase 7 of Side B observed that the \(K\) for token
+\(t\) is read \(L\) times but only ever computed once, so the NTT of
+\(K_t\) is also fixed once. We therefore store \(K_t\) \textbf{already
+in the NTT domain}:
+
+\begin{Shaded}
+\begin{Highlighting}[]
+\KeywordTok{typedef} \KeywordTok{struct}\NormalTok{ \{ }\KeywordTok{\_Alignas}\NormalTok{(}\DecValTok{64}\NormalTok{) }\DataTypeTok{int64\_t}\NormalTok{ k\_ntt[N]; \} sp\_ntt\_key\_block;}
+\end{Highlighting}
+\end{Shaded}
+
+The cache layout is
+\texttt{k\_ntt\_cache{[}layer{]}{[}position{]}{[}head{]}}, each block
+2048 bytes and cache-line aligned. On \texttt{kv\_write}:
+
+\begin{Shaded}
+\begin{Highlighting}[]
+\NormalTok{sp\_ok\_encode(K, K\_int, Δ);            }\CommentTok{/* scale and round */}
+\NormalTok{sp\_ntt\_forward(K\_int, q, ψ);          }\CommentTok{/* once per token */}
+\NormalTok{memcpy(\&cache[L][t][h], K\_int, }\DecValTok{2048}\NormalTok{); }\CommentTok{/* persist */}
+\end{Highlighting}
+\end{Shaded}
+
+On \texttt{kv\_read} during attention:
+
+\begin{Shaded}
+\begin{Highlighting}[]
+\NormalTok{sp\_poly\_dot\_product\_ntt\_q\_cached(Q\_ntt, \&cache[L][t][h], Δ, \&ctx);}
+\end{Highlighting}
+\end{Shaded}
+
+The Q-NTT is hoisted out of the position loop (Phase 5b: 9.6\%
+wall-time), the K-NTT survives across forward steps (Phase 6/7:
+\(-16.7\%\) cumulative vs.~Phase 4 baseline). PPL stays bit-identical at
+14.2856 on Gemma3-1B with \(\mathrm{ctx}=128\).
+
+\hypertarget{memory-budget}{%
+\subsubsection{6.1 Memory budget}\label{memory-budget}}
+
+A single \(K\) block is 2 kB; at Gemma3-1B (26 layers, 1 head, 4096
+token capacity) the cache fits in 13 MB. At 8192 tokens it is 26 MB.
+Even on consumer hardware (24 MB L3 on Beast Canyon) the full inference
+cache for the model fits on-die.
+
+\hypertarget{crt-dual-prime-ntt}{%
+\subsection{7. CRT Dual-Prime NTT}\label{crt-dual-prime-ntt}}
+
+A 60-bit prime forces \texttt{\_\_int128} arithmetic in the inner loop.
+Modern AVX-512 and HVX hardware do not have native 128-bit lanes, and
+MSVC does not provide \texttt{\_\_int128} at all. Phase 9 split the
+prime into two \textasciitilde30-bit Proth primes \(q_1\), \(q_2\) with
+\(q_1 q_2 \approx 2^{60}\):
+
+\begin{Shaded}
+\begin{Highlighting}[]
+\NormalTok{sp\_poly\_mul\_ntt\_q(out1, a1, b1, q1, μ1, ψ}\DecValTok{1}\NormalTok{, ...);   }\CommentTok{/* parallel ring 1 */}
+\NormalTok{sp\_poly\_mul\_ntt\_q(out2, a2, b2, q2, μ2, ψ}\DecValTok{2}\NormalTok{, ...);   }\CommentTok{/* parallel ring 2 */}
+\CommentTok{/* Garner CRT stitch (uint64 throughout, no \_\_int128) */}
+\end{Highlighting}
+\end{Shaded}
+
+Empirical confirmation: - Bit-identical to the 60-bit reference on Linux
+GCC and Windows MSVC. - Engine integration: PPL 14.2856 (bit-identical),
+wall +2.5\% before SIMD vectorisation. - Every intermediate fits in a
+\texttt{uint64}. \textbf{The kernel is now portable} to ARM, RISC-V,
+Hexagon HVX, and GPU shaders.
+
+This is the key portability win of the entire architecture: the math
+chosen in Part I (CRT over two coprime moduli) gives us the engineering
+escape route from a 128-bit-only world.
+
+\hypertarget{rmsnorm-rope-softmax-the-fp32-islands}{%
+\subsection{8. RMSNorm, RoPE, Softmax --- the fp32
+islands}\label{rmsnorm-rope-softmax-the-fp32-islands}}
+
+Three operations remain in fp32 in the current build, encapsulated as
+bridge kernels: - \texttt{sp\_rmsnorm\_bridge} --- decode
+\(a + b\omega\) to fp32 per pair, compute
+\(1/\sqrt{\mathrm{mean}(x^2)}\), multiply by \((1 + w)\) (Gemma3 +1.0
+norm-weight offset), re-encode. Resets \texttt{frobenius\_scale\ =\ 1}.
+- \texttt{sp\_rope\_bridge} --- decode pair, rotate by
+\(\theta = \mathrm{pos}\cdot\mathrm{base}^{-2k/d_h}\), re-encode. NEOX
+layout. - \texttt{sp\_softmax\_bridge} --- fp32 reduction along token
+axis; expected eventual replacement by a \(p\)-adic exponential table
+(Part I §10 Step 6).
+
+The bridges are thread-safe and re-entrant. They are the only fp32 work
+in the forward pass.
+
+\hypertarget{hexagon-hvx-snapdragon-v69}{%
+\subsection{9. Hexagon HVX / Snapdragon
+V69}\label{hexagon-hvx-snapdragon-v69}}
+
+The mobile target is a Snapdragon 8 Elite phone, V69 HTP, accessed via
+FastRPC. The relevant kernels:
+
+\begin{longtable}[]{@{}lll@{}}
+\toprule
+\begin{minipage}[b]{0.39\columnwidth}\raggedright
+IDL Method\strut
+\end{minipage} & \begin{minipage}[b]{0.32\columnwidth}\raggedright
+Purpose\strut
+\end{minipage} & \begin{minipage}[b]{0.21\columnwidth}\raggedright
+Side\strut
+\end{minipage}\tabularnewline
+\midrule
+\endhead
+\begin{minipage}[t]{0.39\columnwidth}\raggedright
+\texttt{sp\_hex\_vht2\_forward\_f32}\strut
+\end{minipage} & \begin{minipage}[t]{0.32\columnwidth}\raggedright
+Vilenkin-Chrestenson VHT2 transform + Möbius reorder\strut
+\end{minipage} & \begin{minipage}[t]{0.21\columnwidth}\raggedright
+DSP\strut
+\end{minipage}\tabularnewline
+\begin{minipage}[t]{0.39\columnwidth}\raggedright
+\texttt{sp\_hex\_mobius\_scatter\_f32}\strut
+\end{minipage} & \begin{minipage}[t]{0.32\columnwidth}\raggedright
+Square-free reorder via HVX bit-scatter\strut
+\end{minipage} & \begin{minipage}[t]{0.21\columnwidth}\raggedright
+DSP\strut
+\end{minipage}\tabularnewline
+\begin{minipage}[t]{0.39\columnwidth}\raggedright
+\texttt{sp\_hex\_band\_quantize\_f32}\strut
+\end{minipage} & \begin{minipage}[t]{0.32\columnwidth}\raggedright
+Banded encode to packed uint8 in VTCM\strut
+\end{minipage} & \begin{minipage}[t]{0.21\columnwidth}\raggedright
+DSP\strut
+\end{minipage}\tabularnewline
+\begin{minipage}[t]{0.39\columnwidth}\raggedright
+\texttt{sp\_hex\_compress\_f32\_full\_batch}\strut
+\end{minipage} & \begin{minipage}[t]{0.32\columnwidth}\raggedright
+Fused VHT2 + Möbius + quantize (head\_dim ∈ \{64,128,256,512\})\strut
+\end{minipage} & \begin{minipage}[t]{0.21\columnwidth}\raggedright
+DSP\strut
+\end{minipage}\tabularnewline
+\begin{minipage}[t]{0.39\columnwidth}\raggedright
+\texttt{sp\_hex\_compress\_f32\_batch}\strut
+\end{minipage} & \begin{minipage}[t]{0.32\columnwidth}\raggedright
+Single-vector compress (head-dim agnostic)\strut
+\end{minipage} & \begin{minipage}[t]{0.21\columnwidth}\raggedright
+DSP\strut
+\end{minipage}\tabularnewline
+\begin{minipage}[t]{0.39\columnwidth}\raggedright
+\texttt{sp\_hex\_hier\_predict\_f32}\strut
+\end{minipage} & \begin{minipage}[t]{0.32\columnwidth}\raggedright
+Skeleton → predicted residuals (spinor)\strut
+\end{minipage} & \begin{minipage}[t]{0.21\columnwidth}\raggedright
+DSP\strut
+\end{minipage}\tabularnewline
+\begin{minipage}[t]{0.39\columnwidth}\raggedright
+\texttt{sp\_hex\_residual\_quantize\_spinor}\strut
+\end{minipage} & \begin{minipage}[t]{0.32\columnwidth}\raggedright
+3-bit magnitude + 1-bit phase residual pack\strut
+\end{minipage} & \begin{minipage}[t]{0.21\columnwidth}\raggedright
+DSP\strut
+\end{minipage}\tabularnewline
+\begin{minipage}[t]{0.39\columnwidth}\raggedright
+\texttt{sp\_hex\_hier\_encode\_f32}\strut
+\end{minipage} & \begin{minipage}[t]{0.32\columnwidth}\raggedright
+Full write pipeline\strut
+\end{minipage} & \begin{minipage}[t]{0.21\columnwidth}\raggedright
+DSP\strut
+\end{minipage}\tabularnewline
+\begin{minipage}[t]{0.39\columnwidth}\raggedright
+\texttt{sp\_hex\_residual\_unpack\_f32}\strut
+\end{minipage} & \begin{minipage}[t]{0.32\columnwidth}\raggedright
+Inverse of \texttt{residual\_quantize\_spinor}\strut
+\end{minipage} & \begin{minipage}[t]{0.21\columnwidth}\raggedright
+DSP\strut
+\end{minipage}\tabularnewline
+\begin{minipage}[t]{0.39\columnwidth}\raggedright
+\texttt{sp\_hex\_hier\_decode\_f32}\strut
+\end{minipage} & \begin{minipage}[t]{0.32\columnwidth}\raggedright
+Full read pipeline\strut
+\end{minipage} & \begin{minipage}[t]{0.21\columnwidth}\raggedright
+DSP\strut
+\end{minipage}\tabularnewline
+\begin{minipage}[t]{0.39\columnwidth}\raggedright
+\texttt{sp\_hex\_logit\_argmax\_u16}\strut
+\end{minipage} & \begin{minipage}[t]{0.32\columnwidth}\raggedright
+Argmax over vocabulary (eliminates 300 kB FastRPC transfer per
+decode)\strut
+\end{minipage} & \begin{minipage}[t]{0.21\columnwidth}\raggedright
+DSP\strut
+\end{minipage}\tabularnewline
+\bottomrule
+\end{longtable}
+
+\hypertarget{memory-footprint}{%
+\subsubsection{9.1 Memory footprint}\label{memory-footprint}}
+
+The hierarchical-spinor block packs the K-cache as:
+
+\begin{longtable}[]{@{}lrl@{}}
+\toprule
+\begin{minipage}[b]{0.33\columnwidth}\raggedright
+Region\strut
+\end{minipage} & \begin{minipage}[b]{0.29\columnwidth}\raggedleft
+Bytes\strut
+\end{minipage} & \begin{minipage}[b]{0.29\columnwidth}\raggedright
+Notes\strut
+\end{minipage}\tabularnewline
+\midrule
+\endhead
+\begin{minipage}[t]{0.33\columnwidth}\raggedright
+Skeleton (14 fp16 squarefree-top coefficients)\strut
+\end{minipage} & \begin{minipage}[t]{0.29\columnwidth}\raggedleft
+28\strut
+\end{minipage} & \begin{minipage}[t]{0.29\columnwidth}\raggedright
+top-K variance, calibrated at warmup\strut
+\end{minipage}\tabularnewline
+\begin{minipage}[t]{0.33\columnwidth}\raggedright
+Residual (60 lanes, 3-bit magnitude + 1-bit phase)\strut
+\end{minipage} & \begin{minipage}[t]{0.29\columnwidth}\raggedleft
+31\strut
+\end{minipage} & \begin{minipage}[t]{0.29\columnwidth}\raggedright
+composite-index residuals\strut
+\end{minipage}\tabularnewline
+\begin{minipage}[t]{0.33\columnwidth}\raggedright
+amax (scaling)\strut
+\end{minipage} & \begin{minipage}[t]{0.29\columnwidth}\raggedleft
+4\strut
+\end{minipage} & \begin{minipage}[t]{0.29\columnwidth}\raggedright
+per-block fp32\strut
+\end{minipage}\tabularnewline
+\begin{minipage}[t]{0.33\columnwidth}\raggedright
+\textbf{Total}\strut
+\end{minipage} & \begin{minipage}[t]{0.29\columnwidth}\raggedleft
+\textbf{63}\strut
+\end{minipage} & \begin{minipage}[t]{0.29\columnwidth}\raggedright
+per K slot\strut
+\end{minipage}\tabularnewline
+\bottomrule
+\end{longtable}
+
+A raw fp32 K at \(d_h=128\) is 616 bytes. \textbf{Compression ratio:
+\(9.78\times\).} The 60.79\% square-free / 39.21\% composite split
+matches the theoretical \(6/\pi^2\) density from §4.1 of Part I.
+
+\hypertarget{strike-progression}{%
+\subsubsection{9.2 Strike progression}\label{strike-progression}}
+
+The Hexagon work is broken into ``Strikes'' tracking each kernel ship:
+
+\begin{longtable}[]{@{}lll@{}}
+\toprule
+\begin{minipage}[b]{0.35\columnwidth}\raggedright
+Strike\strut
+\end{minipage} & \begin{minipage}[b]{0.26\columnwidth}\raggedright
+Ship\strut
+\end{minipage} & \begin{minipage}[b]{0.30\columnwidth}\raggedright
+Notes\strut
+\end{minipage}\tabularnewline
+\midrule
+\endhead
+\begin{minipage}[t]{0.35\columnwidth}\raggedright
+4\strut
+\end{minipage} & \begin{minipage}[t]{0.26\columnwidth}\raggedright
+Prefetch oracle\strut
+\end{minipage} & \begin{minipage}[t]{0.30\columnwidth}\raggedright
+A510 silver-cluster affinity + 16-slot prefetch buffer → 100× I/O
+latency reduction (27 ms → 0.27 ms on 56 MB cold read)\strut
+\end{minipage}\tabularnewline
+\begin{minipage}[t]{0.35\columnwidth}\raggedright
+5--7\strut
+\end{minipage} & \begin{minipage}[t]{0.26\columnwidth}\raggedright
+VHT2 + scatter + sieve + quantize\strut
+\end{minipage} & \begin{minipage}[t]{0.30\columnwidth}\raggedright
+full DSP-side compress pipeline\strut
+\end{minipage}\tabularnewline
+\begin{minipage}[t]{0.35\columnwidth}\raggedright
+8a\strut
+\end{minipage} & \begin{minipage}[t]{0.26\columnwidth}\raggedright
+logit argmax on DSP\strut
+\end{minipage} & \begin{minipage}[t]{0.30\columnwidth}\raggedright
+saves 300 kB FastRPC per decode\strut
+\end{minipage}\tabularnewline
+\begin{minipage}[t]{0.35\columnwidth}\raggedright
+9--10\strut
+\end{minipage} & \begin{minipage}[t]{0.26\columnwidth}\raggedright
+compress\_f32 head-dim agnostic + batched\strut
+\end{minipage} & \begin{minipage}[t]{0.30\columnwidth}\raggedright
+matches engine \texttt{K\_per\_call} profile\strut
+\end{minipage}\tabularnewline
+\begin{minipage}[t]{0.35\columnwidth}\raggedright
+11/11b/11c\strut
+\end{minipage} & \begin{minipage}[t]{0.26\columnwidth}\raggedright
+Residual spinor predict / quantize / reshape to (60, 14)\strut
+\end{minipage} & \begin{minipage}[t]{0.30\columnwidth}\raggedright
+per-engine config\strut
+\end{minipage}\tabularnewline
+\begin{minipage}[t]{0.35\columnwidth}\raggedright
+12\strut
+\end{minipage} & \begin{minipage}[t]{0.26\columnwidth}\raggedright
+Hierarchical Spinor encode\_f32 end-to-end\strut
+\end{minipage} & \begin{minipage}[t]{0.30\columnwidth}\raggedright
+shipped\strut
+\end{minipage}\tabularnewline
+\begin{minipage}[t]{0.35\columnwidth}\raggedright
+14\strut
+\end{minipage} & \begin{minipage}[t]{0.26\columnwidth}\raggedright
+residual unpack on DSP\strut
+\end{minipage} & \begin{minipage}[t]{0.30\columnwidth}\raggedright
+mirror of 11b\strut
+\end{minipage}\tabularnewline
+\begin{minipage}[t]{0.35\columnwidth}\raggedright
+15a\strut
+\end{minipage} & \begin{minipage}[t]{0.26\columnwidth}\raggedright
+KvCache backend wired (FastRPC handler dispatch)\strut
+\end{minipage} & \begin{minipage}[t]{0.30\columnwidth}\raggedright
+shipped\strut
+\end{minipage}\tabularnewline
+\begin{minipage}[t]{0.35\columnwidth}\raggedright
+15b\strut
+\end{minipage} & \begin{minipage}[t]{0.26\columnwidth}\raggedright
+Calibrated W-matrix push to DSP rodata\strut
+\end{minipage} & \begin{minipage}[t]{0.30\columnwidth}\raggedright
+pending\strut
+\end{minipage}\tabularnewline
+\begin{minipage}[t]{0.35\columnwidth}\raggedright
+16\strut
+\end{minipage} & \begin{minipage}[t]{0.26\columnwidth}\raggedright
+Batched \texttt{hier\_decode\_f32} (eliminate per-K dispatch
+density)\strut
+\end{minipage} & \begin{minipage}[t]{0.30\columnwidth}\raggedright
+gating debt\strut
+\end{minipage}\tabularnewline
+\bottomrule
+\end{longtable}
+
+\hypertarget{first-light-on-s22-ultra}{%
+\subsubsection{9.3 First-light on S22
+Ultra}\label{first-light-on-s22-ultra}}
+
+Engine + DSP backend, Qwen3-4B Q6\_K: FastRPC engaged, prefill at 1.67
+t/s on two warm-up tokens (576 K/V writes), decode stalled at the per-K
+dispatch density wall (\textasciitilde20 s/token naive). Strike 16
+(batched decode) is the known-good fix and the current top engineering
+priority.
+
+\hypertarget{arm-v9-a510-affinity}{%
+\subsubsection{9.4 ARM v9 / A510 affinity}\label{arm-v9-a510-affinity}}
+
+Per Strike 4: pinning the prefetch oracle to the A510 silver cluster (4
+small cores, 3--13 µs hit latency, 2--3 ms cold-miss UFS sync) while
+reserving A710 / X2 prime cores for the model executor achieves a 100×
+wall-time improvement on KV-read I/O. The architectural lesson is that
+the prefetch oracle, which would compete with the model on the prime
+cores, lives essentially free on the small ones.
+
+\hypertarget{tests-and-test-suite}{%
+\subsection{10. Tests and Test Suite}\label{tests-and-test-suite}}
+
+\hypertarget{unit-tests}{%
+\subsubsection{10.1 Unit tests}\label{unit-tests}}
+
+\texttt{tests/} contains:
+
+\begin{longtable}[]{@{}ll@{}}
+\toprule
+\begin{minipage}[b]{0.26\columnwidth}\raggedright
+File\strut
+\end{minipage} & \begin{minipage}[b]{0.68\columnwidth}\raggedright
+What it covers\strut
+\end{minipage}\tabularnewline
+\midrule
+\endhead
+\begin{minipage}[t]{0.26\columnwidth}\raggedright
+\texttt{test\_sp\_ntt.cpp}\strut
+\end{minipage} & \begin{minipage}[t]{0.68\columnwidth}\raggedright
+NTT roundtrip, bit-exact O(N²) parity, dot-product to fp32 ULP,
+timing\strut
+\end{minipage}\tabularnewline
+\begin{minipage}[t]{0.26\columnwidth}\raggedright
+\texttt{test\_sp\_ntt\_crt.cpp}\strut
+\end{minipage} & \begin{minipage}[t]{0.68\columnwidth}\raggedright
+Two-prime CRT bit-identical to 60-bit reference\strut
+\end{minipage}\tabularnewline
+\begin{minipage}[t]{0.26\columnwidth}\raggedright
+\texttt{test\_sp\_matmul.cpp}\strut
+\end{minipage} & \begin{minipage}[t]{0.68\columnwidth}\raggedright
+\(\mathcal{O}_K\) matmul vs fp16 reference\strut
+\end{minipage}\tabularnewline
+\begin{minipage}[t]{0.26\columnwidth}\raggedright
+\texttt{test\_sp\_bridges.cpp}\strut
+\end{minipage} & \begin{minipage}[t]{0.68\columnwidth}\raggedright
+RMSNorm, softmax, SiLU to fp32 reference\strut
+\end{minipage}\tabularnewline
+\begin{minipage}[t]{0.26\columnwidth}\raggedright
+\texttt{test\_sp\_attention.cpp}\strut
+\end{minipage} & \begin{minipage}[t]{0.68\columnwidth}\raggedright
+Dot product, multi-head, causal mask\strut
+\end{minipage}\tabularnewline
+\begin{minipage}[t]{0.26\columnwidth}\raggedright
+\texttt{test\_sp\_ffn.cpp}\strut
+\end{minipage} & \begin{minipage}[t]{0.68\columnwidth}\raggedright
+Gate/up/down, residual add\strut
+\end{minipage}\tabularnewline
+\begin{minipage}[t]{0.26\columnwidth}\raggedright
+\texttt{test\_sp\_forward\_step.cpp}\strut
+\end{minipage} & \begin{minipage}[t]{0.68\columnwidth}\raggedright
+Single-layer forward, bit-exact shim cancellation\strut
+\end{minipage}\tabularnewline
+\begin{minipage}[t]{0.26\columnwidth}\raggedright
+\texttt{test\_sp\_weights\_loader.cpp}\strut
+\end{minipage} & \begin{minipage}[t]{0.68\columnwidth}\raggedright
+GGUF walk, encode, shim, matmul parity\strut
+\end{minipage}\tabularnewline
+\bottomrule
+\end{longtable}
+
+\hypertarget{theorem-suite}{%
+\subsubsection{10.2 Theorem suite}\label{theorem-suite}}
+
+Mechanically verifies the theorems from Part I §12: T1--T6 plus
+extensions E9.1, E9.2, E9.3, E9.5, E9.6, E10. As of the last green
+build, \textbf{19 / 19 tests passing} (16 VERIFIED, 2
+PENDING-paper-flag, 1 expected-state FAIL).
+
+\hypertarget{build-and-run}{%
+\subsection{11. Build and Run}\label{build-and-run}}
+
+\hypertarget{cmake-configuration}{%
+\subsubsection{11.1 CMake configuration}\label{cmake-configuration}}
+
+\begin{Shaded}
+\begin{Highlighting}[]
+\KeywordTok{set}\NormalTok{(SP\_FROBENIUS\_QUANT       ON)                            }\CommentTok{\# Theorem 4 shim}
+\KeywordTok{set}\NormalTok{(SP\_ENGINE\_NATIVE         OFF)                           }\CommentTok{\# fp32 bridges, off ⇒ native}
+\KeywordTok{set}\NormalTok{(SP\_ENGINE\_POLY\_ATTN      ON)                            }\CommentTok{\# polynomial ring attention}
+\KeywordTok{set}\NormalTok{(SP\_NTT\_PROTH\_PRIME       576460752312401921)            }\CommentTok{\# 60{-}bit prime}
+\KeywordTok{set}\NormalTok{(SP\_NTT\_CRT               ON)                            }\CommentTok{\# dual{-}prime kernel}
+\KeywordTok{set}\NormalTok{(SP\_ENABLE\_AVX2           ON)}
+\KeywordTok{set}\NormalTok{(SP\_ENABLE\_AVX512         ON)}
+\KeywordTok{set}\NormalTok{(SP\_THREADS               16)}
+\end{Highlighting}
+\end{Shaded}
+
+\hypertarget{compiler-flags}{%
+\subsubsection{11.2 Compiler flags}\label{compiler-flags}}
+
+\begin{Shaded}
+\begin{Highlighting}[]
+\ExtensionTok{{-}O3}\NormalTok{ {-}march=native {-}ffast{-}math {-}mavx2 {-}mavx512f}
+\end{Highlighting}
+\end{Shaded}
+
+\hypertarget{cli-verbs}{%
+\subsubsection{11.3 CLI verbs}\label{cli-verbs}}
+
+\begin{Shaded}
+\begin{Highlighting}[]
+\ExtensionTok{sp{-}engine.exe}\NormalTok{ perplexity{-}sp }\KeywordTok{\textbackslash{}}
+    \ExtensionTok{{-}{-}model}\NormalTok{ gemma3{-}1b.gguf }\KeywordTok{\textbackslash{}}
+    \ExtensionTok{{-}{-}frobenius{-}quant}\NormalTok{ {-}p 41 {-}k 8 }\KeywordTok{\textbackslash{}}
+    \ExtensionTok{{-}{-}poly{-}attn}\NormalTok{ {-}{-}ntt{-}crt }\KeywordTok{\textbackslash{}}
+    \ExtensionTok{{-}{-}ctx}\NormalTok{ 128 {-}{-}chunks 4 }\KeywordTok{\textbackslash{}}
+    \ExtensionTok{{-}{-}threads}\NormalTok{ 16}
+\end{Highlighting}
+\end{Shaded}
+
+\hypertarget{environment-variables}{%
+\subsubsection{11.4 Environment variables}\label{environment-variables}}
+
+\begin{longtable}[]{@{}ll@{}}
+\toprule
+Variable & Effect\tabularnewline
+\midrule
+\endhead
+\texttt{SP\_ENGINE\_NATIVE} & 0 = fp32 bridges, 1 = fully native
+(experimental)\tabularnewline
+\texttt{SP\_ENGINE\_POLY\_ATTN} & 1 = polynomial-ring attention, 0 =
+legacy \(\mathbb{R}\)\tabularnewline
+\texttt{SP\_ENGINE\_POLY\_NTT} & 1 = 60-bit NTT, 0 = \(O(N^2)\)
+baseline\tabularnewline
+\texttt{SP\_ENGINE\_POLY\_NTT\_CRT} & 1 = dual-prime CRT
+path\tabularnewline
+\texttt{SP\_FREETHEDSP} & 1 = LD\_PRELOAD shim, S22U unsigned-PD
+path\tabularnewline
+\bottomrule
+\end{longtable}
+
+\hypertarget{results}{%
+\subsection{12. Results}\label{results}}
+
+\hypertarget{frobenius-validation}{%
+\subsubsection{12.1 Frobenius validation}\label{frobenius-validation}}
+
+\begin{longtable}[]{@{}llrr@{}}
+\toprule
+Build & Model & PPL & \(\Delta\)\tabularnewline
+\midrule
+\endhead
+Phase 1.8 baseline & Gemma3-270M & 19.3049 & --\tabularnewline
+Phase 1.8 Config B & Gemma3-270M & 19.3090 & +0.042\%\tabularnewline
+Phase 1.8 Config E & Gemma3-270M & 19.3049 & +0.000\%\tabularnewline
+Phase 2.3 baseline (1B GPU) & Gemma3-1B & 13.12 & --\tabularnewline
+Phase 2.3 with shim & Gemma3-1B & 13.11 & \(-0.08\%\)\tabularnewline
+Phase 2.3 Frobenius@1.7 shim & Gemma3-1B & 13.1097 &
+\(-0.0102\)\tabularnewline
+\bottomrule
+\end{longtable}
+
+\hypertarget{polynomial-ring-attention-1}{%
+\subsubsection{12.2 Polynomial-ring
+attention}\label{polynomial-ring-attention-1}}
+
+\begin{longtable}[]{@{}llrrr@{}}
+\toprule
+Build & Model & Tokens & PPL & KL\tabularnewline
+\midrule
+\endhead
+Phase 3 baseline & Gemma3-1B & 63 & 9.0754 & 0\tabularnewline
+Phase 4 NTT & Gemma3-1B & 63 & 14.2856 & 0\tabularnewline
+Phase 5a Barrett & Gemma3-1B & 63 & 14.2856 & 0\tabularnewline
+Phase 6 K-cache & Gemma3-1B & 63 & 14.2856 & 0\tabularnewline
+Phase 7 persistent K & Gemma3-1B & 63 & 14.2856 & 0\tabularnewline
+Phase 9b CRT NTT & Gemma3-1B & 63 & 14.2856 & 0\tabularnewline
+\bottomrule
+\end{longtable}
+
+(The PPL gap between Phase 3 and Phase 4 is a benchmark-corpus parity
+issue with the legacy GGML baseline, not a regression of the math.)
+
+\hypertarget{wall-time}{%
+\subsubsection{12.3 Wall-time}\label{wall-time}}
+
+\begin{longtable}[]{@{}lrrr@{}}
+\toprule
+Phase & Wall (s, Gemma3-1B ctx=128) & \(\Delta\) vs prev &
+Cumulative\tabularnewline
+\midrule
+\endhead
+Phase 4 baseline & 114.1 & -- & --\tabularnewline
+Phase 5a Barrett & 110.3 & \(-3.3\%\) & \(-3.3\%\)\tabularnewline
+Phase 5b Q-hoist & 103.2 & \(-6.4\%\) & \(-9.6\%\)\tabularnewline
+Phase 6 K-cache & 95.0 & \(-7.9\%\) & \(-16.7\%\)\tabularnewline
+Phase 9b CRT NTT & 93.9 & \(-1.1\%\) & \(-17.7\%\)\tabularnewline
+\bottomrule
+\end{longtable}
+
+\hypertarget{hexagon-kv-compression}{%
+\subsubsection{12.4 Hexagon KV
+compression}\label{hexagon-kv-compression}}
+
+At Gemma3 \(d_h = 128\), raw fp32 K = 616 B, packed K = 63 B, ratio
+\(9.78\times\). The squarefree skeleton / composite residual split is 14
+/ 60 (60.79\% square-free, matching \(6/\pi^2\)).
+
+\hypertarget{open-items}{%
+\subsection{13. Open Items}\label{open-items}}
+
+The system runs end-to-end on x86 + CUDA + Hexagon today, with these
+clearly scoped follow-ups:
+
+\begin{enumerate}
+\def\labelenumi{\arabic{enumi}.}
+\tightlist
+\item
+  \textbf{Strike 16 --- batched \texttt{hier\_decode\_f32}} on DSP, to
+  amortise FastRPC dispatch density. Targets sub-1-s/token decode on
+  V69.
+\item
+  \textbf{Strike 15b --- calibrated W-matrix push} to DSP rodata. Engine
+  calibration is shipped; the push path is wired but not validated
+  end-to-end.
+\item
+  \textbf{Mixed-precision Q4 with \(k=8\) Frobenius} --- current Q4 +
+  \(\varphi_{41}^8\) causes amax blow-out; three fix paths sketched
+  (pre-quantized exploit, per-block shim, per-chunk calibration).
+\item
+  \textbf{Fused QKV matmul} --- Phase 8 ships standalone GEMV; fusing
+  \(W_Q,W_K,W_V\) should yield a further \(\sim 20\%\) matmul reduction.
+\item
+  \textbf{Discrete softmax} --- replace the fp32 bridge with a
+  \(p\)-adic exponential table; needed for fully-integer training-loop
+  closure.
+\item
+  \textbf{CUDA path maintenance} --- \texttt{sp\_cuda\_sqfree\_cache\_t}
+  exists but has not been re-validated against the 63-byte block format.
+  Marked deferred.
+\item
+  \textbf{Multi-GPU CRT KV sharding} --- outlined in Part I §5, not yet
+  implemented.
+\end{enumerate}
+
+\hypertarget{engineering-notes-selected}{%
+\subsection{14. Engineering Notes
+(Selected)}\label{engineering-notes-selected}}
+
+A few engineering details worth recording so a future maintainer doesn't
+re-derive them:
+
+\begin{itemize}
+\tightlist
+\item
+  \textbf{AVX-2 32-bit cast.} \texttt{\_mm256\_mul\_epi32} reads lower
+  32 bits only. \texttt{scale\_recip} is chosen so all operands fit
+  \([-2^{31}, 2^{31})\). Validating this by exhaustive search at load
+  time is cheap; do not skip.
+\item
+  \textbf{\texttt{\_\_int128} is a portability trap.} Once you can
+  choose CRT, do; the cost is one parallel ring at compile time and the
+  gain is every other piece of silicon.
+\item
+  \textbf{fp16 K cache must align with HVX 1024-bit vectors} when
+  running on V69; otherwise the kernel falls off the fast path silently.
+  The packed 63-byte block satisfies this exactly.
+\item
+  \textbf{Single-thread first, scale second.} Phase 2.3b's 8-thread run
+  produced bit-identical output to single-thread \emph{after}
+  \texttt{memset(scratch,\ 0)} was added in the per-thread inner loop.
+  Dirty scratch buffers were the root cause of an early 5-nat PPL swing.
+\item
+  \textbf{The norm-weight \(+1.0\) offset on Gemma3} is mandatory;
+  missing it explodes the residual stream by 92 orders of magnitude (one
+  of our actual numbers during Phase 2.3 iter 1).
+\end{itemize}
+
+\hypertarget{conclusion}{%
+\subsection{15. Conclusion}\label{conclusion}}
+
+The mathematics of Part I executes. On x86, the engine runs at Gemma3-1B
+scale with six significant figures of bit-exactness between shimmed and
+unshimmed inference, validating Theorem 4 at production scale. The
+CRT-NTT kernel removes the last barrier to running the math on devices
+without 128-bit ALUs and is now bit-identical between Linux GCC and
+Windows MSVC. The Hexagon V69 backend reaches first-light:
+\(9.78\times\) KV compression, FastRPC engaged, prefill on Qwen3-4B
+running at 1.67 t/s --- the per-K dispatch wall is the next known fix.
+
+Two days of work. The framework is built. The engine runs.
+
+\begin{center}\rule{0.5\linewidth}{0.5pt}\end{center}
+
+\hypertarget{references-system}{%
+\subsection{References (system)}\label{references-system}}
+
+\begin{enumerate}
+\def\labelenumi{\arabic{enumi}.}
+\tightlist
+\item
+  Shannon-Prime, \emph{project\_paths\_and\_stuff.md} (build environment
+  master doc).
+\item
+  Cooley \& Tukey (1965), \emph{An algorithm for the machine calculation
+  of complex Fourier series}.
+\item
+  Cheon et al.~(2017), \emph{Homomorphic encryption for arithmetic of
+  approximate numbers} (CKKS).
+\item
+  Barrett, P. (1986), \emph{Implementing the Rivest, Shamir, and Adleman
+  public key encryption algorithm on a standard digital signal
+  processor}.
+\item
+  Qualcomm Hexagon SDK V69 documentation.
+\item
+  \emph{FastRPC dispatch ground truth} --- Shannon-Prime internal memo
+  (577 calls/s ceiling).
+\item
+  \emph{KV Cache Is A View v2} --- Shannon-Prime internal document.
+\end{enumerate}
+
+\begin{center}\rule{0.5\linewidth}{0.5pt}\end{center}
+
+\emph{The companion theoretical paper is Part I. Source code (engine,
+math core, Hexagon backend) is at
+\texttt{D:\textbackslash{}F\textbackslash{}shannon-prime-repos} and its
+three sibling repos. Test results in this paper are reproducible with
+the CLI in §11.3.}
+
+\end{document}

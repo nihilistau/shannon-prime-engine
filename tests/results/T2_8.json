@@ -1,0 +1,14 @@
+{
+  "test_id": "T2.8", "phase": 3,
+  "name": "Knight-Skeleton fallback (full + novel)",
+  "config": { "head_dim": 128, "capacity": 64 },
+  "metrics": {
+    "final_cache_size": 64,
+    "decision": 2,
+    "replaced_slot_idx": 62,
+    "gen_before": 62, "gen_after": 64,
+    "min_var_before": 3.8342, "new_skel_var": 9999.0000,
+    "replacements_total": 1
+  },
+  "verdict": "PASS"
+}

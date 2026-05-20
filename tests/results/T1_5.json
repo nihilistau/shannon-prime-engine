@@ -1,0 +1,10 @@
+{
+  "test_id": "T1.5", "phase": 1,
+  "name": "anchor count 14 +/- 2",
+  "config": { "head_dim": 128, "trials": 1000, "band_lo": 12, "band_hi": 16 },
+  "metrics": {
+    "min_anchors": 14, "max_anchors": 14, "mean_anchors": 14.00,
+    "out_of_band": false, "tau_A_default": 0.0000
+  },
+  "verdict": "PASS"
+}

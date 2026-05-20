@@ -1,0 +1,11 @@
+{
+  "test_id": "T2.6", "phase": 3,
+  "name": "eviction on subsumption",
+  "metrics": {
+    "insert_K_decision": 1,
+    "insert_Q_decision": 0,
+    "evictions_total": 1,
+    "K_node_count": 60, "Q_node_count": 30
+  },
+  "verdict": "PASS"
+}

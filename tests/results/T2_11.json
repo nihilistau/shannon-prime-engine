@@ -1,0 +1,14 @@
+{
+  "test_id": "T2.11", "phase": 5,
+  "name": "sieve insert wall-time at capacity 4096",
+  "config": { "head_dim": 128, "capacity": 4096, "inserts": 1000 },
+  "metrics": {
+    "mean_us": 0.957, "p50_us": 0.900,
+    "p99_us": 1.500, "p999_us": 3.800, "max_us": 3.800,
+    "tier0_survival_rate": 0.0338,
+    "tier1_survival_rate": 0.4195,
+    "slot_tests": 70480, "tier1_tests": 2384, "full_embeds": 1000,
+    "exit_gate_p99_us": 50.0
+  },
+  "verdict": "PASS"
+}

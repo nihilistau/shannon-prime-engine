@@ -1,0 +1,10 @@
+{
+  "test_id": "T1.8", "phase": 2,
+  "name": "transitivity (truncation triples)",
+  "config": { "head_dim": 128, "trials": 100 },
+  "metrics": {
+    "triples_pass": 100,
+    "T1_in_T2_ok": 100, "T1_in_T3_ok": 100
+  },
+  "verdict": "PASS"
+}

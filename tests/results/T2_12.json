@@ -1,0 +1,16 @@
+{
+  "test_id": "T2.12", "phase": 3,
+  "name": "Extended-Domain Reduction invariant",
+  "config": {
+    "head_dim": 128, "cache_size": 200,
+    "witnesses": 50, "ro_count": 64,
+    "predicates": ["anchor_count", "label_b_count", "max_depth"]
+  },
+  "metrics": {
+    "total_checks": 150, "failures": 0,
+    "fail_anchor_count": 0,
+    "fail_label_b": 0,
+    "fail_max_depth": 0
+  },
+  "verdict": "PASS"
+}

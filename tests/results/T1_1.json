@@ -1,0 +1,11 @@
+{
+  "test_id": "T1.1", "phase": 1,
+  "name": "encoder determinism",
+  "config": { "head_dim": 128, "seed": 42, "trials": 1000 },
+  "metrics": {
+    "bit_identical_count": 1000,
+    "trials": 1000,
+    "node_count": 60
+  },
+  "verdict": "PASS"
+}
