@@ -1,0 +1,144 @@
+[ruler-lite] sp-engine exited 4294967295
+ggml_cuda_init: found 1 CUDA devices (Total VRAM: 12287 MiB):
+  Device 0: NVIDIA GeForce RTX 2060, compute capability 7.5, VMM: yes, VRAM: 12287 MiB
+[sp-engine] CPU backend: 4 threads
+[sp_native] hparams: n_embd=1152 n_head=4 n_head_kv=1 head_dim=256 n_ff=6912 n_vocab=262144 n_layer=26 rope_base=1000000 rms_eps=1.0e-06
+[sp_native] kv: SP-banded cache (n_layer=26 n_head_kv=1 head_dim=256 max_seq=4096) — shadow cache: n_layer=26 n_head_kv=1 head_dim=256 pad_dim=256 max_seq=4096 compression=4.23x
+[sp_threadpool] 4 threads ready (1 driver + 3 workers)
+[sp-engine] native forward path active (SHANNON_PRIME_NATIVE=1)
+[sp-engine:diag] bind_cache: is_gpu=0 n_layer=26 n_head_kv=1 head_dim=256 max_seq=307
+[sp_native] matmul: unsupported W dtype=-1 (no fallback)
+[sp_native] layer 0 failed (rc=-3)
+[sp-engine] native prefill failed
+[ruler-lite] sp-engine exited 4294967295
+ggml_cuda_init: found 1 CUDA devices (Total VRAM: 12287 MiB):
+  Device 0: NVIDIA GeForce RTX 2060, compute capability 7.5, VMM: yes, VRAM: 12287 MiB
+[sp-engine] CPU backend: 4 threads
+[sp_native] hparams: n_embd=1152 n_head=4 n_head_kv=1 head_dim=256 n_ff=6912 n_vocab=262144 n_layer=26 rope_base=1000000 rms_eps=1.0e-06
+[sp_native] kv: SP-banded cache (n_layer=26 n_head_kv=1 head_dim=256 max_seq=4096) — shadow cache: n_layer=26 n_head_kv=1 head_dim=256 pad_dim=256 max_seq=4096 compression=4.23x
+[sp_threadpool] 4 threads ready (1 driver + 3 workers)
+[sp-engine] native forward path active (SHANNON_PRIME_NATIVE=1)
+[sp-engine:diag] bind_cache: is_gpu=0 n_layer=26 n_head_kv=1 head_dim=256 max_seq=307
+[sp_native] matmul: unsupported W dtype=-1 (no fallback)
+[sp_native] layer 0 failed (rc=-3)
+[sp-engine] native prefill failed
+[ruler-lite] sp-engine exited 4294967295
+ggml_cuda_init: found 1 CUDA devices (Total VRAM: 12287 MiB):
+  Device 0: NVIDIA GeForce RTX 2060, compute capability 7.5, VMM: yes, VRAM: 12287 MiB
+[sp-engine] CPU backend: 4 threads
+[sp_native] hparams: n_embd=1152 n_head=4 n_head_kv=1 head_dim=256 n_ff=6912 n_vocab=262144 n_layer=26 rope_base=1000000 rms_eps=1.0e-06
+[sp_native] kv: SP-banded cache (n_layer=26 n_head_kv=1 head_dim=256 max_seq=4096) — shadow cache: n_layer=26 n_head_kv=1 head_dim=256 pad_dim=256 max_seq=4096 compression=4.23x
+[sp_threadpool] 4 threads ready (1 driver + 3 workers)
+[sp-engine] native forward path active (SHANNON_PRIME_NATIVE=1)
+[sp-engine:diag] bind_cache: is_gpu=0 n_layer=26 n_head_kv=1 head_dim=256 max_seq=266
+[sp_native] matmul: unsupported W dtype=-1 (no fallback)
+[sp_native] layer 0 failed (rc=-3)
+[sp-engine] native prefill failed
+[ruler-lite] sp-engine exited 4294967295
+ggml_cuda_init: found 1 CUDA devices (Total VRAM: 12287 MiB):
+  Device 0: NVIDIA GeForce RTX 2060, compute capability 7.5, VMM: yes, VRAM: 12287 MiB
+[sp-engine] CPU backend: 4 threads
+[sp_native] hparams: n_embd=1152 n_head=4 n_head_kv=1 head_dim=256 n_ff=6912 n_vocab=262144 n_layer=26 rope_base=1000000 rms_eps=1.0e-06
+[sp_native] kv: SP-banded cache (n_layer=26 n_head_kv=1 head_dim=256 max_seq=4096) — shadow cache: n_layer=26 n_head_kv=1 head_dim=256 pad_dim=256 max_seq=4096 compression=4.23x
+[sp_threadpool] 4 threads ready (1 driver + 3 workers)
+[sp-engine] native forward path active (SHANNON_PRIME_NATIVE=1)
+[sp-engine:diag] bind_cache: is_gpu=0 n_layer=26 n_head_kv=1 head_dim=256 max_seq=266
+[sp_native] matmul: unsupported W dtype=-1 (no fallback)
+[sp_native] layer 0 failed (rc=-3)
+[sp-engine] native prefill failed
+[ruler-lite] sp-engine exited 4294967295
+ggml_cuda_init: found 1 CUDA devices (Total VRAM: 12287 MiB):
+  Device 0: NVIDIA GeForce RTX 2060, compute capability 7.5, VMM: yes, VRAM: 12287 MiB
+[sp-engine] CPU backend: 4 threads
+[sp_native] hparams: n_embd=1152 n_head=4 n_head_kv=1 head_dim=256 n_ff=6912 n_vocab=262144 n_layer=26 rope_base=1000000 rms_eps=1.0e-06
+[sp_native] kv: SP-banded cache (n_layer=26 n_head_kv=1 head_dim=256 max_seq=4096) — shadow cache: n_layer=26 n_head_kv=1 head_dim=256 pad_dim=256 max_seq=4096 compression=4.23x
+[sp_threadpool] 4 threads ready (1 driver + 3 workers)
+[sp-engine] native forward path active (SHANNON_PRIME_NATIVE=1)
+[sp-engine:diag] bind_cache: is_gpu=0 n_layer=26 n_head_kv=1 head_dim=256 max_seq=250
+[sp_native] matmul: unsupported W dtype=-1 (no fallback)
+[sp_native] layer 0 failed (rc=-3)
+[sp-engine] native prefill failed
+[ruler-lite] sp-engine exited 4294967295
+ggml_cuda_init: found 1 CUDA devices (Total VRAM: 12287 MiB):
+  Device 0: NVIDIA GeForce RTX 2060, compute capability 7.5, VMM: yes, VRAM: 12287 MiB
+[sp-engine] CPU backend: 4 threads
+[sp_native] hparams: n_embd=1152 n_head=4 n_head_kv=1 head_dim=256 n_ff=6912 n_vocab=262144 n_layer=26 rope_base=1000000 rms_eps=1.0e-06
+[sp_native] kv: SP-banded cache (n_layer=26 n_head_kv=1 head_dim=256 max_seq=4096) — shadow cache: n_layer=26 n_head_kv=1 head_dim=256 pad_dim=256 max_seq=4096 compression=4.23x
+[sp_threadpool] 4 threads ready (1 driver + 3 workers)
+[sp-engine] native forward path active (SHANNON_PRIME_NATIVE=1)
+[sp-engine:diag] bind_cache: is_gpu=0 n_layer=26 n_head_kv=1 head_dim=256 max_seq=250
+[sp_native] matmul: unsupported W dtype=-1 (no fallback)
+[sp_native] layer 0 failed (rc=-3)
+[sp-engine] native prefill failed
+[ruler-lite] sp-engine exited 4294967295
+ggml_cuda_init: found 1 CUDA devices (Total VRAM: 12287 MiB):
+  Device 0: NVIDIA GeForce RTX 2060, compute capability 7.5, VMM: yes, VRAM: 12287 MiB
+[sp-engine] CPU backend: 4 threads
+[sp_native] hparams: n_embd=1152 n_head=4 n_head_kv=1 head_dim=256 n_ff=6912 n_vocab=262144 n_layer=26 rope_base=1000000 rms_eps=1.0e-06
+[sp_native] kv: SP-banded cache (n_layer=26 n_head_kv=1 head_dim=256 max_seq=4096) — shadow cache: n_layer=26 n_head_kv=1 head_dim=256 pad_dim=256 max_seq=4096 compression=4.23x
+[sp_threadpool] 4 threads ready (1 driver + 3 workers)
+[sp-engine] native forward path active (SHANNON_PRIME_NATIVE=1)
+[sp-engine:diag] bind_cache: is_gpu=0 n_layer=26 n_head_kv=1 head_dim=256 max_seq=285
+[sp_native] matmul: unsupported W dtype=-1 (no fallback)
+[sp_native] layer 0 failed (rc=-3)
+[sp-engine] native prefill failed
+[ruler-lite] sp-engine exited 4294967295
+ggml_cuda_init: found 1 CUDA devices (Total VRAM: 12287 MiB):
+  Device 0: NVIDIA GeForce RTX 2060, compute capability 7.5, VMM: yes, VRAM: 12287 MiB
+[sp-engine] CPU backend: 4 threads
+[sp_native] hparams: n_embd=1152 n_head=4 n_head_kv=1 head_dim=256 n_ff=6912 n_vocab=262144 n_layer=26 rope_base=1000000 rms_eps=1.0e-06
+[sp_native] kv: SP-banded cache (n_layer=26 n_head_kv=1 head_dim=256 max_seq=4096) — shadow cache: n_layer=26 n_head_kv=1 head_dim=256 pad_dim=256 max_seq=4096 compression=4.23x
+[sp_threadpool] 4 threads ready (1 driver + 3 workers)
+[sp-engine] native forward path active (SHANNON_PRIME_NATIVE=1)
+[sp-engine:diag] bind_cache: is_gpu=0 n_layer=26 n_head_kv=1 head_dim=256 max_seq=285
+[sp_native] matmul: unsupported W dtype=-1 (no fallback)
+[sp_native] layer 0 failed (rc=-3)
+[sp-engine] native prefill failed
+[ruler-lite] sp-engine exited 4294967295
+ggml_cuda_init: found 1 CUDA devices (Total VRAM: 12287 MiB):
+  Device 0: NVIDIA GeForce RTX 2060, compute capability 7.5, VMM: yes, VRAM: 12287 MiB
+[sp-engine] CPU backend: 4 threads
+[sp_native] hparams: n_embd=1152 n_head=4 n_head_kv=1 head_dim=256 n_ff=6912 n_vocab=262144 n_layer=26 rope_base=1000000 rms_eps=1.0e-06
+[sp_native] kv: SP-banded cache (n_layer=26 n_head_kv=1 head_dim=256 max_seq=4096) — shadow cache: n_layer=26 n_head_kv=1 head_dim=256 pad_dim=256 max_seq=4096 compression=4.23x
+[sp_threadpool] 4 threads ready (1 driver + 3 workers)
+[sp-engine] native forward path active (SHANNON_PRIME_NATIVE=1)
+[sp-engine:diag] bind_cache: is_gpu=0 n_layer=26 n_head_kv=1 head_dim=256 max_seq=269
+[sp_native] matmul: unsupported W dtype=-1 (no fallback)
+[sp_native] layer 0 failed (rc=-3)
+[sp-engine] native prefill failed
+[ruler-lite] sp-engine exited 4294967295
+ggml_cuda_init: found 1 CUDA devices (Total VRAM: 12287 MiB):
+  Device 0: NVIDIA GeForce RTX 2060, compute capability 7.5, VMM: yes, VRAM: 12287 MiB
+[sp-engine] CPU backend: 4 threads
+[sp_native] hparams: n_embd=1152 n_head=4 n_head_kv=1 head_dim=256 n_ff=6912 n_vocab=262144 n_layer=26 rope_base=1000000 rms_eps=1.0e-06
+[sp_native] kv: SP-banded cache (n_layer=26 n_head_kv=1 head_dim=256 max_seq=4096) — shadow cache: n_layer=26 n_head_kv=1 head_dim=256 pad_dim=256 max_seq=4096 compression=4.23x
+[sp_threadpool] 4 threads ready (1 driver + 3 workers)
+[sp-engine] native forward path active (SHANNON_PRIME_NATIVE=1)
+[sp-engine:diag] bind_cache: is_gpu=0 n_layer=26 n_head_kv=1 head_dim=256 max_seq=269
+[sp_native] matmul: unsupported W dtype=-1 (no fallback)
+[sp_native] layer 0 failed (rc=-3)
+[sp-engine] native prefill failed
+[ruler-lite] sp-engine exited 4294967295
+ggml_cuda_init: found 1 CUDA devices (Total VRAM: 12287 MiB):
+  Device 0: NVIDIA GeForce RTX 2060, compute capability 7.5, VMM: yes, VRAM: 12287 MiB
+[sp-engine] CPU backend: 4 threads
+[sp_native] hparams: n_embd=1152 n_head=4 n_head_kv=1 head_dim=256 n_ff=6912 n_vocab=262144 n_layer=26 rope_base=1000000 rms_eps=1.0e-06
+[sp_native] kv: SP-banded cache (n_layer=26 n_head_kv=1 head_dim=256 max_seq=4096) — shadow cache: n_layer=26 n_head_kv=1 head_dim=256 pad_dim=256 max_seq=4096 compression=4.23x
+[sp_threadpool] 4 threads ready (1 driver + 3 workers)
+[sp-engine] native forward path active (SHANNON_PRIME_NATIVE=1)
+[sp-engine:diag] bind_cache: is_gpu=0 n_layer=26 n_head_kv=1 head_dim=256 max_seq=284
+[sp_native] matmul: unsupported W dtype=-1 (no fallback)
+[sp_native] layer 0 failed (rc=-3)
+[sp-engine] native prefill failed
+[ruler-lite] sp-engine exited 4294967295
+ggml_cuda_init: found 1 CUDA devices (Total VRAM: 12287 MiB):
+  Device 0: NVIDIA GeForce RTX 2060, compute capability 7.5, VMM: yes, VRAM: 12287 MiB
+[sp-engine] CPU backend: 4 threads
+[sp_native] hparams: n_embd=1152 n_head=4 n_head_kv=1 head_dim=256 n_ff=6912 n_vocab=262144 n_layer=26 rope_base=1000000 rms_eps=1.0e-06
+[sp_native] kv: SP-banded cache (n_layer=26 n_head_kv=1 head_dim=256 max_seq=4096) — shadow cache: n_layer=26 n_head_kv=1 head_dim=256 pad_dim=256 max_seq=4096 compression=4.23x
+[sp_threadpool] 4 threads ready (1 driver + 3 workers)
+[sp-engine] native forward path active (SHANNON_PRIME_NATIVE=1)
+[sp-engine:diag] bind_cache: is_gpu=0 n_layer=26 n_head_kv=1 head_dim=256 max_seq=284
+[sp_native] matmul: unsupported W dtype=-1 (no fallback)
+[sp_native] layer 0 failed (rc=-3)
+[sp-engine] native prefill failed

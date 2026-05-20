@@ -1,0 +1,189 @@
+{
+  "ctx": 512,
+  "trials": 2,
+  "depths": [
+    "shallow",
+    "middle",
+    "deep"
+  ],
+  "model": "D:\\Files\\Models\\Mine\\gemma-3-1b-it\\gemma-3-1b-it-Q4_0\\gemma-3-1b-it-Q4_0.gguf",
+  "seed": 42,
+  "results": [
+    {
+      "depth": "shallow",
+      "depth_pct": 0.1,
+      "trial": 0,
+      "topic": "violins",
+      "value": "tungsten",
+      "mode": "softmax",
+      "ctx": 512,
+      "hit": false,
+      "wall_s": 0.9207355976104736,
+      "out_head": ""
+    },
+    {
+      "depth": "shallow",
+      "depth_pct": 0.1,
+      "trial": 0,
+      "topic": "violins",
+      "value": "tungsten",
+      "mode": "ultra",
+      "ctx": 512,
+      "hit": false,
+      "wall_s": 0.7960550785064697,
+      "out_head": ""
+    },
+    {
+      "depth": "shallow",
+      "depth_pct": 0.1,
+      "trial": 1,
+      "topic": "gardens",
+      "value": "saffron",
+      "mode": "softmax",
+      "ctx": 512,
+      "hit": false,
+      "wall_s": 0.7557101249694824,
+      "out_head": ""
+    },
+    {
+      "depth": "shallow",
+      "depth_pct": 0.1,
+      "trial": 1,
+      "topic": "gardens",
+      "value": "saffron",
+      "mode": "ultra",
+      "ctx": 512,
+      "hit": false,
+      "wall_s": 0.7433915138244629,
+      "out_head": ""
+    },
+    {
+      "depth": "middle",
+      "depth_pct": 0.5,
+      "trial": 0,
+      "topic": "monasteries",
+      "value": "marmalade",
+      "mode": "softmax",
+      "ctx": 512,
+      "hit": false,
+      "wall_s": 0.778961181640625,
+      "out_head": ""
+    },
+    {
+      "depth": "middle",
+      "depth_pct": 0.5,
+      "trial": 0,
+      "topic": "monasteries",
+      "value": "marmalade",
+      "mode": "ultra",
+      "ctx": 512,
+      "hit": false,
+      "wall_s": 0.7868993282318115,
+      "out_head": ""
+    },
+    {
+      "depth": "middle",
+      "depth_pct": 0.5,
+      "trial": 1,
+      "topic": "librarians",
+      "value": "obsidian",
+      "mode": "softmax",
+      "ctx": 512,
+      "hit": false,
+      "wall_s": 0.7396683692932129,
+      "out_head": ""
+    },
+    {
+      "depth": "middle",
+      "depth_pct": 0.5,
+      "trial": 1,
+      "topic": "librarians",
+      "value": "obsidian",
+      "mode": "ultra",
+      "ctx": 512,
+      "hit": false,
+      "wall_s": 0.7374303340911865,
+      "out_head": ""
+    },
+    {
+      "depth": "deep",
+      "depth_pct": 0.9,
+      "trial": 0,
+      "topic": "librarians",
+      "value": "obsidian",
+      "mode": "softmax",
+      "ctx": 512,
+      "hit": false,
+      "wall_s": 0.8755965232849121,
+      "out_head": ""
+    },
+    {
+      "depth": "deep",
+      "depth_pct": 0.9,
+      "trial": 0,
+      "topic": "librarians",
+      "value": "obsidian",
+      "mode": "ultra",
+      "ctx": 512,
+      "hit": false,
+      "wall_s": 0.8180909156799316,
+      "out_head": ""
+    },
+    {
+      "depth": "deep",
+      "depth_pct": 0.9,
+      "trial": 1,
+      "topic": "hurricanes",
+      "value": "petunia",
+      "mode": "softmax",
+      "ctx": 512,
+      "hit": false,
+      "wall_s": 0.8364365100860596,
+      "out_head": ""
+    },
+    {
+      "depth": "deep",
+      "depth_pct": 0.9,
+      "trial": 1,
+      "topic": "hurricanes",
+      "value": "petunia",
+      "mode": "ultra",
+      "ctx": 512,
+      "hit": false,
+      "wall_s": 0.8156251907348633,
+      "out_head": ""
+    }
+  ],
+  "summary": {
+    "softmax|shallow": {
+      "hit": 0,
+      "n": 2,
+      "wall_sum": 1.676445722579956
+    },
+    "ultra|shallow": {
+      "hit": 0,
+      "n": 2,
+      "wall_sum": 1.5394465923309326
+    },
+    "softmax|middle": {
+      "hit": 0,
+      "n": 2,
+      "wall_sum": 1.518629550933838
+    },
+    "ultra|middle": {
+      "hit": 0,
+      "n": 2,
+      "wall_sum": 1.524329662322998
+    },
+    "softmax|deep": {
+      "hit": 0,
+      "n": 2,
+      "wall_sum": 1.7120330333709717
+    },
+    "ultra|deep": {
+      "hit": 0,
+      "n": 2,
+      "wall_sum": 1.633716106414795
+    }
+  }
+}

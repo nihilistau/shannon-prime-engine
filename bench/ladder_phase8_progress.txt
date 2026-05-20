@@ -10,3 +10,11 @@ PPL_native = 7629.9336  (over 255 tokens, 1 chunks at ctx=512, frobenius_quant=1
 perplexity = 7629.9336 (n=1, ctx=512)
  
 === ctx=1024 softmax === 
+PPL_native = 28.8196  (over 511 tokens, 1 chunks at ctx=1024, frobenius_quant=1 sato_tate=0)
+perplexity = 28.8196 (n=1, ctx=1024)
+ 
+=== ctx=1024 ultraproduct === 
+PPL_native = 32407.5164  (over 511 tokens, 1 chunks at ctx=1024, frobenius_quant=1 sato_tate=0)
+perplexity = 32407.5164 (n=1, ctx=1024)
+ 
+=== ctx=2048 softmax === 

@@ -1,0 +1,32 @@
+Phase 8 RULER-lite — ctx=512  depths=['shallow', 'middle', 'deep']  trials=2
+Engine: D:\F\shannon-prime-repos\shannon-prime-engine\build-cuda\bin\sp-engine.exe
+Model:  D:\Files\Models\Mine\gemma-3-1b-it\gemma-3-1b-it-Q4_0\gemma-3-1b-it-Q4_0.gguf
+
+--- d=shallow(0.10) t=0  needle=('violins','tungsten') ---
+  [softmax ] hit=0  wall=   0.9s  out=''
+  [ultra   ] hit=0  wall=   0.8s  out=''
+--- d=shallow(0.10) t=1  needle=('gardens','saffron') ---
+  [softmax ] hit=0  wall=   0.8s  out=''
+  [ultra   ] hit=0  wall=   0.7s  out=''
+--- d=middle(0.50) t=0  needle=('monasteries','marmalade') ---
+  [softmax ] hit=0  wall=   0.8s  out=''
+  [ultra   ] hit=0  wall=   0.8s  out=''
+--- d=middle(0.50) t=1  needle=('librarians','obsidian') ---
+  [softmax ] hit=0  wall=   0.7s  out=''
+  [ultra   ] hit=0  wall=   0.7s  out=''
+--- d=deep(0.90) t=0  needle=('librarians','obsidian') ---
+  [softmax ] hit=0  wall=   0.9s  out=''
+  [ultra   ] hit=0  wall=   0.8s  out=''
+--- d=deep(0.90) t=1  needle=('hurricanes','petunia') ---
+  [softmax ] hit=0  wall=   0.8s  out=''
+  [ultra   ] hit=0  wall=   0.8s  out=''
+
+=== summary ===
+  mode=softmax   depth=deep     recall=  0.0%  (0/2)  avg_wall=0.9s
+  mode=softmax   depth=middle   recall=  0.0%  (0/2)  avg_wall=0.8s
+  mode=softmax   depth=shallow  recall=  0.0%  (0/2)  avg_wall=0.8s
+  mode=ultra     depth=deep     recall=  0.0%  (0/2)  avg_wall=0.8s
+  mode=ultra     depth=middle   recall=  0.0%  (0/2)  avg_wall=0.8s
+  mode=ultra     depth=shallow  recall=  0.0%  (0/2)  avg_wall=0.8s
+
+Wrote ruler_lite_ctx512.json
