@@ -1,0 +1,24 @@
+Phase 10 lambda sweep starting Thu 21/05/2026  8:11:33.82 
+Phase 8e baseline: softmax 13.9257/15.8494 (0.879), ultra-b4 20726.01/50565.40 (0.410) 
+Phase 9 baseline:  L0.05 39077.94/84106.82 (0.465), L0.20 66162.47/90412.96 (0.732) 
+Phase 10 patch: splitmix64-shuffled q-bank index (seed 0x9E3779B97F4A7C15) 
+ 
+=== lambda=0.05 === 
+--- ultra-b4-L0.05 planted --- 
+PPL_native = 34647.9045  (over 510 tokens, 2 chunks at ctx=512, frobenius_quant=1 sato_tate=0)
+perplexity = 34647.9045 (n=2, ctx=512)
+ 
+--- ultra-b4-L0.05 control --- 
+PPL_native = 32026.1387  (over 510 tokens, 2 chunks at ctx=512, frobenius_quant=1 sato_tate=0)
+perplexity = 32026.1387 (n=2, ctx=512)
+ 
+=== lambda=0.20 === 
+--- ultra-b4-L0.20 planted --- 
+PPL_native = 81582.8176  (over 510 tokens, 2 chunks at ctx=512, frobenius_quant=1 sato_tate=0)
+perplexity = 81582.8176 (n=2, ctx=512)
+ 
+--- ultra-b4-L0.20 control --- 
+PPL_native = 131809.2217  (over 510 tokens, 2 chunks at ctx=512, frobenius_quant=1 sato_tate=0)
+perplexity = 131809.2217 (n=2, ctx=512)
+ 
+DONE Thu 21/05/2026  8:44:05.90 
