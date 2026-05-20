@@ -127,6 +127,7 @@ set(SP_CORE_SRC
     ${SP_CORE_DIR}/core/sp_kste_pack.c
     ${SP_CORE_DIR}/core/sp_kste_embed.c
     ${SP_CORE_DIR}/core/sp_kste_choice.c
+    ${SP_CORE_DIR}/core/sp_kste_ramanujan.c
     ${SP_CORE_DIR}/core/sp_frobenius.c
     ${SP_CORE_DIR}/core/sp_ec_weil.c
     ${SP_CORE_DIR}/core/sp_poly_ring.c

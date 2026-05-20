@@ -197,6 +197,11 @@ struct sp_forward_context {
     // kernel encodes the top-m K-vectors and routes the reduction
     // through sp_kste_select_canonical (Paper IV §10).
     int ultraproduct_bracket = 1;
+    // Phase 9 — Ramanujan-Fourier modulation strength for the bracket
+    // path.  When > 0, K-vectors are position-modulated by Kluyver
+    // c_q(p)/q² before encoding.  Engages position-aware coprimality
+    // structure in the ⪯_d equivalence relation.
+    float ultraproduct_ramanujan_lambda = 0.0f;
 
     int     n_layers   = 0;
     int     n_embd     = 0;

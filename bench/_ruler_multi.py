@@ -158,6 +158,7 @@ def build_corpora(corpus_text: str, ctx_target: int,
 def run_perplexity(model: Path, corpus_path: Path, *,
                    ctx: int, chunks: int, ultraproduct: bool,
                    bracket: int = 1,
+                   ramanujan_lambda: float = 0.0,
                    timeout_s: float = 1500.0) -> tuple[float | None, float]:
     cmd = [
         str(ENG), "perplexity",
@@ -171,6 +172,8 @@ def run_perplexity(model: Path, corpus_path: Path, *,
         cmd += ["--ultraproduct-attn", "principal"]
         if bracket > 1:
             cmd += ["--ultraproduct-bracket", str(bracket)]
+        if ramanujan_lambda > 0.0:
+            cmd += ["--kste-ramanujan-lambda", str(ramanujan_lambda)]
     cmd.append(str(corpus_path))
 
     env = dict(os.environ)
@@ -201,6 +204,9 @@ def main() -> int:
     ap.add_argument("--chunks",    type=int, default=2)
     ap.add_argument("--bracket",   type=int, default=4,
                     help="F-over-top-m bracket for ultraproduct mode.")
+    ap.add_argument("--ramanujan-lambda", type=float, default=0.0,
+                    help="Phase-9 c_q(p)/q² modulation strength on the "
+                         "F-over-top-m bracket.  0 = no-op (Phase 8 baseline).")
     ap.add_argument("--cluster-pct", type=float, default=0.50,
                     help="Depth at which the 5-needle block is planted.")
     ap.add_argument("--timeout",   type=float, default=1500.0)
@@ -236,6 +242,7 @@ def main() -> int:
                                         ctx=args.ctx, chunks=args.chunks,
                                         ultraproduct=ultra,
                                         bracket=args.bracket,
+                                        ramanujan_lambda=args.ramanujan_lambda,
                                         timeout_s=args.timeout)
             print(f"  PPL = {ppl}   wall = {wall:.1f}s", flush=True)
             cells.append({"mode": mode, "corpus": corpus_kind,

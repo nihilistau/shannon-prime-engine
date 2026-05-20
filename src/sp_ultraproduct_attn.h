@@ -81,6 +81,7 @@ void sp_ultraproduct_attn_principal(const sp_ok_tensor& q,
                                       const uint8_t* evicted_mask = nullptr,
                                       float evicted_gamma         = 0.0f,
                                       int32_t* selected_pos       = nullptr,
-                                      int   bracket               = 1);
+                                      int   bracket               = 1,
+                                      float ramanujan_lambda      = 0.0f);
 
 }  // namespace sp::engine

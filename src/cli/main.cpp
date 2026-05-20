@@ -233,6 +233,11 @@ static void usage(const char* prog) {
         "                               >1 = pick top-m positions, encode their K-vectors,\n"
         "                                    use sp_kste_select_canonical (Choice Operator F)\n"
         "                                    to deterministically resolve the ⪯_d class.\n"
+        "  --kste-ramanujan-lambda <f>  Phase-9 Ramanujan-Fourier modulation strength.\n"
+        "                               0 = no-op (default).  >0 modulates each bracket\n"
+        "                               K-vector by lambda * c_q(position) / q^2 (q-bank\n"
+        "                               {2,3,5,6,10}) before encoding.  Differentiates same\n"
+        "                               K at different positions in the ⪯_d relation.\n"
         "  --frobenius-quant            Enable single-prime Frobenius quantization\n"
         "                               (Config B): calibration-free fp8 via φ_p^k.\n"
         "  --frobenius-quant-p <p>      Split prime in K=Q(√-163). Default 41\n"
@@ -377,6 +382,11 @@ static int parse_config_flag(sp::engine::Config& cfg, const char* a, const char*
     if (a_eq("--ultraproduct-bracket") && has_next) {
         cfg.ultraproduct_bracket = (int)std::atoll(next);
         if (cfg.ultraproduct_bracket < 1) cfg.ultraproduct_bracket = 1;
+        return 2;
+    }
+    if (a_eq("--kste-ramanujan-lambda") && has_next) {
+        cfg.kste_ramanujan_lambda = (float)std::atof(next);
+        if (cfg.kste_ramanujan_lambda < 0.0f) cfg.kste_ramanujan_lambda = 0.0f;
         return 2;
     }
     if (a_eq("--frobenius-q8"))                     { cfg.frobenius_q8 = true; return 1; }
@@ -1029,15 +1039,18 @@ int main(int argc, char** argv) {
 
             // Phase 7: ultraproduct attention dispatch (default 0 = soft
             // attention; 1 = principal ultrafilter / hard Top-1).
-            ctx.ultraproduct_mode    = pc.ultraproduct_attn;
-            ctx.ultraproduct_bracket = pc.ultraproduct_bracket;
+            ctx.ultraproduct_mode             = pc.ultraproduct_attn;
+            ctx.ultraproduct_bracket          = pc.ultraproduct_bracket;
+            ctx.ultraproduct_ramanujan_lambda = pc.kste_ramanujan_lambda;
             if (ctx.ultraproduct_mode > 0) {
                 std::fprintf(stderr,
                     "[sp-engine] perplexity-native: ultraproduct-attn=%s "
-                    "bracket=%d (Phase 7/8d, INFERENCE-ONLY)\n",
+                    "bracket=%d ramanujan_lambda=%.4f "
+                    "(Phase 7/8d/9, INFERENCE-ONLY)\n",
                     ctx.ultraproduct_mode == 1 ? "principal" :
                     ctx.ultraproduct_mode == 2 ? "nonprincipal" : "?",
-                    ctx.ultraproduct_bracket);
+                    ctx.ultraproduct_bracket,
+                    ctx.ultraproduct_ramanujan_lambda);
             }
 
             // Phase 4b: Friedman sieve setup (after context_init populates

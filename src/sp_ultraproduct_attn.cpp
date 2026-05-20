@@ -36,7 +36,8 @@ void sp_ultraproduct_attn_principal(const sp_ok_tensor& q,
                                       const uint8_t* evicted_mask,
                                       float evicted_gamma,
                                       int32_t* selected_pos,
-                                      int   bracket)
+                                      int   bracket,
+                                      float ramanujan_lambda)
 {
     if (q.data == nullptr || k.data == nullptr || v.data == nullptr ||
         out.data == nullptr) return;
@@ -222,6 +223,11 @@ void sp_ultraproduct_attn_principal(const sp_ok_tensor& q,
                 }
 
                 // (2) Encode each top-m K-vector into an sp_kste_tree.
+                //
+                // Phase 9 — when ramanujan_lambda > 0, apply Kluyver
+                // c_q(t)/q² modulation to K before encoding.  Same
+                // K-vector at different positions t → different tree
+                // → richer ⪯_d equivalence relation feeding F.
                 int n_valid = 0;
                 for (int j = 0; j < m; ++j) {
                     const int64_t t = top[j].second;
@@ -231,6 +237,12 @@ void sp_ultraproduct_attn_principal(const sp_ok_tensor& q,
                             k.data[((int64_t)kv_h * head_dim + d) * T_stride + t];
                         k_decode_buf[d] =
                             (float)((double)k_dt.a / k_div_inner);
+                    }
+                    if (ramanujan_lambda > 0.0f) {
+                        sp_kste_ramanujan_modulate(k_decode_buf.data(),
+                                                    head_dim,
+                                                    (int)t,
+                                                    ramanujan_lambda);
                     }
                     sp_kste_encode(&bracket_trees[n_valid],
                                     k_decode_buf.data(),

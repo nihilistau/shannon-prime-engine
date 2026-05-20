@@ -190,6 +190,13 @@ struct Config {
     // to deterministically resolve the equivalence class.  bracket=1
     // preserves Phase 7 plain-argmax behaviour.
     int         ultraproduct_bracket = 1;
+    // Phase 9 — Ramanujan-Fourier modulation strength (Paper IV §10+).
+    // When > 0 and bracket > 1, each K-vector in the bracket is
+    // additively modulated by lambda * c_q(position) / q^2 (q-bank
+    // {2,3,5,6,10}) before encoding.  Differentiates K-vectors at
+    // different integer positions in the ⪯_d equivalence relation.
+    // lambda == 0 (default) is a strict no-op.
+    float       kste_ramanujan_lambda = 0.0f;
 
     // Phase 12 Step B-2: --frobenius-q8.
     // After the Frobenius shim has run, round-trip every shim-list
