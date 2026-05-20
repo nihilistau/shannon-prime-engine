@@ -1,0 +1,12 @@
+Phase 8 ladder starting Wed 20/05/2026 18:40:39.18 
+Settings: prefill=1, gguf-block-quant + frobenius-quant, chunks=1 
+ 
+=== ctx=512 softmax === 
+PPL_native = 14.0475  (over 255 tokens, 1 chunks at ctx=512, frobenius_quant=1 sato_tate=0)
+perplexity = 14.0475 (n=1, ctx=512)
+ 
+=== ctx=512 ultraproduct === 
+PPL_native = 7629.9336  (over 255 tokens, 1 chunks at ctx=512, frobenius_quant=1 sato_tate=0)
+perplexity = 7629.9336 (n=1, ctx=512)
+ 
+=== ctx=1024 softmax === 
