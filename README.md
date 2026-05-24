@@ -7,6 +7,9 @@ Shannon-Prime Engine is a complete transformer inference engine that natively ex
 Companion repositories: [math core](https://github.com/nihilistau/shannon-prime) · [papers](https://github.com/nihilistau/Position_Is_Arithmetic) · [llama.cpp integration](https://github.com/nihilistau/shannon-prime-llama) · [ComfyUI integration](https://github.com/nihilistau/shannon-prime-comfyui).
 
 ---
+All of the interesting and ongoing work has now moved to [Shannon-Prime-Latice](https://github.com/nihilistau/shannon-prime-lattice), [Shannon-Prime-System](https://github.com/nihilistau/shannon-prime-system) and [Shannon-Prime-System-Engine](https://github.com/nihilistau/shannon-prime-system-engine)
+
+---
 
 ## Table of contents
 
